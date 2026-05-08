@@ -4,3 +4,6 @@
 [submodule "third_party/libero"]
 	path = third_party/libero
 	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "src/openpi/training/lingyu_dataloader"]
+	path = src/openpi/training/lingyu_dataloader
+	url = https://github.com/SHR238/lingyu_dataloader.git
