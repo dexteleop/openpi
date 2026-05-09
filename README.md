@@ -47,6 +47,18 @@ We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+GIT_LFS_SKIP_SMUDGE=1 uv pip install webdataset
+```
+
+```bash
+git clone --recursive https://github.com/dmlc/decord
+cd decord
+mkdir build && cd build
+cmake .. -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+make
+cd .. && cd python
+~/openpi/.venv/bin/python setup.py install
+~/openpi/.venv/bin/python -c "import decord._C; print('GPU decord ready')"
 ```
 
 NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
