@@ -904,15 +904,17 @@ _CONFIGS = [
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=50
         ),
+        checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
         data=LeRobotTeleavatarDataConfig(
-            repo_id="inference",  # Your local dataset name
+            repo_id="/DATA/disk0/haoran/intel_dataset/cross",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  #
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,  # Use end-effector representation
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/DATA/disk0/model/pi0_base/params"),
         batch_size=64,
         num_train_steps=20000,
 
