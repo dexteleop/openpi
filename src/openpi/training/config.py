@@ -98,6 +98,13 @@ class DataConfig:
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
 
+    # Directory containing WDS .tar files for the Lingyu WebDataset loader.
+    wds_data_dir: str | None = None
+    # Fraction of system memory to use for WDS shuffle buffer (default 0.4 = 40%).
+    wds_memory_ratio: float = 0.1
+    # Shuffle buffer size for WDS near-global shuffling.
+    wds_shuffle_buffer_size: int = 10000
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -375,9 +382,10 @@ class LeRobotTeleavatarDataConfig(DataConfigFactory):
                     {
                         "observation/images/left_color": "observation.images.left_color",
                         "observation/images/right_color": "observation.images.right_color",
-                        "observation/images/head_camera": "observation.images.head_camera",
+                        "observation/images/head_camera": "observation.images.chest_camera",
                         "observation/state": "observation.state",
                         "action": "action",  # Keep action as action
+                        "prompt": "prompt",
                     }
                 )
             ]
@@ -525,6 +533,31 @@ class RLDSDroidDataConfig(DataConfigFactory):
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
             filter_dict_path=self.filter_dict_path,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class WDSLingyuDataConfig(DataConfigFactory):
+    """Config for training on Lingyu WebDataset (WDS) .tar files.
+
+    WDS data loader handles video frame decoding, normalization, and tokenization
+    inside its collate_fn, skipping the standard transforms pipeline entirely.
+    """
+
+    # Path to directory containing .tar files.
+    wds_data_dir: str = tyro.MISSING
+    # Fraction of system memory to use for WDS shuffle buffer.
+    wds_memory_ratio: float = 0.4
+    # Shuffle buffer size for WDS near-global shuffling.
+    wds_shuffle_buffer_size: int = 10000
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            wds_data_dir=self.wds_data_dir,
+            wds_memory_ratio=self.wds_memory_ratio,
+            wds_shuffle_buffer_size=self.wds_shuffle_buffer_size,
         )
 
 
@@ -904,9 +937,9 @@ _CONFIGS = [
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=50
         ),
-        checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
+        checkpoint_base_dir="/home/zyz/shihaoran/intel_test/openpi/checkpoints",
         data=LeRobotTeleavatarDataConfig(
-            repo_id="/DATA/disk0/haoran/intel_dataset/cross",  # Your local dataset name
+            repo_id="/home/zyz/shihaoran/intel_test/openpi/data/build_blocks",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  #
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -914,8 +947,8 @@ _CONFIGS = [
             use_delta_joint_actions=False,  # Use end-effector representation
         ),
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/DATA/disk0/model/pi0_base/params"),
-        batch_size=64,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
+        batch_size=2,
         num_train_steps=20000,
 
         
@@ -1203,6 +1236,29 @@ _CONFIGS = [
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    #
+    # Lingyu WDS configs.
+    #
+    TrainConfig(
+        name="pi0_lingyu_wds",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=50,
+        ),
+        checkpoint_base_dir="/home/zyz/shihaoran/intel_test/openpi/checkpoints",
+        data=WDSLingyuDataConfig(
+            repo_id="lingyu",
+            wds_data_dir="/mnt/data6t/shihaoran_data/test_wds",
+            wds_memory_ratio=0.6,
+            wds_shuffle_buffer_size=10000,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
+        num_workers=32,
+        batch_size=2,
+        num_train_steps=20000,
         wandb_enabled=False,
     ),
     #

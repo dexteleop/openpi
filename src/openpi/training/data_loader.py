@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.lingyu_dataloader.wds_pi0train import WDSDataLoader
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -242,6 +243,16 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    if data_config.wds_data_dir is not None:
+        return create_wds_data_loader(
+            data_config,
+            action_horizon=config.model.action_horizon,
+            batch_size=config.batch_size,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            num_workers=config.num_workers,
+        )
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
@@ -332,6 +343,52 @@ def create_torch_data_loader(
         num_workers=num_workers,
         seed=seed,
         framework=framework,
+    )
+
+    return DataLoaderImpl(data_config, data_loader)
+
+
+def create_wds_data_loader(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    batch_size: int,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a WDS data loader for training with Lingyu WebDataset .tar files.
+
+    The WDS data loader handles video frame decoding, normalization, and tokenization
+    inside its collate_fn, skipping the standard transforms pipeline.
+
+    Args:
+        data_config: The data configuration.
+        action_horizon: The action horizon.
+        batch_size: The batch size.
+        sharding: The sharding to use for the data loader.
+        shuffle: Whether to shuffle the data.
+        num_batches: Determines the number of batches to return.
+        num_workers: Number of worker processes for the WDS data loader.
+    """
+    if jax.process_count() > 1:
+        raise NotImplementedError("Data loading with multiple processes is not supported.")
+
+    assert data_config.wds_data_dir is not None, "wds_data_dir must be set for WDS data loader."
+
+    local_batch_size = batch_size // jax.process_count()
+    logging.info(f"WDS local_batch_size: {local_batch_size}")
+
+    data_loader = WDSDataLoader(
+        dataset_dir=data_config.wds_data_dir,
+        local_batch_size=local_batch_size,
+        action_horizon=action_horizon,
+        sharding=sharding,
+        memory_ratio=data_config.wds_memory_ratio,
+        shuffle_buffer_size=data_config.wds_shuffle_buffer_size,
+        num_batches=num_batches,
+        num_workers=num_workers,
     )
 
     return DataLoaderImpl(data_config, data_loader)
