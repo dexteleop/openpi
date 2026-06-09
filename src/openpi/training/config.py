@@ -365,27 +365,41 @@ class LeRobotTeleavatarDataConfig(DataConfigFactory):
     and 3 camera feeds (left_color, right_color, head_color).
     """
     use_delta_joint_actions: bool = False
+    # Whether the head camera should be rotated 180° before the left-eye crop.
+    # Property of the source dataset orientation; forwarded to TeleavatarInputs.
+    rotate_head_camera: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Repack transform to match dataset keys to inference keys
+        # Repack transform to match dataset keys to inference keys.
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/images/head_camera": "observation.images.head_camera",
+            "observation/state": "observation.state",
+            "action": "action",  # Keep action as action
+        }
+        # When prompt_from_task is on, PromptFromLeRobotTask injects a top-level
+        # "prompt" string from meta.tasks[task_index]. RepackTransform rebuilds
+        # the dict from scratch, so the key has to be listed here or it's lost
+        # and TeleavatarInputs falls back to its hardcoded default for every
+        # sample. Only request the key when it will actually be present;
+        # otherwise the flat_item lookup would KeyError.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/images/left_color": "observation.images.left_color",
-                        "observation/images/right_color": "observation.images.right_color",
-                        "observation/images/head_camera": "observation.images.head_camera",
-                        "observation/state": "observation.state",
-                        "action": "action",  # Keep action as action
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_structure)]
         )
 
         # Data transforms for teleavatar policy
         data_transforms = _transforms.Group(
-            inputs=[teleavatar_policy.TeleavatarInputs(model_type=model_config.model_type)],
+            inputs=[
+                teleavatar_policy.TeleavatarInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                )
+            ],
             outputs=[teleavatar_policy.TeleavatarOutputs()],
         )
 
@@ -884,6 +898,9 @@ _CONFIGS = [
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,
+            # Official robot head camera is mounted upside-down; the recorded
+            # frames are raw upside-down stereo in both training and inference.
+            rotate_head_camera=True,
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -911,6 +928,9 @@ _CONFIGS = [
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,  # Use end-effector representation
+            # Official robot head camera is mounted upside-down; the recorded
+            # frames are raw upside-down stereo in both training and inference.
+            rotate_head_camera=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         batch_size=64,
@@ -955,6 +975,9 @@ _CONFIGS = [
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,  # Use end-effector representation
+            # Official robot head camera is mounted upside-down; the recorded
+            # frames are raw upside-down stereo in both training and inference.
+            rotate_head_camera=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         batch_size=16,

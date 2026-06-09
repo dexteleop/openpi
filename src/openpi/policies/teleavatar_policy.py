@@ -1,10 +1,13 @@
 import dataclasses
+import logging
 
 import einops
 import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+
+logger = logging.getLogger(__name__)
 
 
 def make_teleavatar_example() -> dict:
@@ -29,6 +32,22 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+def _extract_left_head_view(image: np.ndarray, *, rotate: bool = False) -> np.ndarray:
+    """Crop the left eye from a side-by-side stereo head image, optionally
+    rotating 180° first.
+
+    The crop is gated on the ``width == 2 * height`` shape check so an
+    already-cropped ``(H, H, 3)`` frame (e.g. an inference path that
+    pre-crops) is left untouched.
+    """
+    height, width = image.shape[:2]
+    if width == 2 * height:
+        if rotate:
+            image = np.rot90(image, k=2)
+        image = image[:, :height, :]
+    return image
+
+
 @dataclasses.dataclass(frozen=True)
 class TeleavatarInputs(transforms.DataTransformFn):
     """
@@ -48,6 +67,14 @@ class TeleavatarInputs(transforms.DataTransformFn):
     This matches the data format in convert_teleavatar_data_to_lerobot.py
     """
     model_type: _model.ModelType
+    # Whether to rotate 180° before cropping the head frame. Property of the
+    # source data, not of train/inference — set it identically for both. The
+    # 2:1-width guard inside _extract_left_head_view already no-ops for
+    # already-cropped (square) frames, so this only matters for raw stereo.
+    #   True  → upside-down raw stereo (camera mounted upside-down, e.g. the
+    #           officially released robot — its training data is upside-down too)
+    #   False → frame already right-side-up before this transform
+    rotate_head_camera: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Parse images to uint8 (H,W,C) format
@@ -55,11 +82,13 @@ class TeleavatarInputs(transforms.DataTransformFn):
         left_color = _parse_image(data["observation/images/left_color"])
         right_color = _parse_image(data["observation/images/right_color"])
         head_color = _parse_image(data["observation/images/head_camera"])
-
-        # Resize head camera to match stereo camera resolution for consistency
-        if head_color.shape[:2] != (480, 848):
-            import cv2
-            head_color = cv2.resize(head_color, (848, 480))
+        # Crop the left eye from the side-by-side stereo head frame, rotating
+        # 180° iff the configured source orientation says so. The width-check
+        # guard inside _extract_left_head_view makes this a no-op when the head
+        # frame already arrives square (cropped by ros2_interface).
+        head_color = _extract_left_head_view(
+            head_color, rotate=self.rotate_head_camera
+        )
 
         # Extract 14-dim state from 48-dim observation
         # Input layout: [positions(0-15), velocities(16-31), efforts(32-47)]
@@ -103,12 +132,22 @@ class TeleavatarInputs(transforms.DataTransformFn):
 
             inputs["actions"] = selected_actions
 
-        # Pass the prompt (aka language instruction) to the model.
-        # For teleavatar, we use a default prompt since the dataset doesn't have task descriptions.
+        # Pass the prompt (aka language instruction) to the model. During
+        # training this should be filled by PromptFromLeRobotTask + the
+        # "prompt": "prompt" entry in the repack structure (see
+        # LeRobotTeleavatarDataConfig.create). The fallback below only kicks
+        # in for inference callers that don't supply a prompt; if it ever
+        # triggers during training, every sample shares one fixed string and
+        # the language channel is dead — make that visible.
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
         else:
-            inputs["prompt"] = "pick a toy and put it in the basket using left gripper"  # Default task for teleavatar
+            inputs["prompt"] = "pick a toy and put it in the basket using left gripper"
+            logger.warning(
+                "TeleavatarInputs: no 'prompt' in sample; using hardcoded "
+                "fallback. Expected during inference without a client prompt, "
+                "but indicates a training-pipeline bug if seen on training data."
+            )
 
         return inputs
 
