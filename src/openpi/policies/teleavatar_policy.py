@@ -142,7 +142,7 @@ class TeleavatarInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
         else:
-            inputs["prompt"] = "pick a toy and put it in the basket using left gripper"
+            inputs["prompt"] = "perform the manipulation task"
             logger.warning(
                 "TeleavatarInputs: no 'prompt' in sample; using hardcoded "
                 "fallback. Expected during inference without a client prompt, "

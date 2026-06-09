@@ -21,7 +21,6 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.teleavatar_policy as teleavatar_policy
-import openpi.policies.teleavatar_policy_endeffector as teleavatar_policy_endeffector
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -423,64 +422,6 @@ class LeRobotTeleavatarDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotTeleavatarEndEffectorDataConfig(DataConfigFactory):
-    """
-    Config for training on Teleavatar dual-arm robot dataset using end-effector representation.
-
-    This config handles the extended state with end-effector poses (position + quaternion)
-    and 3 camera feeds (left_color, right_color, head_camera).
-    
-    State format: [left_ee_pose(7), left_gripper_effort(1), right_ee_pose(7), right_gripper_effort(1)]
-    """
-    use_delta_ee_actions: bool = False
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Repack transform to match dataset keys to inference keys
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/images/left_color": "observation.images.left_color",
-                        "observation/images/right_color": "observation.images.right_color",
-                        "observation/images/head_camera": "observation.images.head_camera",
-                        "observation/state": "observation.state",
-                        "action": "action",
-                    }
-                )
-            ]
-        )
-
-        # Data transforms for teleavatar end-effector policy
-        data_transforms = _transforms.Group(
-            inputs=[teleavatar_policy_endeffector.TeleavatarEndEffectorInputs(model_type=model_config.model_type)],
-            outputs=[teleavatar_policy_endeffector.TeleavatarEndEffectorOutputs()],
-        )
-
-        # Apply delta actions if requested (for end-effector pose, not gripper efforts)
-        # Inputs are 16 dimensions: 7 left ee pose, 1 left gripper, 7 right ee pose, 1 right gripper
-        if self.use_delta_ee_actions:
-            # Apply delta to left ee pose (first 7 dims), leave left gripper (8th dim) absolute
-            # Apply delta to right ee pose (dims 9-15), leave right gripper (16th dim) absolute
-            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
-
-        # Model transforms
-        model_transforms = ModelTransformFactory()(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-        )
-
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -892,7 +833,7 @@ _CONFIGS = [
             action_dim=32  # Teleavatar uses 16-dim actions
         ),
         data=LeRobotTeleavatarDataConfig(
-            repo_id="inference",  # Your local dataset name
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  # No prompts in teleavatar dataset
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -919,10 +860,10 @@ _CONFIGS = [
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=50
+            action_horizon=30
         ),
         data=LeRobotTeleavatarDataConfig(
-            repo_id="inference",  # Your local dataset name
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  #
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -939,37 +880,16 @@ _CONFIGS = [
         
     ),
     TrainConfig(
-        name="pi0_teleavatar_endeffector",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(
-            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=10
-        ),
-        data=LeRobotTeleavatarEndEffectorDataConfig(
-            repo_id="inference",  # Your local dataset name
-            base_config=DataConfig(
-                prompt_from_task=True,  # No prompts in teleavatar dataset
-                action_sequence_keys=("action",)  # Use 'action' not 'actions'
-            ),
-            use_delta_ee_actions=False,  # Use end-effector representation
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        batch_size=16,
-        num_train_steps=20000,
-
-        
-    ),
-    TrainConfig(
         name="pi0_teleavatar_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=10
+            action_horizon=30
         ),
         data=LeRobotTeleavatarDataConfig(
-            repo_id="lerobot/right_dataset",  # Your local dataset name
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=False,  # No prompts in teleavatar dataset
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -991,70 +911,6 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_teleavatar_low_mem_finetune_endeffector",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=10
-        ),
-        data=LeRobotTeleavatarEndEffectorDataConfig(
-            repo_id="left_dataset",  # Your local dataset name
-            base_config=DataConfig(
-                prompt_from_task=False,  # No prompts in teleavatar dataset
-                action_sequence_keys=("action",)  # Use 'action' not 'actions'
-            ),
-            use_delta_ee_actions=False,  # Use end-effector representation
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        batch_size=16,
-        num_train_steps=20000,
-        # The freeze filter defines which parameters should be frozen during training.
-        # We have a convenience function in the model config that returns the default freeze filter
-        # for the given model config for LoRA finetuning. Just make sure it matches the model config
-        # you chose above.
-        freeze_filter=pi0_config.Pi0Config(
-            action_dim=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-    ),
-    #
-    # Fine-tuning Aloha configs.
-    #
-    # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
-    TrainConfig(
-        name="pi0_aloha_pen_uncap",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="uncap the pen",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
     ),
     TrainConfig(
         name="pi05_aloha_pen_uncap",
