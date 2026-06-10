@@ -48,6 +48,28 @@ def _extract_left_head_view(image: np.ndarray, *, rotate: bool = False) -> np.nd
     return image
 
 
+def _left_gripper_effort_to_normalized(effort: np.ndarray) -> np.ndarray:
+    """Convert left gripper effort to normalized [0, 1] controller range."""
+    return np.where(effort > 0, 0.5 - effort / 7.0, 0.5 - effort)
+
+
+def _right_gripper_effort_to_normalized(effort: np.ndarray) -> np.ndarray:
+    """Convert right gripper effort to normalized [0, 1] controller range."""
+    return np.where(effort < 0, effort / 7.0 + 0.5, effort + 0.5)
+
+
+def _left_gripper_normalized_to_effort(data: np.ndarray) -> np.ndarray:
+    """Convert normalized [0, 1] controller value to left gripper effort."""
+    grip = -(data - 0.5)
+    return np.where(grip > 0, grip * 7.0, grip)
+
+
+def _right_gripper_normalized_to_effort(data: np.ndarray) -> np.ndarray:
+    """Convert normalized [0, 1] controller value to right gripper effort."""
+    grip = data - 0.5
+    return np.where(grip < 0, grip * 7.0, grip)
+
+
 @dataclasses.dataclass(frozen=True)
 class TeleavatarInputs(transforms.DataTransformFn):
     """
@@ -130,6 +152,14 @@ class TeleavatarInputs(transforms.DataTransformFn):
                 action_data[:, 47:48],  # Right gripper effort (index 47 = 32+15)
             ], axis=1)  # Concatenate along action dimension
 
+            # Convert raw gripper efforts to the normalized [0, 1] controller
+            # range. This runs before the dataset norm-stats normalization in
+            # model_transforms, so norm stats must be recomputed after enabling
+            # this (scripts/compute_norm_stats.py). Action layout is
+            # [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)].
+            selected_actions[:, 7] = _left_gripper_effort_to_normalized(selected_actions[:, 7])
+            selected_actions[:, 15] = _right_gripper_effort_to_normalized(selected_actions[:, 15])
+
             inputs["actions"] = selected_actions
 
         # Pass the prompt (aka language instruction) to the model. During
@@ -169,4 +199,10 @@ class TeleavatarOutputs(transforms.DataTransformFn):
         # Only return the first 16 actions for teleavatar.
         # Since the model may output more dimensions due to padding, we extract just what we need.
         # For your own dataset, replace `16` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :16])}
+        actions = np.asarray(data["actions"][:, :16])
+
+        # Convert normalized [0, 1] gripper values back to effort for robot
+        # execution (inverse of the effort->normalized map in TeleavatarInputs).
+        actions[:, 7] = _left_gripper_normalized_to_effort(actions[:, 7])
+        actions[:, 15] = _right_gripper_normalized_to_effort(actions[:, 15])
+        return {"actions": actions}
