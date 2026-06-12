@@ -27,8 +27,9 @@ class TeleavatarEnvironment(_environment.Environment):
         Args:
             prompt: Default language instruction for the policy
 
-        Note: Images are NOT resized here - they are kept at original resolution
-        to match training data format (480×848 for stereo, 1080×1920 for head).
+        Note: Images are NOT resized here. Stereo cameras stay at 480×848; the
+        head camera arrives already cropped to the left eye and rotated 180°
+        from the ROS2 PyAV decode (224×224), matching the training head view.
         """
         self._prompt = prompt
 
@@ -125,9 +126,10 @@ class TeleavatarEnvironment(_environment.Environment):
                 - 'images': Dict of camera images in (H, W, C) format at ORIGINAL resolution
                 - 'prompt': Language instruction
 
-        Note: Images are kept at original resolution to match training data:
+        Note: Image formats match the training data:
             - left_color, right_color: 480×848×3 (H,W,C)
-            - head_camera: 1080×1920×3 (H,W,C)
+            - head_camera: 224×224×3 (H,W,C), already left-eye-cropped + rot180
+              by the ROS2 PyAV decode callback.
         The policy's _parse_image will handle any format conversion if needed.
         """
         if self._ros_interface is None:

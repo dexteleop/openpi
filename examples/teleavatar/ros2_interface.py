@@ -2,19 +2,52 @@
 """
 ROS2 interface wrapper for Teleavatar robot.
 Handles subscribing to sensor topics and publishing actions.
+
+Image decoding strategy:
+- Subscribes directly to FFMPEGPacket (H.265) topics, bypassing the
+  ffmpeg_image_transport republish node.
+- Uses PyAV with hevc_cuvid (GPU) for decoding, falling back to CPU hevc.
+- head_camera (the 2:1 stereo XR video on /xr_video_topic): GPU hw-resize
+  2160×4320 → 224×448 during decode, then crop the left eye + rotate 180°
+  → 224×224. This matches what TeleavatarInputs(rotate_head_camera=True)
+  produces from the raw 2:1 stereo at training time, so train and deploy see
+  the same head view.
+- left_color / right_color: decoded as-is at 480×848.
 """
 
 import logging
 import time
+from collections import deque
 from threading import Lock
 from typing import Dict, Optional
 
+import av
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge
+from ffmpeg_image_transport_msgs.msg import FFMPEGPacket
 from rclpy.node import Node
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32
+
+_HZ_WINDOW = 60  # number of frames to average for the per-camera Hz estimate
+
+
+def _make_codec(name: str, options: dict | None = None) -> av.CodecContext:
+    """Create and open a PyAV codec context, trying GPU first then CPU."""
+    gpu_codec = "hevc_cuvid"
+    cpu_codec = "hevc"
+    try:
+        ctx = av.CodecContext.create(gpu_codec, "r")
+        if options:
+            ctx.options = options
+        ctx.open()
+        logging.info(f"[{name}] using {gpu_codec}" + (f" options={options}" if options else ""))
+        return ctx
+    except Exception as e:
+        logging.warning(f"[{name}] {gpu_codec} unavailable ({e}), falling back to CPU")
+        ctx = av.CodecContext.create(cpu_codec, "r")
+        ctx.open()
+        return ctx
 
 
 class TeleavatarROS2Interface(Node):
@@ -24,7 +57,6 @@ class TeleavatarROS2Interface(Node):
         super().__init__(node_name)
 
         self.logger = self.get_logger()
-        self.cv_bridge = CvBridge()
         self.lock = Lock()
 
         # Storage for latest sensor data
@@ -33,10 +65,32 @@ class TeleavatarROS2Interface(Node):
         self.image_timestamps: Dict[str, float] = {}
         self.joint_timestamps: Dict[str, float] = {}
 
+        # Per-camera receive-time / decode-latency tracking for Hz logging.
+        self._image_recv_times: Dict[str, deque] = {
+            "left_color": deque(maxlen=_HZ_WINDOW),
+            "right_color": deque(maxlen=_HZ_WINDOW),
+            "head_camera": deque(maxlen=_HZ_WINDOW),
+        }
+        self._image_latencies: Dict[str, deque] = {
+            "left_color": deque(maxlen=_HZ_WINDOW),
+            "right_color": deque(maxlen=_HZ_WINDOW),
+            "head_camera": deque(maxlen=_HZ_WINDOW),
+        }
+        self._last_hz_log: float = time.time()
+        self._hz_log_interval: float = 5.0  # log camera Hz/latency every N seconds
+
         self.left_joint_names = ['l_joint1', 'l_joint2', 'l_joint3', 'l_joint4', 'l_joint5', 'l_joint6', 'l_joint7']
         self.right_joint_names = ['r_joint1', 'r_joint2', 'r_joint3', 'r_joint4', 'r_joint5', 'r_joint6', 'r_joint7']
         self.left_gripper_names = ['l_joint8']
         self.right_gripper_names = ['r_joint8']
+
+        # PyAV codec contexts (one per camera). head_camera uses a GPU hw-resize
+        # 2160×4320 → 224×448 during decode; left/right decode at native 480×848.
+        self._codecs: Dict[str, av.CodecContext] = {
+            "left_color": _make_codec("left_color"),
+            "right_color": _make_codec("right_color"),
+            "head_camera": _make_codec("head_camera", options={"resize": "448x224"}),
+        }
 
         # Setup subscribers and publishers
         self._setup_subscribers()
@@ -46,24 +100,28 @@ class TeleavatarROS2Interface(Node):
 
     def _setup_subscribers(self):
         """Setup ROS2 subscribers for images and joint states."""
-        # Image subscribers - explicit subscriptions to avoid lambda closure issues
+        # Image subscribers — subscribe directly to the H.265 (FFMPEGPacket)
+        # topics and decode with PyAV (bypasses the republish node). head_camera
+        # is the 2:1 stereo XR video; the decode callback crops the left eye and
+        # rotates it (see _ffmpeg_callback). Note: /head/...  is the chest camera
+        # and is NOT the model's head input — the model uses /xr_video_topic.
         self.create_subscription(
-            Image,
-            '/left/image_raw',
-            lambda msg: self._image_callback(msg, 'left_color'),
-            10
+            FFMPEGPacket,
+            '/left/color/image_raw/ffmpeg',
+            lambda msg: self._ffmpeg_callback(msg, 'left_color'),
+            10,
         )
         self.create_subscription(
-            Image,
-            '/right/image_raw',
-            lambda msg: self._image_callback(msg, 'right_color'),
-            10
+            FFMPEGPacket,
+            '/right/color/image_raw/ffmpeg',
+            lambda msg: self._ffmpeg_callback(msg, 'right_color'),
+            10,
         )
         self.create_subscription(
-            Image,
-            '/head/image_raw',   # use chest_camera image
-            lambda msg: self._image_callback(msg, 'head_camera'),
-            10
+            FFMPEGPacket,
+            '/xr_video_topic/ffmpeg',   # 2:1 stereo head camera
+            lambda msg: self._ffmpeg_callback(msg, 'head_camera'),
+            10,
         )
 
         # Joint state subscribers - explicit subscriptions
@@ -93,18 +151,60 @@ class TeleavatarROS2Interface(Node):
         self.enable_pub = self.create_publisher(Float32, '/api/fsm/enable', 10)
         self.logger.info("ROS2 publishers initialized")
 
-    def _image_callback(self, msg: Image, camera_name: str):
-        """Callback for image messages."""
+    def _ffmpeg_callback(self, msg: FFMPEGPacket, camera_name: str):
+        """Decode an H.265 FFMPEGPacket with PyAV (GPU hevc_cuvid)."""
         try:
-            # Convert ROS Image to numpy array (RGB format)
-            # self.logger.info(f"Received image from {camera_name} at time {msg.header.stamp.sec}.{msg.header.stamp.nanosec}")
-            cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+            t0 = time.time()
+            pkt = av.Packet(bytes(msg.data))
+            pkt.pts = msg.pts
+            pkt.dts = msg.pts  # ffmpeg_image_transport sometimes leaves dts unset
 
-            with self.lock:
-                self.latest_images[camera_name] = cv_image
-                self.image_timestamps[camera_name] = time.time()
+            for frame in self._codecs[camera_name].decode(pkt):
+                if camera_name == "head_camera":
+                    # GPU hevc_cuvid hw-resizes 2160×4320 → 224×448 during decode.
+                    # Crop the left eye + rotate 180° (camera mounted upside-down)
+                    # so the frame matches TeleavatarInputs(rotate_head_camera=True)
+                    # on the raw 2:1 stereo at training time (same pixel mapping:
+                    # rot180 then left-half). The 2:1-width guard also covers a
+                    # CPU-fallback decode (no hw-resize → 2160×4320); the policy's
+                    # ResizeImages downsizes whatever square crop we hand back.
+                    img = frame.to_ndarray(format="rgb24")
+                    h, w = img.shape[:2]
+                    if w == 2 * h:
+                        img = np.rot90(img, k=2)
+                        img = np.ascontiguousarray(img[:, :h, :])
+                else:
+                    img = frame.to_ndarray(format="rgb24")  # 480×848×3
+
+                now = time.time()
+                with self.lock:
+                    self.latest_images[camera_name] = img
+                    self.image_timestamps[camera_name] = now
+                    self._image_recv_times[camera_name].append(now)
+                    self._image_latencies[camera_name].append((now - t0) * 1000)
+
+                self._maybe_log_hz()
+                break  # one packet → at most one output frame
         except Exception as e:
-            self.logger.error(f"Failed to process image from {camera_name}: {e}")
+            self.logger.error(f"Failed to decode {camera_name}: {e}")
+
+    def _maybe_log_hz(self):
+        """Periodically log per-camera frame rate and decode latency."""
+        now = time.time()
+        if now - self._last_hz_log < self._hz_log_interval:
+            return
+        self._last_hz_log = now
+
+        parts = []
+        with self.lock:
+            for name in self._image_recv_times:
+                times = self._image_recv_times[name]
+                lats = self._image_latencies[name]
+                hz = (len(times) - 1) / (times[-1] - times[0]) if len(times) >= 2 else 0.0
+                lat = float(np.mean(lats)) if lats else 0.0
+                parts.append(f"{name}={hz:.1f}Hz/{lat:.1f}ms")
+
+        self.logger.info(f"Cameras: {', '.join(parts)}")
 
     def _joint_state_callback(self, msg: JointState, joint_group: str):
         """Callback for joint state messages."""
@@ -206,6 +306,8 @@ class TeleavatarROS2Interface(Node):
                 'images': {
                     'left_color': self.latest_images['left_color'].copy(),
                     'right_color': self.latest_images['right_color'].copy(),
+                    # head_camera is already the left eye, rotated 180° (cropped
+                    # in _ffmpeg_callback; 224×224 on the GPU decode path).
                     'head_camera': self.latest_images['head_camera'].copy(),
                 },
                 'state': state_48d,
