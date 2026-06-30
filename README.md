@@ -22,10 +22,9 @@
 | 微调（LoRA）     | > 22 GB  | RTX 4090 / A100    |
 | 微调（完整）     | > 70 GB  | A100 (80GB) / H100 |
 
-真机部署还需要：
-
-- 已安装 ROS2（rclpy）的运行环境，以及 `ffmpeg_image_transport_msgs` 消息包；
-- 用于解码相机 H.265 码流的 PyAV，推荐带 NVIDIA 硬件解码（`hevc_cuvid`），否则会回退到 CPU 解码。
+真机部署的客户端软件依赖（ROS2、`ffmpeg_image_transport_msgs`、PyAV 等）随
+[`environment.yml`](environment.yml) 一并安装，详见 [环境安装](#环境安装)。相机为 H.265 码流，
+客户端机器建议配 NVIDIA GPU 以启用硬件解码（`hevc_cuvid`），否则会回退到 CPU 解码。
 
 
 ## 环境安装
