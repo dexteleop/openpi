@@ -102,9 +102,8 @@ class TeleavatarROS2Interface(Node):
         """Setup ROS2 subscribers for images and joint states."""
         # Image subscribers — subscribe directly to the H.265 (FFMPEGPacket)
         # topics and decode with PyAV (bypasses the republish node). head_camera
-        # is the 2:1 stereo XR video; the decode callback crops the left eye and
-        # rotates it (see _ffmpeg_callback). Note: /head/...  is the chest camera
-        # and is NOT the model's head input — the model uses /xr_video_topic.
+        # is the 2:1 stereo XR video on /xr_video_topic; the decode callback
+        # crops the left eye and rotates it (see _ffmpeg_callback).
         self.create_subscription(
             FFMPEGPacket,
             '/left/color/image_raw/ffmpeg',

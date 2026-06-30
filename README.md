@@ -270,9 +270,8 @@ python examples/teleavatar/main.py --remote-host 127.0.0.1 --remote-port 8000 \
 | `/left_arm/joint_states`          | `JointState`        | 左臂关节状态                  |
 | `/right_arm/joint_states`         | `JointState`        | 右臂关节状态                  |
 
-> 客户端直接订阅 H.265 的 `FFMPEGPacket` 码流并用 PyAV 解码（绕过 `ffmpeg_image_transport` 的
-> republish 节点）；头部相机在 GPU 解码时即硬件缩放，再裁剪左眼 + 旋转 180° 得到 224×224，
-> 与训练时 `rotate_head_camera=True` 的处理保持一致。注意 `/head/...` 是胸口相机，**不是**模型的头部输入。
+> 三路相机均为 H.265 码流，客户端订阅 `FFMPEGPacket` 后用 PyAV 解码；头部相机会裁剪左眼并旋转
+> 180°，与训练时 `rotate_head_camera=True` 保持一致（详见 [数据格式说明](#数据格式说明)）。
 
 **发布（动作）**
 
@@ -285,13 +284,3 @@ python examples/teleavatar/main.py --remote-host 127.0.0.1 --remote-port 8000 \
 | `/api/fsm/enable`             | `Float32`    | ros2_interface      | 使能 FSM                   |
 | `/api/left_arm/joint_cmd`     | `JointState` | arm_pd_controller   | 左臂速度指令（100Hz）      |
 | `/api/right_arm/joint_cmd`    | `JointState` | arm_pd_controller   | 右臂速度指令（100Hz）      |
-
-
-## 关于归一化文件
-
-训练保存检查点时，`norm_stats.json` 会被自动打包进检查点的 `assets/<repo_id>/` 目录，
-策略服务端启动时会从该路径加载，正常情况下无需手动处理。
-
-若需将检查点迁移到其他机器、或检查点中缺失该文件，请手动将第 3 步生成的
-`norm_stats.json`（位于 `./assets/<config_name>/<repo_id>/`）复制到检查点对应的
-`assets/<repo_id>/` 目录下，再进行部署。
