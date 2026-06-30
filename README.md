@@ -6,10 +6,10 @@
 
 提供以下基础 VLA 模型权重用于微调训练：
 
-| 基础模型   | 用途 | 描述                                                                       | 检查点路径                                  |
-| ---------- | ---- | -------------------------------------------------------------------------- | ------------------------------------------- |
-| $\pi_0$    | 微调 | [$\pi_0$ 基础模型](https://www.physicalintelligence.company/blog/pi0)      | `gs://openpi-assets/checkpoints/pi0_base`   |
-| $\pi_{05}$ | 微调 | [$\pi_{0.5}$ 基础模型](https://www.physicalintelligence.company/blog/pi05) | `gs://openpi-assets/checkpoints/pi05_base`  |
+| 基础模型 | 用途 | 描述                                                                  | 检查点路径                                 |
+| -------- | ---- | ------------------------------------------------------------------- | ------------------------------------------ |
+| π₀       | 微调 | [π₀ 基础模型](https://www.physicalintelligence.company/blog/pi0)    | `gs://openpi-assets/checkpoints/pi0_base`  |
+| π₀.₅     | 微调 | [π₀.₅ 基础模型](https://www.physicalintelligence.company/blog/pi05) | `gs://openpi-assets/checkpoints/pi05_base` |
 
 
 ## 系统要求
@@ -36,6 +36,17 @@
 git clone https://github.com/zhou-yh19/openpi.git
 ```
 
+本项目分为**两套环境**，分别部署在不同（或相同）机器上：
+
+| 环境       | 用途                                       | 包含          | 安装方式              |
+| ---------- | ------------------------------------------ | ------------- | --------------------- |
+| 服务端     | 训练、计算归一化、策略推理服务（JAX/GPU）  | openpi 本体   | `uv`                  |
+| 客户端     | 真机部署，采集观测、下发动作（ROS2）       | ROS2 + 客户端 | `conda environment.yml` |
+
+> 训练和计算归一化只需要服务端环境；真机部署时服务端跑策略服务，客户端通过 WebSocket 与之通信。
+
+### 服务端环境（uv）
+
 使用 [uv](https://docs.astral.sh/uv/) 来管理 Python 依赖。
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -53,48 +64,22 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
 注意：`GIT_LFS_SKIP_SMUDGE=1` 是为了拉取 LeRobot 作为依赖项所必需的。
 
+### 客户端环境（conda + ROS2）
 
-## 数据格式说明
+真机部署侧需要 ROS2，本仓库提供了一份 conda 环境文件 [`environment.yml`](environment.yml)
+（基于 robostack 的 ROS2 Humble，含 `rclpy`、`ffmpeg_image_transport_msgs`、`av` 等）。
+用 conda/mamba 创建并激活：
 
-理解灵御机器人的观测/动作约定，对配置训练和部署都很重要。相关实现位于
-[`src/openpi/policies/teleavatar_policy.py`](src/openpi/policies/teleavatar_policy.py)。
-
-### 相机
-
-机器人提供 3 路相机，在送入模型前会映射到 $\pi_0$ 的三个图像输入：
-
-| 数据集 / ROS 来源              | 原始分辨率                  | 模型输入键          | 处理方式                                       |
-| ------------------------------ | --------------------------- | ------------------- | ---------------------------------------------- |
-| `head_camera`（`/xr_video_topic`） | 2:1 双目立体（如 2160×4320） | `base_0_rgb`        | 先旋转 180°，再裁剪左眼 → 方形主视角           |
-| `left_color`（`/left/...`）     | 480×848                     | `left_wrist_0_rgb`  | 原样使用                                        |
-| `right_color`（`/right/...`）   | 480×848                     | `right_wrist_0_rgb` | 原样使用                                        |
-
-> 头部相机在官方发布的机器人上为**倒装**，因此训练数据和推理数据都是倒着的，需要旋转 180°
-> 后再裁剪左眼。该行为由配置项 `rotate_head_camera` 控制，**训练和推理必须保持一致**。
-> 裁剪逻辑带有 `width == 2 * height` 的形状判断：若帧已经是方形（即在推理端已被裁剪），则自动跳过，
-> 不会重复处理。
-
-### 状态（observation/state，48 维）
-
-数据集中存储 48 维本体感觉状态，布局为 `[位置(16), 速度(16), 力矩(16)]`，每个 16 维块内部布局一致：
-
-```
-[左臂关节 1-7, 左夹爪, 右臂关节 1-7, 右夹爪]
+```bash
+conda env create -n teleavatar_client -f environment.yml
+conda activate teleavatar_client
 ```
 
-模型实际只使用其中的 **14 维关节位置**：左臂位置(7) + 右臂位置(7)。
+客户端脚本（`examples/teleavatar/main.py` 等）依赖本仓库的 `openpi-client` 子包，在该环境中再安装一次：
 
-### 动作（action，16 维）
-
-模型输出 16 维动作：
-
+```bash
+pip install -e packages/openpi-client
 ```
-[左臂关节位置(7), 左夹爪力矩(1), 右臂关节位置(7), 右夹爪力矩(1)]
-```
-
-夹爪力矩在进入模型前会被归一化到 `[0, 1]` 控制器区间（`TeleavatarInputs`），推理输出后再反归一化为力矩
-（`TeleavatarOutputs`）。**注意**：由于该归一化发生在数据集 norm_stats 归一化之前，若修改该逻辑，
-必须重新运行 `scripts/compute_norm_stats.py`。
 
 
 ## 模型微调
@@ -108,7 +93,7 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ### 2. 把遥操作数据转换为 LeRobot 数据集
 
 使用代码库 [rosbag_to_lerobot](https://github.com/dexteleop/rosbag_to_lerobot) 将 rosbag 转换为 LeRobot 数据集。
-转换后的数据集需包含上文 [数据格式说明](#数据格式说明) 中描述的相机键、48 维状态和 `action` 序列。
+转换后的数据集需符合 [数据格式说明（参考）](#数据格式说明参考) 中描述的相机键、48 维状态和 `action` 序列约定。
 
 
 ### 3. 计算训练集归一化参数
@@ -207,7 +192,25 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_teleavatar --exp-
                   arm_pd_controller (100Hz PD)  →  /api/<arm>/joint_cmd (速度指令)
 ```
 
-### 1. 启动策略服务端
+> 其中 `serve_policy` 跑在**服务端**（uv 环境）；`zero.py`、`arm_pd_controller.py`、`main.py`
+> （及其内部的 `ros2_interface`）跑在**客户端**（conda + ROS2 环境）。
+
+### 1. 机器人归零（客户端环境）
+
+部署前先把双臂移动到固定的 home 位姿。在客户端运行 [`zero.py`](zero.py)：
+
+```bash
+python zero.py
+```
+
+该脚本是一个 ROS2 节点：从当前关节位置在 5 秒内插值到预设 home 位姿（左右臂目标位姿硬编码在脚本内，
+关节限位读自工作目录下的 [`arm_config.yml`](arm_config.yml)），以 100Hz 发布到 `/api/{left,right}_arm/joint_cmd`，
+同时发 `/api/fsm/enable=1` 使能；双臂收敛到容差内后自动退出。
+
+> 归零必须在启动 `arm_pd_controller` / `main.py` **之前**完成——它们都向 `/api/{arm}/joint_cmd`
+> 下发指令，同时运行会冲突。
+
+### 2. 启动策略服务端（服务端环境）
 
 在一个终端中加载微调后的检查点并启动 WebSocket 策略服务端：
 
@@ -221,7 +224,7 @@ uv run scripts/serve_policy.py policy:checkpoint \
 - `--policy.dir`：检查点目录，其中需包含 `assets/<repo_id>/norm_stats.json`（训练时自动打包）。
 - 默认监听端口为 `8000`，可用 `--port` 修改。
 
-### 2. 启动底层臂控制器
+### 3. 启动底层臂控制器（客户端环境）
 
 策略输出的是目标**关节位置**，需要由一个 100Hz 的 PD 控制器转换为底层速度指令。
 在机器人端启动 [`arm_pd_controller.py`](examples/teleavatar/arm_pd_controller.py)：
@@ -234,7 +237,7 @@ python examples/teleavatar/arm_pd_controller.py
 按 `v = kp * (q_des - q_state)` 计算速度（带限幅与 0.5s 指令超时保护），
 发布到 `/api/{left,right}_arm/joint_cmd`。
 
-### 3. 运行机器人客户端
+### 4. 运行机器人客户端（客户端环境）
 
 在另一个终端启动机器人控制主程序 [`main.py`](examples/teleavatar/main.py)：
 
@@ -271,7 +274,7 @@ python examples/teleavatar/main.py --remote-host 127.0.0.1 --remote-port 8000 \
 | `/right_arm/joint_states`         | `JointState`        | 右臂关节状态                  |
 
 > 三路相机均为 H.265 码流，客户端订阅 `FFMPEGPacket` 后用 PyAV 解码；头部相机会裁剪左眼并旋转
-> 180°，与训练时 `rotate_head_camera=True` 保持一致（详见 [数据格式说明](#数据格式说明)）。
+> 180°，与训练时 `rotate_head_camera=True` 保持一致（详见 [数据格式说明（参考）](#数据格式说明参考)）。
 
 **发布（动作）**
 
@@ -284,3 +287,46 @@ python examples/teleavatar/main.py --remote-host 127.0.0.1 --remote-port 8000 \
 | `/api/fsm/enable`             | `Float32`    | ros2_interface      | 使能 FSM                   |
 | `/api/left_arm/joint_cmd`     | `JointState` | arm_pd_controller   | 左臂速度指令（100Hz）      |
 | `/api/right_arm/joint_cmd`    | `JointState` | arm_pd_controller   | 右臂速度指令（100Hz）      |
+
+
+## 数据格式说明（参考）
+
+理解灵御机器人的观测/动作约定，对配置训练和部署都很重要。相关实现位于
+[`src/openpi/policies/teleavatar_policy.py`](src/openpi/policies/teleavatar_policy.py)。
+
+### 相机
+
+机器人提供 3 路相机，在送入模型前会映射到 π₀ 的三个图像输入：
+
+| 数据集 / ROS 来源              | 原始分辨率                  | 模型输入键          | 处理方式                                       |
+| ------------------------------ | --------------------------- | ------------------- | ---------------------------------------------- |
+| `head_camera`（`/xr_video_topic`） | 2:1 双目立体（如 2160×4320） | `base_0_rgb`        | 先旋转 180°，再裁剪左眼 → 方形主视角           |
+| `left_color`（`/left/...`）     | 480×848                     | `left_wrist_0_rgb`  | 原样使用                                        |
+| `right_color`（`/right/...`）   | 480×848                     | `right_wrist_0_rgb` | 原样使用                                        |
+
+> 头部相机在官方发布的机器人上为**倒装**，因此训练数据和推理数据都是倒着的，需要旋转 180°
+> 后再裁剪左眼。该行为由配置项 `rotate_head_camera` 控制，**训练和推理必须保持一致**。
+> 裁剪逻辑带有 `width == 2 * height` 的形状判断：若帧已经是方形（即在推理端已被裁剪），则自动跳过，
+> 不会重复处理。
+
+### 状态（observation/state，48 维）
+
+数据集中存储 48 维本体感觉状态，布局为 `[位置(16), 速度(16), 力矩(16)]`，每个 16 维块内部布局一致：
+
+```
+[左臂关节 1-7, 左夹爪, 右臂关节 1-7, 右夹爪]
+```
+
+模型实际只使用其中的 **14 维关节位置**：左臂位置(7) + 右臂位置(7)。
+
+### 动作（action，16 维）
+
+模型输出 16 维动作：
+
+```
+[左臂关节位置(7), 左夹爪力矩(1), 右臂关节位置(7), 右夹爪力矩(1)]
+```
+
+夹爪力矩在进入模型前会被归一化到 `[0, 1]` 控制器区间（`TeleavatarInputs`），推理输出后再反归一化为力矩
+（`TeleavatarOutputs`）。**注意**：由于该归一化发生在数据集 norm_stats 归一化之前，若修改该逻辑，
+必须重新运行 `scripts/compute_norm_stats.py`。
