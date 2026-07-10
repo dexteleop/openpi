@@ -10,9 +10,9 @@ triggers, then holds the target until the measured positions converge
 (like zero.py) and exits.
 
 Usage (client conda env, robot enabled):
-    python examples/teleavatar_v2/zero_from_episode.py --episode 0
-    python examples/teleavatar_v2/zero_from_episode.py --episode 12 --frame -1   # last frame
-    python examples/teleavatar_v2/zero_from_episode.py --episode 0 --dry-run     # no ROS2 needed
+    python examples/teleavatar_v2/zero_from_episode.py --dataset <数据集路径> --episode 0
+    python examples/teleavatar_v2/zero_from_episode.py --dataset <数据集路径> --episode 12 --frame -1   # last frame
+    python examples/teleavatar_v2/zero_from_episode.py --dataset <数据集路径> --episode 0 --dry-run     # no ROS2 needed
 """
 
 import argparse
@@ -26,8 +26,7 @@ from replay_episode import load_episode
 
 def main():
     parser = argparse.ArgumentParser(description="Move the Teleavatar to a recorded episode pose")
-    parser.add_argument("--dataset", type=pathlib.Path,
-                        default=pathlib.Path("/media/yihan/686C-5C13/lerobot_0708_new"),
+    parser.add_argument("--dataset", type=pathlib.Path, required=True,
                         help="LeRobot dataset root (contains meta/ and data/)")
     parser.add_argument("--episode", type=int, required=True, help="Episode index to take the pose from")
     parser.add_argument("--frame", type=int, default=0,

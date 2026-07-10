@@ -98,8 +98,8 @@ conda activate teleavatar_client
 pip install -e packages/openpi-client
 ```
 
-相机解码的额外依赖因机器人代数而异（v1 用 PyAV，已随 environment.yml 安装；v2 需系统级
-GStreamer + `nvh265dec`），见各代 README 的"客户端额外依赖"一节。
+相机解码依赖（v1 用 PyAV，v2 用 GStreamer/PyGObject）均已随 environment.yml 安装；
+自检方法与旧环境的补装命令见各代 README 的"客户端额外依赖"一节。
 
 
 ## 模型微调

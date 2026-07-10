@@ -17,9 +17,9 @@ so the arms never jump. Ctrl+C stops publishing immediately.
 
 Usage (client conda env, robot enabled; run zero.py first if you want a
 known home pose):
-    python examples/teleavatar_v2/replay_episode.py --episode 0
-    python examples/teleavatar_v2/replay_episode.py --episode 12 --speed 0.5
-    python examples/teleavatar_v2/replay_episode.py --episode 0 --dry-run   # no ROS2 needed
+    python examples/teleavatar_v2/replay_episode.py --dataset <数据集路径> --episode 0
+    python examples/teleavatar_v2/replay_episode.py --dataset <数据集路径> --episode 12 --speed 0.5
+    python examples/teleavatar_v2/replay_episode.py --dataset <数据集路径> --episode 0 --dry-run   # no ROS2 needed
 
 Needs pandas + pyarrow for parquet reading (pip install pandas pyarrow).
 """
@@ -86,8 +86,7 @@ def print_summary(left_pos, right_pos, left_trigger, right_trigger, fps, speed):
 
 def main():
     parser = argparse.ArgumentParser(description="Replay a LeRobot episode on the Teleavatar robot")
-    parser.add_argument("--dataset", type=pathlib.Path,
-                        default=pathlib.Path("/media/yihan/686C-5C13/lerobot_0708_new"),
+    parser.add_argument("--dataset", type=pathlib.Path, required=True,
                         help="LeRobot dataset root (contains meta/ and data/)")
     parser.add_argument("--episode", type=int, required=True, help="Episode index to replay")
     parser.add_argument("--source", choices=["action", "state"], default="action",

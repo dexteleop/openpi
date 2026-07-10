@@ -12,14 +12,12 @@ ROS2 话题）；平台自带底层控制，位置指令直发 `/api/<arm>/joint
 ## 客户端额外依赖
 
 相机图像通过 RTP/H.265 视频流接收（接收实现见 [`rtp_video_interface.py`](rtp_video_interface.py)），
-需要系统级 GStreamer 与 NVIDIA 硬件解码：
+需要 GStreamer 与 PyGObject。新版 `environment.yml` 已包含这些依赖；若客户端环境是旧版
+environment.yml 创建的，在该 conda 环境中补装：
 
 ```bash
-sudo apt update
-sudo apt install -y \
-  python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools \
-  gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-  python3-opencv python3-numpy
+conda install -c conda-forge pygobject gst-python gstreamer \
+    gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
 ```
 
 环境自检（需 `nvidia-smi` 正常、各 GStreamer 插件齐全）：
@@ -161,14 +159,14 @@ trigger >= 0.10:  effort = −1.6 × (trigger − 0.10) / 0.90  # 合爪段： 0
   （先从当前位姿缓起到第 0 帧再按录制帧率回放；`--dry-run` 无需 ROS2，只打印轨迹摘要）：
 
   ```bash
-  python examples/teleavatar_v2/replay_episode.py --episode 0 [--dataset <数据集路径>] [--speed 0.5]
+  python examples/teleavatar_v2/replay_episode.py --dataset <数据集路径> --episode 0 [--speed 0.5]
   ```
 
 - [`zero_from_episode.py`](zero_from_episode.py)：把双臂缓移到某条 episode 的某一帧位姿
   （默认第 0 帧，`--frame -1` 为最后一帧），到位收敛后退出：
 
   ```bash
-  python examples/teleavatar_v2/zero_from_episode.py --episode 0 [--frame -1]
+  python examples/teleavatar_v2/zero_from_episode.py --dataset <数据集路径> --episode 0 [--frame -1]
   ```
 
 - [`test.py`](test.py)：RTP 收流/解码/六路分割保存测试，用于部署前排查视频链路。

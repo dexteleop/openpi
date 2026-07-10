@@ -1011,7 +1011,7 @@ _CONFIGS = [
             action_dim=32  # Teleavatar uses 16-dim actions
         ),
         data=LeRobotTeleavatarV2DataConfig(
-            repo_id="lerobot_0708_new",  # Your local dataset name (under $HF_LEROBOT_HOME, i.e. /model)
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  # No prompts in teleavatar dataset
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -1042,7 +1042,7 @@ _CONFIGS = [
             action_horizon=30
         ),
         data=LeRobotTeleavatarV2DataConfig(
-            repo_id="lerobot_0708_new",  # Your local dataset name (under $HF_LEROBOT_HOME, i.e. /model)
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  #
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -1069,7 +1069,7 @@ _CONFIGS = [
             action_horizon=30
         ),
         data=LeRobotTeleavatarV2DataConfig(
-            repo_id="lerobot_new_0703",  # Your local dataset name (under $HF_LEROBOT_HOME, i.e. /model)
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=False,  # No prompts in teleavatar dataset
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
