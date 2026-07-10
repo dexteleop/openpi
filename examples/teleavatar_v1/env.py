@@ -12,7 +12,7 @@ from openpi_client import image_tools
 from openpi_client.runtime import environment as _environment
 from typing_extensions import override
 
-from examples.teleavatar import ros2_interface
+from examples.teleavatar_v1 import ros2_interface
 
 
 class TeleavatarEnvironment(_environment.Environment):

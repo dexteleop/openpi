@@ -74,7 +74,7 @@ conda env create -n teleavatar_client -f environment.yml
 conda activate teleavatar_client
 ```
 
-客户端脚本（`examples/teleavatar/main.py` 等）依赖本仓库的 `openpi-client` 子包，在该环境中再安装一次：
+客户端脚本（`examples/teleavatar_v1/main.py` 等）依赖本仓库的 `openpi-client` 子包，在该环境中再安装一次：
 
 ```bash
 pip install -e packages/openpi-client
@@ -100,7 +100,7 @@ pip install -e packages/openpi-client
 在开始训练之前，需要计算训练数据的归一化统计信息。使用训练配置名称运行以下脚本。
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi0_teleavatar
+uv run scripts/compute_norm_stats.py --config-name pi0_teleavatar_v1
 ```
 
 `norm_stats.json` 的存放位置取决于 `repo_id` 的写法：
@@ -123,20 +123,20 @@ uv run scripts/compute_norm_stats.py --config-name pi0_teleavatar
 
 | 配置名                          | 基础模型 | 微调方式 | batch_size | 备注                              |
 | ------------------------------- | -------- | -------- | ---------- | --------------------------------- |
-| `pi0_teleavatar`                | pi0      | 完整微调 | 64         | 通用首选                          |
-| `pi05_teleavatar`               | pi05     | 完整微调 | 64         | 余弦学习率 + EMA                  |
-| `pi0_teleavatar_low_mem_finetune` | pi0    | LoRA     | 16         | 低显存，冻结主干、关闭 EMA        |
+| `pi0_teleavatar_v1`                | pi0      | 完整微调 | 64         | 通用首选                          |
+| `pi05_teleavatar_v1`               | pi05     | 完整微调 | 64         | 余弦学习率 + EMA                  |
+| `pi0_teleavatar_v1_low_mem_finetune` | pi0    | LoRA     | 16         | 低显存，冻结主干、关闭 EMA        |
 
-编辑对应的 `TrainConfig` 来调整训练参数。以 `pi0_teleavatar` 为例：
+编辑对应的 `TrainConfig` 来调整训练参数。以 `pi0_teleavatar_v1` 为例：
 
 ```python
 TrainConfig(
-    name="pi0_teleavatar",
+    name="pi0_teleavatar_v1",
     model=pi0_config.Pi0Config(
         action_dim=32,      # 保持 32 以匹配 pi0_base 预训练权重
         action_horizon=30,  # 每次预测 30 步动作
     ),
-    data=LeRobotTeleavatarDataConfig(
+    data=LeRobotTeleavatarV1DataConfig(
         repo_id="path-to-dataset",      # 替换为本地 LeRobot 数据集路径
         base_config=DataConfig(
             prompt_from_task=True,       # 从 LeRobot task 中读取语言指令
@@ -169,11 +169,11 @@ TrainConfig(
 现在可以使用以下命令启动训练。
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_teleavatar --exp-name=my_experiment
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_teleavatar_v1 --exp-name=my_experiment
 ```
 
 - `--exp-name`：实验名称，用于区分不同设置下微调后的权重保存路径。按上面命令微调后，
-  权重保存在 `<checkpoint_base_dir>/pi0_teleavatar/my_experiment/<step>`。
+  权重保存在 `<checkpoint_base_dir>/pi0_teleavatar_v1/my_experiment/<step>`。
 - `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`：允许 JAX 使用高达 90% 的 GPU 内存（默认 75%），以最大化显存利用。
 
 训练过程可在 Weights & Biases 仪表板上监控（需 `wandb_enabled=True`）。
@@ -204,10 +204,10 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_teleavatar --exp-
 
 ### 1. 机器人归零（客户端环境）
 
-部署前先把双臂移动到固定的 home 位姿。在客户端运行 [`zero.py`](zero.py)：
+部署前先把双臂移动到固定的 home 位姿。在客户端运行 [`zero.py`](examples/teleavatar_v1/zero.py)：
 
 ```bash
-python zero.py
+python examples/teleavatar_v1/zero.py
 ```
 
 该脚本是一个 ROS2 节点：从当前关节位置在 5 秒内插值到预设 home 位姿（左右臂目标位姿硬编码在脚本内，
@@ -223,21 +223,21 @@ python zero.py
 
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi0_teleavatar \
-    --policy.dir=checkpoints/pi0_teleavatar/my_experiment/20000
+    --policy.config=pi0_teleavatar_v1 \
+    --policy.dir=checkpoints/pi0_teleavatar_v1/my_experiment/20000
 ```
 
-- `--policy.config`：训练时使用的配置名（如 `pi0_teleavatar` / `pi05_teleavatar`）。
+- `--policy.config`：训练时使用的配置名（如 `pi0_teleavatar_v1` / `pi05_teleavatar_v1`）。
 - `--policy.dir`：检查点目录，其中需包含 `assets/<repo_id>/norm_stats.json`（训练时自动打包）。
 - 默认监听端口为 `8000`，可用 `--port` 修改。
 
 ### 3. 启动底层臂控制器（客户端环境）
 
 策略输出的是目标**关节位置**，需要由一个 100Hz 的 PD 控制器转换为底层速度指令。
-在机器人端启动 [`arm_pd_controller.py`](examples/teleavatar/arm_pd_controller.py)：
+在机器人端启动 [`arm_pd_controller.py`](examples/teleavatar_v1/arm_pd_controller.py)：
 
 ```bash
-python examples/teleavatar/arm_pd_controller.py
+python examples/teleavatar_v1/arm_pd_controller.py
 ```
 
 该节点订阅 `/{left,right}_arm/model_joint_cmd` 与 `/{left,right}_arm/joint_states`，
@@ -246,10 +246,10 @@ python examples/teleavatar/arm_pd_controller.py
 
 ### 4. 运行机器人客户端（客户端环境）
 
-在另一个终端启动机器人控制主程序 [`main.py`](examples/teleavatar/main.py)：
+在另一个终端启动机器人控制主程序 [`main.py`](examples/teleavatar_v1/main.py)：
 
 ```bash
-python examples/teleavatar/main.py --remote-host 127.0.0.1 --remote-port 8000 \
+python examples/teleavatar_v1/main.py --remote-host 127.0.0.1 --remote-port 8000 \
     --prompt "stack the three blocks"
 ```
 
@@ -299,7 +299,7 @@ python examples/teleavatar/main.py --remote-host 127.0.0.1 --remote-port 8000 \
 ## 数据格式说明（参考）
 
 理解灵御机器人的观测/动作约定，对配置训练和部署都很重要。相关实现位于
-[`src/openpi/policies/teleavatar_policy.py`](src/openpi/policies/teleavatar_policy.py)。
+[`src/openpi/policies/teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py)。
 
 ### 相机
 

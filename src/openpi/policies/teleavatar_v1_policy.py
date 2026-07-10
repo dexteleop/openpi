@@ -1,3 +1,11 @@
+"""Policy transforms for the V1 (officially released) Teleavatar robot.
+
+Frozen snapshot kept for v1 users: upside-down stereo head camera
+(rotate_head_camera=True), mono 848x480 left/right cameras, 48-dim
+state/action, and the v1 asymmetric gripper effort mapping. Active
+development targets the v2 robot in teleavatar_policy.py.
+"""
+
 import dataclasses
 import logging
 

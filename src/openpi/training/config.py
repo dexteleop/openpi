@@ -20,7 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
-import openpi.policies.teleavatar_policy as teleavatar_policy
+import openpi.policies.teleavatar_v1_policy as teleavatar_v1_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -370,9 +370,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotTeleavatarDataConfig(DataConfigFactory):
+class LeRobotTeleavatarV1DataConfig(DataConfigFactory):
     """
-    Config for training on Teleavatar dual-arm robot dataset.
+    Config for training on the Teleavatar v1 (officially released) dual-arm robot dataset.
 
     This config handles the 48-dimensional state (joint positions, velocities, efforts)
     and 3 camera feeds (left_color, right_color, head_color).
@@ -408,12 +408,12 @@ class LeRobotTeleavatarDataConfig(DataConfigFactory):
         # Data transforms for teleavatar policy
         data_transforms = _transforms.Group(
             inputs=[
-                teleavatar_policy.TeleavatarInputs(
+                teleavatar_v1_policy.TeleavatarInputs(
                     model_type=model_config.model_type,
                     rotate_head_camera=self.rotate_head_camera,
                 )
             ],
-            outputs=[teleavatar_policy.TeleavatarOutputs()],
+            outputs=[teleavatar_v1_policy.TeleavatarOutputs()],
         )
 
         # Apply delta actions if requested (for joint positions/velocities, not gripper efforts)
@@ -836,17 +836,17 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
-    # Fine-tuning Teleavatar configs.
+    # Fine-tuning Teleavatar v1 configs.
     #
     TrainConfig(
-        name="pi05_teleavatar",
+        name="pi05_teleavatar_v1",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=30,
             discrete_state_input=False,
             action_dim=32  # Teleavatar uses 16-dim actions
         ),
-        data=LeRobotTeleavatarDataConfig(
+        data=LeRobotTeleavatarV1DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  # No prompts in teleavatar dataset
@@ -870,13 +870,13 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     TrainConfig(
-        name="pi0_teleavatar",
+        name="pi0_teleavatar_v1",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=30
         ),
-        data=LeRobotTeleavatarDataConfig(
+        data=LeRobotTeleavatarV1DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  #
@@ -894,7 +894,7 @@ _CONFIGS = [
         
     ),
     TrainConfig(
-        name="pi0_teleavatar_low_mem_finetune",
+        name="pi0_teleavatar_v1_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora",
@@ -902,7 +902,7 @@ _CONFIGS = [
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=30
         ),
-        data=LeRobotTeleavatarDataConfig(
+        data=LeRobotTeleavatarV1DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=False,  # No prompts in teleavatar dataset
