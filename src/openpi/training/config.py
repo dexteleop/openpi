@@ -178,12 +178,26 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        asset_id = self.assets.asset_id or repo_id
+        # An absolute-path repo_id (local dataset) must not be used as the
+        # asset_id: every `... / asset_id` join would resolve to the dataset
+        # directory (absolute paths win in path joins), so checkpoints's
+        # assets/ would silently stay empty and serving would only work with
+        # the dataset mounted at the same path. Use the dataset basename
+        # instead, so norm stats really get packaged into the checkpoint.
+        is_local_path = repo_id is not None and pathlib.PurePath(repo_id).is_absolute()
+        asset_id = self.assets.asset_id or (pathlib.PurePath(repo_id).name if is_local_path else repo_id)
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+        if norm_stats is None and is_local_path:
+            # Convention for local datasets: compute_norm_stats.py writes
+            # <dataset>/norm_stats.json (its output path joins the absolute
+            # repo_id). Load from there so the stats live with the data and
+            # get copied into the checkpoint's assets/<basename>/ on save.
+            norm_stats = self._load_norm_stats(epath.Path(repo_id).parent, pathlib.PurePath(repo_id).name)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=norm_stats,
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 

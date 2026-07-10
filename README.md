@@ -103,9 +103,17 @@ pip install -e packages/openpi-client
 uv run scripts/compute_norm_stats.py --config-name pi0_teleavatar
 ```
 
-生成的 `norm_stats.json` 会写入 `./assets/<config_name>/<repo_id>/` 目录下
-（例如 `./assets/pi0_teleavatar/<your_dataset>/norm_stats.json`）。训练时会自动读取，
-并在保存检查点时一并打包进检查点的 `assets/<repo_id>/` 目录，供推理时使用。
+`norm_stats.json` 的存放位置取决于 `repo_id` 的写法：
+
+- **`repo_id` 为数据集绝对路径**（本仓库推荐用法）：写入**数据集目录本身**
+  （`<数据集>/norm_stats.json`），与数据放在一起；训练启动时会从该处读取。
+- **`repo_id` 为裸名字**（配合 `HF_LEROBOT_HOME`）：写入 `./assets/<config_name>/<repo_id>/`
+  （相对**运行命令时的工作目录**，训练时必须从同一目录启动才能读到）。
+
+无论哪种方式，训练保存检查点时都会把 norm stats 复制进检查点的
+`<step>/assets/<数据集名>/norm_stats.json`，推理时从检查点内读取，checkpoint 拷到其他机器可直接使用。
+若训练启动日志出现 `Norm stats not found in ..., skipping.`，说明没有读到归一化参数，
+训练会**静默地在不归一化的情况下继续**——务必确认日志中有 `Loaded norm stats from ...` 再继续。
 
 
 ### 4. 选择并配置训练参数
