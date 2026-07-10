@@ -18,10 +18,10 @@
 本文档只写两代**共享**的内容（环境安装、模型微调、共通数据格式）；各代的**部署流程、话题、
 相机格式与夹爪映射**见各自的说明文档：
 
-- **v1（官方发布版）**：[examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
-- **v2（当前开发版）**：[examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
+- **v1**：[examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
+- **v2**：[examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
 
-| | v1（官方发布版） | v2（当前开发版） |
+| | v1 | v2 |
 | --- | --- | --- |
 | 训练配置 | `pi0_teleavatar_v1` / `pi05_teleavatar_v1` / `pi0_teleavatar_v1_low_mem_finetune` | `pi0_teleavatar_v2` / `pi05_teleavatar_v2` / `pi0_teleavatar_v2_low_mem_finetune` |
 | 策略模块 | [`teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py) | [`teleavatar_v2_policy.py`](src/openpi/policies/teleavatar_v2_policy.py) |
@@ -225,7 +225,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_teleavatar_v2 --e
 ### 状态（observation/state）
 
 数据集存储的本体感觉状态以 48 维 `[位置(16), 速度(16), 力矩(16)]` 为基础布局（两代相同），
-其后可追加任意字段（如末端位姿、底盘电机等，例如当前 v2 数据集为 62 或 72 维）；
+其后可追加任意字段（如末端位姿、底盘电机等）；
 模型只按固定索引取数，追加字段自动忽略。每个 16 维块内部布局一致：
 
 ```

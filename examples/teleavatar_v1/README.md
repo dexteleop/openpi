@@ -1,4 +1,4 @@
-# Teleavatar v1（官方发布版）部署与数据格式
+# Teleavatar v1 部署与数据格式
 
 v1 机器人的特点：相机走 ROS2 `FFMPEGPacket` 话题（头部倒装双目 + 单目双腕，PyAV 解码）；
 臂控制需要 100Hz PD 速度中继（`arm_pd_controller.py`）；夹爪为非对称 ±7 线性映射。
