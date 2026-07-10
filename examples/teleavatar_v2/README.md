@@ -101,13 +101,13 @@ S100 将头部（2 目）+ 双腕（各 2 目）相机下采样后按曝光时�
 H.265 编码后经 RTP 推流（默认端口 8890，payload 96，约 45 fps）。客户端由
 [`rtp_video_interface.py`](rtp_video_interface.py) 的 `RTPH265VideoInterface` 用 GStreamer
 （`nvh265dec`）解码，并按固定区域裁出六路子画面；`ros2_interface` 取其中三路映射为策略输入
-（RTP 分割图为厂商命名，该映射已在真机上核对、与训练裁剪逐像素一致）：
+（该映射已在真机上核对、与训练时的内侧眼裁剪一致）：
 
 | 策略观测键     | RTP 分割图              | 尺寸 (H×W)  | 说明               |
 | -------------- | ----------------------- | ----------- | ------------------ |
 | `head_camera`  | `head_left_eye`         | 960×960     | 头部左目           |
-| `left_color`   | `left_wrist_left_eye`   | 400×640     | 左腕（厂商命名左目）|
-| `right_color`  | `right_wrist_right_eye` | 400×640     | 右腕（厂商命名右目）|
+| `left_color`   | `left_wrist_right_eye`  | 400×640     | 左腕右目（内侧）   |
+| `right_color`  | `right_wrist_left_eye`  | 400×640     | 右腕左目（内侧）   |
 
 > 若发送端拼接布局变化，需同步修改接口内 `TELEAVATAR_SPLIT_REGIONS` 的裁剪坐标；
 > 收流测试可用 [`test.py`](test.py)。

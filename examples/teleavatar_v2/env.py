@@ -130,8 +130,8 @@ class TeleavatarEnvironment(_environment.Environment):
                 - 'prompt': Language instruction
 
         Note: Image formats match the (cropped) training data:
-            - left_color: RTP split `left_wrist_left_eye`, 400×640×3 (H,W,C)
-            - right_color: RTP split `right_wrist_right_eye`, 400×640×3 (H,W,C)
+            - left_color: RTP split `left_wrist_right_eye`, 400×640×3 (H,W,C)
+            - right_color: RTP split `right_wrist_left_eye`, 400×640×3 (H,W,C)
             - head_camera: RTP split `head_left_eye`, 960×960×3 (H,W,C)
         All views are split from the RTP composite frame by the
         RTP video interface; the policy's _parse_image will handle any

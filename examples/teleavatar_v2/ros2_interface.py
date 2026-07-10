@@ -14,9 +14,9 @@ Image strategy (v2 robot, RTP composite stream):
   views at fixed crop regions (TELEAVATAR_SPLIT_REGIONS).
 - get_observation() maps the three views the policy needs onto the training
   keys (see _POLICY_TO_RTP_VIEW): head_camera ← head_left_eye (960×960),
-  left_color ← left_wrist_left_eye (400×640), right_color ←
-  right_wrist_right_eye (400×640). The RTP view names are the vendor's;
-  the mapping was verified on-robot to reproduce the same single-eye views
+  left_color ← left_wrist_right_eye (400×640), right_color ←
+  right_wrist_left_eye (400×640) — the inner eyes facing the desk center.
+  The mapping was verified on-robot to reproduce the same single-eye views
   TeleavatarInputs crops from the raw training videos, so its aspect-ratio
   guard passes them through untouched and train/deploy see the same pixels.
 """
