@@ -30,6 +30,8 @@ The following base VLA model weights are provided for fine-tuning:
   - [5. Launch Training](#5-launch-training)
 - [Real-Robot Deployment](#-real-robot-deployment)
 - [Data Format (Shared)](#-data-format-shared)
+- [License](#-license)
+- [Acknowledgments](#-acknowledgments)
 
 ## 🤖 Robot Generations
 
@@ -262,3 +264,11 @@ The `action` sequence in the dataset shares the state layout; 16 dims are extrac
 ```
 
 Grippers are **force-controlled**: the platform accepts a trigger value in `[0, 1]` and maps it to an effort (Nm) through a curve that **differs between the two generations** (see the per-generation READMEs). At training time, `TeleavatarInputs` applies the inverse of the corresponding curve to convert the dataset's gripper efforts to trigger values; at inference, `TeleavatarOutputs` converts the model output back to efforts, which `ros2_interface` finally converts to trigger values for publishing. **Note**: this conversion happens before dataset norm-stats normalization — if you change this logic, you must re-run `scripts/compute_norm_stats.py`.
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 — see [LICENSE](LICENSE).
+
+## 🙏 Acknowledgments
+
+Built on [openpi](https://github.com/Physical-Intelligence/openpi) by Physical Intelligence (Apache 2.0). Dataset conversion toolkits: [rosbag_to_dataset_TA1](https://github.com/dexteleop/rosbag_to_dataset_TA1) / [rosbag_to_dataset_TA2](https://github.com/dexteleop/rosbag_to_dataset_TA2).
