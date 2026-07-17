@@ -271,4 +271,4 @@ This project is licensed under the Apache License 2.0 — see [LICENSE](LICENSE)
 
 ## 🙏 Acknowledgments
 
-Built on [openpi](https://github.com/Physical-Intelligence/openpi) by Physical Intelligence (Apache 2.0). Dataset conversion toolkits: [rosbag_to_dataset_TA1](https://github.com/dexteleop/rosbag_to_dataset_TA1) / [rosbag_to_dataset_TA2](https://github.com/dexteleop/rosbag_to_dataset_TA2).
+Built on [openpi](https://github.com/Physical-Intelligence/openpi) by Physical Intelligence (Apache 2.0).
