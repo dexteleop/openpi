@@ -67,7 +67,7 @@ The client-side software dependencies for real-robot deployment (ROS2, etc.) are
 When cloning this repository, make sure to fetch the submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/zhou-yh19/openpi.git
+git clone --recurse-submodules https://github.com/dexteleop/openpi.git
 ```
 
 The project uses **two separate environments**, which may live on different (or the same) machines:
