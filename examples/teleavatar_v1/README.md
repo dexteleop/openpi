@@ -112,7 +112,7 @@ The V1 platform's `/api/<arm>/joint_cmd` accepts **velocity commands**, so the t
 python examples/teleavatar_v1/arm_pd_controller.py
 ```
 
-This node subscribes to `/{left,right}_arm/model_joint_cmd` and `/{left,right}_arm/joint_states`, computes velocities as `v = kp * (q_des - q_state)` (with clipping and a 0.5 s command timeout), and publishes to `/api/{left,right}_arm/joint_cmd`.
+This node subscribes to `/{left,right}_arm/model_joint_cmd` and `/{left,right}_arm/joint_states`, computes velocities as `v = kp * (q_des - q_state)` (with a 0.5 s command timeout), and publishes to `/api/{left,right}_arm/joint_cmd`. Pass `--safe` to clip the commanded velocities to ±0.3 × the platform velocity limits.
 
 ### 4. Run the Robot Client (Client)
 

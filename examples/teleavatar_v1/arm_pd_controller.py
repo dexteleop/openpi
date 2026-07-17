@@ -12,8 +12,11 @@ Publishes to:
   - /api/left_arm/joint_cmd (velocity commands at 100Hz)
   - /api/right_arm/joint_cmd (velocity commands at 100Hz)
 
-Control law: v = clip(kp * (des_q - state_q), ±0.3 * vel_limit)
+Control law: v = kp * (des_q - state_q)
+(with --safe, clipped to ±0.3 * vel_limit)
 """
+
+import argparse
 
 import numpy as np
 import rclpy
@@ -24,8 +27,11 @@ from sensor_msgs.msg import JointState
 class ArmVelocityController(Node):
     """Proportional controller for arm velocity control."""
 
-    def __init__(self):
+    def __init__(self, safe: bool = False):
         super().__init__('arm_velocity_controller')
+
+        # With safe=True, commanded velocities are clipped to ±0.3 * vel_limit.
+        self.safe = safe
 
         # Control parameters
         self.arm_ctrl_dt = 1.0 / 100.0  # 100 Hz control loop
@@ -102,7 +108,10 @@ class ArmVelocityController(Node):
         # Control loop timer (100 Hz)
         self.create_timer(self.arm_ctrl_dt, self.control_loop)
 
-        self.get_logger().info('Arm velocity controller initialized (100Hz)')
+        self.get_logger().info(
+            'Arm velocity controller initialized (100Hz'
+            + (', velocity clip ±0.3*vel_limit)' if safe else ', no velocity clip)')
+        )
 
     def left_model_cmd_callback(self, msg: JointState):
         """Receive desired position from policy for left arm."""
@@ -141,8 +150,9 @@ class ArmVelocityController(Node):
             target_velocity
         """
         vel_fb = kp_err * (des_q - state_q)
-        vel_fb_clipped = np.clip(vel_fb, -0.3 * self.joint_vel_limit, 0.3 * self.joint_vel_limit)
-        return vel_fb_clipped
+        if self.safe:
+            vel_fb = np.clip(vel_fb, -0.3 * self.joint_vel_limit, 0.3 * self.joint_vel_limit)
+        return vel_fb
 
     def control_loop(self):
         """Main control loop running at 100 Hz."""
@@ -227,8 +237,13 @@ class ArmVelocityController(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    controller = ArmVelocityController()
+    parser = argparse.ArgumentParser(description="Teleavatar V1 arm velocity controller")
+    parser.add_argument("--safe", action="store_true",
+                        help="Clip commanded velocities to ±0.3 × the platform velocity limits")
+    parsed, ros_args = parser.parse_known_args(args)
+
+    rclpy.init(args=ros_args)
+    controller = ArmVelocityController(safe=parsed.safe)
 
     try:
         rclpy.spin(controller)

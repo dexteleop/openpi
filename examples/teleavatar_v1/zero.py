@@ -122,8 +122,8 @@ class JointInterpolator(Node):
         cmd_msg.position = des_position.tolist()
         kp = np.array([ 7, 7, 10, 10, 10, 8, 8 ])
         vel_fb = kp * (des_position - self.current_pos)
-        # Clip the raw P term (same 0.3 * vel_limit cap as arm_pd_controller);
-        # with a multi-radian error it would otherwise reach ~30 rad/s.
+        # Clip the raw P term to ±0.3 * vel_limit; with a multi-radian error
+        # it would otherwise reach ~30 rad/s.
         vel_fb = np.clip(vel_fb, -0.3 * self.vel_limit, 0.3 * self.vel_limit)
         for i in range(len(self.enable_flags)):
             if self.enable_flags[i]:
