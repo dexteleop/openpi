@@ -12,6 +12,9 @@ For installation, the fine-tuning workflow, and the shared data format, see the 
 ## 📑 Table of Contents
 
 - [Client Dependencies](#-client-dependencies)
+- [Robot-Side Setup](#-robot-side-setup)
+  - [1. Switch the Robot to API Mode](#1-switch-the-robot-to-api-mode)
+  - [2. Topic Bridging & ROS Domain](#2-topic-bridging--ros-domain)
 - [Deployment Data Flow](#-deployment-data-flow)
 - [Deployment Steps](#-deployment-steps)
   - [1. Zero the Robot (Client)](#1-zero-the-robot-client)
@@ -25,6 +28,40 @@ For installation, the fine-tuning workflow, and the shared data format, see the 
 ## 📦 Client Dependencies
 
 Camera decoding uses PyAV (`av`) to subscribe to the `FFMPEGPacket` topics. The dependency is already included in `environment.yml` — no extra installation needed. An NVIDIA GPU on the client is recommended to enable `hevc_cuvid` hardware decoding; otherwise decoding falls back to the CPU.
+
+## 🔌 Robot-Side Setup
+
+Before deploying, the robot must be switched out of VR/teleoperation mode. This setup is one-time (the configuration is persisted and applied on reboot). See the TA1 user manual for details.
+
+### 1. Switch the Robot to API Mode
+
+Edit `/root/system_config.yaml` on the robot's main controller (RK3588):
+
+```yaml
+robot:
+  meta_mode: 1            # 0 = VR/teleop, 1 = API
+  left:
+    enable: true
+    arm_control_mode: 1   # 0 = end-effector, 1 = joint; the policy sends joint commands
+  right:
+    enable: true
+    arm_control_mode: 1
+```
+
+The remaining fields (`enable_collision_check`, `chassis`, `adjust_pose`, etc.) can stay at their defaults — see the TA1 user manual. Then power-cycle the robot to apply the change.
+
+> When switching back to VR mode, `arm_control_mode` must be set back to end-effector (`0`) so that IK is available.
+
+### 2. Topic Bridging & ROS Domain
+
+TA1 connects the robot and the client host through a built-in bridge service: state topics (joint states, cameras) are bridged **out** of the robot, and `/api` control topics are bridged **in**. Run the client with the default **`ROS_DOMAIN_ID=0`** — make sure the variable is not exported to another value in your shell (e.g. `29` left over from a TeleAvatar V2 setup).
+
+Verify from the client host:
+
+```bash
+ros2 topic list
+ros2 topic echo /right_arm/joint_states
+```
 
 ## 🔄 Deployment Data Flow
 
@@ -41,9 +78,11 @@ cameras/joints (ROS2)  →  ros2_interface  →  main.py (env)  ──WebSocket�
                       arm_pd_controller (100 Hz PD)  →  /api/<arm>/joint_cmd (velocity commands)
 ```
 
-> `serve_policy` runs on the **server** (uv environment); `zero.py`, `arm_pd_controller.py`, and `main.py` run on the **client** (conda + ROS2 environment).
+> `serve_policy` runs on the **server** (uv environment); `zero.py`, `arm_pd_controller.py`, and `main.py` run on the **client** (conda + ROS2 environment). Topics between the robot and the client go through the built-in bridge service (see [Robot-Side Setup](#-robot-side-setup)).
 
 ## 🚀 Deployment Steps
+
+The steps below assume [Robot-Side Setup](#-robot-side-setup) is complete: the robot is in API mode with joint control, and the client shell uses the default `ROS_DOMAIN_ID=0`.
 
 ### 1. Zero the Robot (Client)
 
