@@ -372,10 +372,14 @@ class TeleavatarROS2Interface(Node):
         motions."""
         target = np.asarray(positions, dtype=np.float64)
         clamped = np.clip(target, self.joint_lower[arm], self.joint_upper[arm])
-        if not np.allclose(clamped, target, atol=1e-9):
+        touched = np.flatnonzero(~np.isclose(clamped, target, atol=1e-9))
+        if touched.size:
+            names = self.left_joint_names if arm == 'left_arm' else self.right_joint_names
+            details = ", ".join(
+                f"{names[i]} {target[i]:.3f}->{clamped[i]:.3f}" for i in touched
+            )
             self.logger.warning(
-                f"{arm} command clamped to joint limits, "
-                f"max deviation {np.max(np.abs(clamped - target)):.3f} rad",
+                f"{arm} command clamped to joint limits: {details}",
                 throttle_duration_sec=2.0,
             )
         return clamped
