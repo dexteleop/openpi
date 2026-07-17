@@ -1,171 +1,163 @@
-# openpi（灵御双臂机器人）
+# openpi for TeleAvatar Dual-Arm Robots
 
-> 📖 上游通用 openpi 文档（PyTorch 支持、模型清单、排错等）见 [README_openpi.md](README_openpi.md)。
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/release/python-3110/)
+[![ROS2 Humble](https://img.shields.io/badge/ROS2-Humble-blue.svg)](https://docs.ros.org/en/humble/)
 
-该代码仓库基于 [openpi](https://github.com/Physical-Intelligence/openpi)，面向灵御（Teleavatar）双臂机器人，包含开源基础模型、用于微调训练的程序，以及在真机上通过 ROS2 部署推理的完整链路。
+This repository is based on [openpi](https://github.com/Physical-Intelligence/openpi) and targets the TeleAvatar dual-arm robots (TeleAvatar V1 and TeleAvatar V2). It provides open-source base VLA models, the fine-tuning pipeline, and the complete ROS2 stack for deploying policies on the real robots.
 
-提供以下基础 VLA 模型权重用于微调训练：
+> 📖 For the general upstream openpi documentation (PyTorch support, full model list, troubleshooting, etc.), see [README_openpi.md](README_openpi.md).
 
-| 基础模型 | 用途 | 描述                                                                  | 检查点路径                                 |
-| -------- | ---- | ------------------------------------------------------------------- | ------------------------------------------ |
-| π₀       | 微调 | [π₀ 基础模型](https://www.physicalintelligence.company/blog/pi0)    | `gs://openpi-assets/checkpoints/pi0_base`  |
-| π₀.₅     | 微调 | [π₀.₅ 基础模型](https://www.physicalintelligence.company/blog/pi05) | `gs://openpi-assets/checkpoints/pi05_base` |
+The following base VLA model weights are provided for fine-tuning:
 
+| Base model | Usage       | Description                                                          | Checkpoint path                            |
+| ---------- | ----------- | -------------------------------------------------------------------- | ------------------------------------------ |
+| π₀         | Fine-tuning | [π₀ base model](https://www.physicalintelligence.company/blog/pi0)   | `gs://openpi-assets/checkpoints/pi0_base`  |
+| π₀.₅       | Fine-tuning | [π₀.₅ base model](https://www.physicalintelligence.company/blog/pi05) | `gs://openpi-assets/checkpoints/pi05_base` |
 
-## 机器人版本
+## 📑 Table of Contents
 
-本仓库同时维护两代灵御机器人，两代代码**完全分开**（同上游 aloha/droid 的多机器人模式）。
-本文档只写两代**共享**的内容（环境安装、模型微调、共通数据格式）；各代的**部署流程、话题、
-相机格式与夹爪映射**见各自的说明文档：
+- [Robot Generations](#-robot-generations)
+- [System Requirements](#-system-requirements)
+- [Installation](#-installation)
+  - [Server Environment (uv)](#server-environment-uv)
+  - [Client Environment (conda + ROS2)](#client-environment-conda--ros2)
+- [Fine-Tuning](#-fine-tuning)
+  - [1. Download the Base Model](#1-download-the-base-model)
+  - [2. Convert Teleoperation Data to a LeRobot Dataset](#2-convert-teleoperation-data-to-a-lerobot-dataset)
+  - [3. Choose and Configure a Training Config](#3-choose-and-configure-a-training-config)
+  - [4. Compute Normalization Statistics](#4-compute-normalization-statistics)
+  - [5. Launch Training](#5-launch-training)
+- [Real-Robot Deployment](#-real-robot-deployment)
+- [Data Format (Shared)](#-data-format-shared)
 
-- **v1**：[examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
-- **v2**：[examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
+## 🤖 Robot Generations
 
-| | v1 | v2 |
+This repository supports both TeleAvatar generations side by side; the two codepaths are **fully separated** (mirroring the upstream aloha/droid multi-robot layout). This document covers only what the two generations **share** (installation, fine-tuning workflow, common data format). For each generation's **deployment procedure, topics, camera formats, and gripper mapping**, see its own README:
+
+- **TeleAvatar V1**: [examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
+- **TeleAvatar V2**: [examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
+
+| | TeleAvatar V1 | TeleAvatar V2 |
 | --- | --- | --- |
-| 训练配置 | `pi0_teleavatar_v1` / `pi05_teleavatar_v1` / `pi0_teleavatar_v1_low_mem_finetune` | `pi0_teleavatar_v2` / `pi05_teleavatar_v2` / `pi0_teleavatar_v2_low_mem_finetune` |
-| 策略模块 | [`teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py) | [`teleavatar_v2_policy.py`](src/openpi/policies/teleavatar_v2_policy.py) |
-| 客户端 | [`examples/teleavatar_v1/`](examples/teleavatar_v1/) | [`examples/teleavatar_v2/`](examples/teleavatar_v2/) |
-| 相机 | ROS2 FFMPEGPacket（头部倒装双目 + 单目双腕，PyAV 解码） | RTP/H265 拼接流（三路双目各取单眼，GStreamer 解码） |
-| 臂控制 | `model_joint_cmd` + `arm_pd_controller`（100Hz PD 速度中继） | 位置指令直发 `/api/<arm>/joint_cmd` |
-| 夹爪映射 | 非对称 ±7 线性曲线 | 对称分段曲线（过零点 trigger = 0.10） |
+| Training configs | `pi0_teleavatar_v1` / `pi05_teleavatar_v1` / `pi0_teleavatar_v1_low_mem_finetune` | `pi0_teleavatar_v2` / `pi05_teleavatar_v2` / `pi0_teleavatar_v2_low_mem_finetune` |
+| Policy module | [`teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py) | [`teleavatar_v2_policy.py`](src/openpi/policies/teleavatar_v2_policy.py) |
+| Client | [`examples/teleavatar_v1/`](examples/teleavatar_v1/) | [`examples/teleavatar_v2/`](examples/teleavatar_v2/) |
+| Dataset conversion | [rosbag_to_dataset_TA1](https://github.com/dexteleop/rosbag_to_dataset_TA1) | [rosbag_to_dataset_TA2](https://github.com/dexteleop/rosbag_to_dataset_TA2) |
+| Cameras | ROS2 FFMPEGPacket topics (upside-down stereo head + mono wrists, PyAV decoding) | Single RTP/H.265 combined stream (three stereo cameras, one eye each, GStreamer decoding) |
+| Arm control | `model_joint_cmd` + `arm_pd_controller` (100 Hz PD velocity relay) | Position commands published directly to `/api/<arm>/joint_cmd` |
+| Gripper mapping | Asymmetric ±7 linear curve | Symmetric piecewise curve (zero crossing at trigger = 0.10) |
 
+## 📋 System Requirements
 
-## 系统要求
+Running the models in this repository requires an NVIDIA GPU with at least the following specs. The training script does not currently support multi-node training.
 
-要运行本仓库中的模型，需要配备至少以下规格的 NVIDIA GPU。当前训练脚本尚不支持多节点训练。
+| Mode                | Required VRAM | Example GPU        |
+| ------------------- | ------------- | ------------------ |
+| Inference           | > 8 GB        | RTX 4090           |
+| Fine-tuning (LoRA)  | > 22 GB       | RTX 4090 / A100    |
+| Fine-tuning (full)  | > 70 GB       | A100 (80GB) / H100 |
 
-| 模式             | 所需内存 | 示例 GPU           |
-| ---------------- | -------- | ------------------ |
-| 推理             | > 8 GB   | RTX 4090           |
-| 微调（LoRA）     | > 22 GB  | RTX 4090 / A100    |
-| 微调（完整）     | > 70 GB  | A100 (80GB) / H100 |
+The client-side software dependencies for real-robot deployment (ROS2, etc.) are installed together via [`environment.yml`](environment.yml) — see [Installation](#-installation). An NVIDIA GPU is recommended on the client for camera decoding; the decoding dependencies differ between the two generations, see the per-generation READMEs.
 
-真机部署的客户端软件依赖（ROS2 等）随 [`environment.yml`](environment.yml) 一并安装，详见
-[环境安装](#环境安装)。相机解码建议客户端配 NVIDIA GPU，两代的解码依赖不同，见各代 README。
+## 🔧 Installation
 
-
-## 环境安装
-
-克隆本仓库时，请确保更新子模块。
+When cloning this repository, make sure to fetch the submodules:
 
 ```bash
-git clone https://github.com/zhou-yh19/openpi.git
+git clone --recurse-submodules https://github.com/zhou-yh19/openpi.git
 ```
 
-本项目分为**两套环境**，分别部署在不同（或相同）机器上：
+The project uses **two separate environments**, which may live on different (or the same) machines:
 
-| 环境       | 用途                                       | 包含          | 安装方式              |
-| ---------- | ------------------------------------------ | ------------- | --------------------- |
-| 服务端     | 训练、计算归一化、策略推理服务（JAX/GPU）  | openpi 本体   | `uv`                  |
-| 客户端     | 真机部署，采集观测、下发动作（ROS2）       | ROS2 + 客户端 | `conda environment.yml` |
+| Environment | Purpose                                                        | Contains            | Installed with          |
+| ----------- | -------------------------------------------------------------- | ------------------- | ----------------------- |
+| Server      | Training, norm stats, policy inference service (JAX/GPU)       | openpi itself       | `uv`                    |
+| Client      | Real-robot deployment: collect observations, send actions (ROS2) | ROS2 + client code | `conda environment.yml` |
 
-> 训练和计算归一化只需要服务端环境；真机部署时服务端跑策略服务，客户端通过 WebSocket 与之通信。
+> Training and norm-stats computation only need the server environment. For real-robot deployment, the server runs the policy service and the client talks to it over WebSocket.
 
-### 服务端环境（uv）
+### Server Environment (uv)
 
-使用 [uv](https://docs.astral.sh/uv/) 来管理 Python 依赖。
+We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies.
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 或者如果没有 curl，可以使用 wget
+# Or, if you don't have curl, use wget
 wget -qO- https://astral.sh/uv/install.sh | sh
 ```
 
-安装 uv 后，运行以下命令来设置环境。
+Once uv is installed, run the following to set up the environment:
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
-注意：`GIT_LFS_SKIP_SMUDGE=1` 是为了拉取 LeRobot 作为依赖项所必需的。
+Note: `GIT_LFS_SKIP_SMUDGE=1` is required to pull LeRobot as a dependency.
 
-### 客户端环境（conda + ROS2）
+### Client Environment (conda + ROS2)
 
-真机部署侧需要 ROS2，本仓库提供了一份 conda 环境文件 [`environment.yml`](environment.yml)
-（基于 robostack 的 ROS2 Humble，含 `rclpy`、`ffmpeg_image_transport_msgs`、`av` 等）。
-用 conda/mamba 创建并激活：
+The robot side needs ROS2. This repository ships a conda environment file [`environment.yml`](environment.yml) (robostack-based ROS2 Humble, including `rclpy`, `ffmpeg_image_transport_msgs`, `av`, etc.). Create and activate it with conda/mamba:
 
 ```bash
 conda env create -n teleavatar_client -f environment.yml
 conda activate teleavatar_client
 ```
 
-客户端脚本依赖本仓库的 `openpi-client` 子包，在该环境中再安装一次：
+The client scripts depend on this repository's `openpi-client` subpackage; install it inside the same environment:
 
 ```bash
 pip install -e packages/openpi-client
 ```
 
-相机解码依赖（v1 用 PyAV，v2 用 GStreamer/PyGObject）均已随 environment.yml 安装；
-自检方法与旧环境的补装命令见各代 README 的"客户端额外依赖"一节。
+The camera decoding dependencies (PyAV for V1, GStreamer/PyGObject for V2) are already installed via `environment.yml`. Self-check instructions and the extra install commands for environments created from an older `environment.yml` are in the "Client Dependencies" section of each generation's README.
 
+## 🚀 Fine-Tuning
 
-## 模型微调
+### 1. Download the Base Model
 
-### 1. 下载 base_model
+Place `pi0_base` (or `pi05_base`) under `~/.cache/openpi/openpi-assets/checkpoints/` ahead of time. Alternatively, the `weight_loader` can pull it directly from `gs://openpi-assets/...` at training time.
 
-提前将 `pi0_base`（或 `pi05_base`）放入到 `~/.cache/openpi/openpi-assets/checkpoints/` 目录中。
-训练时也可由 `weight_loader` 直接从 `gs://openpi-assets/...` 拉取。
+### 2. Convert Teleoperation Data to a LeRobot Dataset
 
+Each generation has its own conversion toolkit for turning rosbags into LeRobot datasets:
 
-### 2. 把遥操作数据转换为 LeRobot 数据集
+- **TeleAvatar V1**: [rosbag_to_dataset_TA1](https://github.com/dexteleop/rosbag_to_dataset_TA1)
+- **TeleAvatar V2**: [rosbag_to_dataset_TA2](https://github.com/dexteleop/rosbag_to_dataset_TA2)
 
-使用代码库 [rosbag_to_lerobot](https://github.com/dexteleop/rosbag_to_lerobot) 将 rosbag 转换为 LeRobot 数据集。
-转换后的数据集需符合 [数据格式说明（共通）](#数据格式说明共通) 中描述的状态布局和 `action`
-序列约定，相机键与分辨率见各代 README。
+The converted dataset must follow the state layout and `action` sequence conventions described in [Data Format (Shared)](#-data-format-shared). Camera keys and resolutions are generation-specific — see the per-generation READMEs.
 
+### 3. Choose and Configure a Training Config
 
-### 3. 计算训练集归一化参数
+[`src/openpi/training/config.py`](src/openpi/training/config.py) pre-defines 3 training configs per generation; choose based on your VRAM and needs:
 
-在开始训练之前，需要计算训练数据的归一化统计信息。使用训练配置名称运行以下脚本（v1 换成对应的 `*_v1` 配置名）。
+| Config (V1 / V2)                   | Base model | Fine-tuning | batch_size | Notes                              |
+| ---------------------------------- | ---------- | ----------- | ---------- | ---------------------------------- |
+| `pi0_teleavatar_v1` / `pi0_teleavatar_v2`   | π₀        | Full        | 64         | Default choice                     |
+| `pi05_teleavatar_v1` / `pi05_teleavatar_v2` | π₀.₅      | Full        | 64         | Cosine LR schedule + EMA           |
+| `pi0_teleavatar_v1_low_mem_finetune` / `pi0_teleavatar_v2_low_mem_finetune` | π₀ | LoRA | 16 | Low VRAM: frozen backbone, EMA off |
 
-```bash
-uv run scripts/compute_norm_stats.py --config-name pi0_teleavatar_v2
-```
+Edit the corresponding `TrainConfig` to adjust training parameters. **The one field you MUST edit is `repo_id`** — point it at your converted LeRobot dataset; everything else has working defaults.
 
-`norm_stats.json` 的存放位置取决于 `repo_id` 的写法：
-
-- **`repo_id` 为数据集绝对路径**（本仓库推荐用法）：写入**数据集目录本身**
-  （`<数据集>/norm_stats.json`），与数据放在一起；训练启动时会从该处读取。
-- **`repo_id` 为裸名字**（配合 `HF_LEROBOT_HOME`）：写入 `./assets/<config_name>/<repo_id>/`
-  （相对**运行命令时的工作目录**，训练时必须从同一目录启动才能读到）。
-
-无论哪种方式，训练保存检查点时都会把 norm stats 复制进检查点的
-`<step>/assets/<数据集名>/norm_stats.json`，推理时从检查点内读取，checkpoint 拷到其他机器可直接使用。
-若训练启动日志出现 `Norm stats not found in ..., skipping.`，说明没有读到归一化参数，
-训练会**静默地在不归一化的情况下继续**——务必确认日志中有 `Loaded norm stats from ...` 再继续。
-
-
-### 4. 选择并配置训练参数
-
-本仓库在 [`src/openpi/training/config.py`](src/openpi/training/config.py) 中为两代机器人各预置了
-3 个训练配置，可根据显存和需求选择：
-
-| 配置名（v1 / v2）                  | 基础模型 | 微调方式 | batch_size | 备注                              |
-| --------------------------------- | -------- | -------- | ---------- | --------------------------------- |
-| `pi0_teleavatar_v1` / `pi0_teleavatar_v2`   | pi0      | 完整微调 | 64         | 通用首选                          |
-| `pi05_teleavatar_v1` / `pi05_teleavatar_v2` | pi05     | 完整微调 | 64         | 余弦学习率 + EMA                  |
-| `pi0_teleavatar_v1_low_mem_finetune` / `pi0_teleavatar_v2_low_mem_finetune` | pi0 | LoRA | 16 | 低显存，冻结主干、关闭 EMA |
-
-编辑对应的 `TrainConfig` 来调整训练参数。以 `pi0_teleavatar_v2` 为例：
+**TeleAvatar V1 example** (`pi0_teleavatar_v1`):
 
 ```python
 TrainConfig(
-    name="pi0_teleavatar_v2",
+    name="pi0_teleavatar_v1",
     model=pi0_config.Pi0Config(
-        action_dim=32,      # 保持 32 以匹配 pi0_base 预训练权重
-        action_horizon=30,  # 每次预测 30 步动作
+        action_dim=32,      # keep 32 to match the pi0_base pretrained weights
+        action_horizon=30,  # predict 30 action steps per inference
     ),
-    data=LeRobotTeleavatarV2DataConfig(   # v1 用 LeRobotTeleavatarV1DataConfig
-        repo_id="path-to-dataset",      # 替换为本地 LeRobot 数据集路径
+    data=LeRobotTeleavatarV1DataConfig(
+        repo_id="/data/lerobot/teleavatar_v1_pick_place",  # REQUIRED: your local dataset path
         base_config=DataConfig(
-            prompt_from_task=True,       # 从 LeRobot task 中读取语言指令
+            prompt_from_task=True,   # read language instructions from the LeRobot task
             action_sequence_keys=("action",),
         ),
-        use_delta_joint_actions=False,   # 使用绝对关节位置（非增量）
-        rotate_head_camera=False,        # 头部相机朝向，两代默认值不同，见各代 README
+        use_delta_joint_actions=False,  # absolute joint positions (not deltas)
+        rotate_head_camera=True,        # V1 head camera is mounted upside-down
     ),
     weight_loader=weight_loaders.CheckpointWeightLoader(
         "gs://openpi-assets/checkpoints/pi0_base/params"
@@ -175,75 +167,98 @@ TrainConfig(
 ),
 ```
 
-关键参数说明：
+**TeleAvatar V2 example** (`pi0_teleavatar_v2`):
 
-- `repo_id`：本地 LeRobot 数据集路径，**必须修改**。
-- `prompt_from_task`：为 `True` 时，从数据集 `meta.tasks` 中按 `task_index` 注入语言指令；
-  为 `False` 时所有样本将使用固定占位指令，语言通道失效。
-- `rotate_head_camera`：是否在裁剪左眼前旋转 180°，需与数据采集时的相机朝向一致
-  （v2 正装为 `False`，v1 倒装为 `True`，均为对应数据类的默认值）。
-- `use_delta_joint_actions`：是否对关节位置使用增量动作（夹爪始终为绝对值），默认 `False`。
+```python
+TrainConfig(
+    name="pi0_teleavatar_v2",
+    model=pi0_config.Pi0Config(
+        action_dim=32,      # keep 32 to match the pi0_base pretrained weights
+        action_horizon=30,  # predict 30 action steps per inference
+    ),
+    data=LeRobotTeleavatarV2DataConfig(
+        repo_id="/data/lerobot/teleavatar_v2_pick_place",  # REQUIRED: your local dataset path
+        base_config=DataConfig(
+            prompt_from_task=True,   # read language instructions from the LeRobot task
+            action_sequence_keys=("action",),
+        ),
+        use_delta_joint_actions=False,  # absolute joint positions (not deltas)
+        rotate_head_camera=False,       # V2 head camera is mounted right-side-up
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader(
+        "gs://openpi-assets/checkpoints/pi0_base/params"
+    ),
+    batch_size=64,
+    num_train_steps=20_000,
+),
+```
 
-可通过 `checkpoint_base_dir`、`overwrite`、`resume`、`wandb_enabled` 等字段控制检查点保存位置与训练行为。
+**Key fields**:
 
+- `repo_id`: Path to your local LeRobot dataset. **This is the required change.**
+- `prompt_from_task`: When `True`, the language instruction is injected from the dataset's `meta.tasks` by `task_index`; when `False`, every sample uses a fixed placeholder instruction and the language channel is effectively disabled.
+- `rotate_head_camera`: Whether to rotate the head camera 180° before the left-eye crop; must match the camera orientation at data-collection time (V1 upside-down → `True`, V2 right-side-up → `False`; both are the defaults of the corresponding data config class).
+- `use_delta_joint_actions`: Whether to use delta actions for joint positions (grippers always stay absolute). Default `False`.
 
-### 5. 运行训练脚本
+Checkpoint location and training behavior can be further controlled via `checkpoint_base_dir`, `overwrite`, `resume`, `wandb_enabled`, etc.
 
-现在可以使用以下命令启动训练（v1 换成对应的 `*_v1` 配置名）。
+### 4. Compute Normalization Statistics
+
+Before launching training, compute the normalization statistics of the training data. Run the script with the config name you just configured:
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi0_teleavatar_v2
+```
+
+Where `norm_stats.json` is written depends on how `repo_id` is set:
+
+- **`repo_id` is an absolute dataset path** (the recommended usage in this repository): stats are written into the **dataset directory itself** (`<dataset>/norm_stats.json`), next to the data; training reads them from there at startup.
+- **`repo_id` is a bare name** (used together with `HF_LEROBOT_HOME`): stats are written to `./assets/<config_name>/<repo_id>/`, relative to **the working directory the command was run from** — training must be launched from the same directory to find them.
+
+Either way, when training saves a checkpoint it copies the norm stats into the checkpoint's `<step>/assets/<dataset_name>/norm_stats.json`; inference reads them from inside the checkpoint, so a checkpoint copied to another machine works as-is. If the training startup log shows `Norm stats not found in ..., skipping.`, the stats were not found and training **silently continues without normalization** — make sure the log shows `Loaded norm stats from ...` before proceeding.
+
+### 5. Launch Training
+
+Start training with the following command (for V1, substitute the corresponding `*_v1` config name):
 
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_teleavatar_v2 --exp-name=my_experiment
 ```
 
-- `--exp-name`：实验名称，用于区分不同设置下微调后的权重保存路径。按上面命令微调后，
-  权重保存在 `<checkpoint_base_dir>/pi0_teleavatar_v2/my_experiment/<step>`。
-- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`：允许 JAX 使用高达 90% 的 GPU 内存（默认 75%），以最大化显存利用。
+- `--exp-name`: Experiment name, used to distinguish checkpoint save paths across different runs. With the command above, weights are saved under `<checkpoint_base_dir>/pi0_teleavatar_v2/my_experiment/<step>`.
+- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`: Lets JAX use up to 90% of GPU memory (default 75%) to maximize VRAM utilization.
 
-训练过程可在 Weights & Biases 仪表板上监控（需 `wandb_enabled=True`）。
+Training can be monitored on the Weights & Biases dashboard (requires `wandb_enabled=True`).
 
+## 🎮 Real-Robot Deployment
 
-## 推理部署（真机）
+Deployment uses a **policy server + robot client** architecture: the policy server (uv environment) loads the checkpoint and serves inference over WebSocket; the robot side (conda + ROS2 environment) collects observations, requests actions from the server, and issues commands. The camera pipelines and arm control differ between the two generations — **see each generation's README for the concrete deployment steps, topic list, and troubleshooting**:
 
-部署采用 **策略服务端 + 机器人客户端** 的架构：策略服务端（uv 环境）加载检查点并通过 WebSocket
-提供推理；机器人端（conda + ROS2 环境）采集观测、向服务端请求动作并下发指令。两代的相机链路与
-臂控制方式不同，**具体部署步骤、话题一览与排查方法见各代 README**：
+- **TeleAvatar V1**: [examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
+- **TeleAvatar V2**: [examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
 
-- **v1**：[examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)（需要 PD 速度中继）
-- **v2**：[examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)（位置指令直发，另含
-  episode 回放/复位工具）
+> General caveat: at serve time, `--policy.config` must match the training config of the checkpoint — the two generations differ in image cropping and gripper conversion, and using the wrong generation fails silently.
 
-> 通用注意：serve 时 `--policy.config` 必须与检查点的训练配置一致——两代的图像裁剪和夹爪换算
-> 不同，配错代数会静默出错。
+## 📊 Data Format (Shared)
 
+The conventions below apply to both generations; camera formats and gripper curves differ per generation, see the per-generation READMEs. The implementations live in [`teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py) and [`teleavatar_v2_policy.py`](src/openpi/policies/teleavatar_v2_policy.py).
 
-## 数据格式说明（共通）
+### State (`observation/state`)
 
-以下约定两代通用；相机格式与夹爪曲线的差异见各代 README。相关实现位于
-[`teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py) 与
-[`teleavatar_v2_policy.py`](src/openpi/policies/teleavatar_v2_policy.py)。
-
-### 状态（observation/state）
-
-数据集存储的本体感觉状态以 48 维 `[位置(16), 速度(16), 力矩(16)]` 为基础布局（两代相同），
-其后可追加任意字段（如末端位姿、底盘电机等）；
-模型只按固定索引取数，追加字段自动忽略。每个 16 维块内部布局一致：
+The proprioceptive state stored in the dataset uses a 48-dim base layout of `[positions (16), velocities (16), efforts (16)]` (identical across both generations); arbitrary extra fields (e.g. end-effector poses, chassis motors) may be appended after it. The model reads fixed indices only, so appended fields are ignored automatically. Each 16-dim block shares the same internal layout:
 
 ```
-[左臂关节 1-7, 左夹爪, 右臂关节 1-7, 右夹爪]
+[left arm joints 1-7, left gripper, right arm joints 1-7, right gripper]
 ```
 
-模型实际只使用其中的 **14 维关节位置**：左臂位置(7) + 右臂位置(7)，其索引在所有布局中一致。
+The model actually uses only the **14 joint-position dims**: left arm positions (7) + right arm positions (7), whose indices are identical in all layouts.
 
-### 动作（action，16 维）
+### Action (16-dim)
 
-数据集中的 `action` 序列与状态同布局，训练时从中抽取 16 维；模型输出 16 维动作：
+The `action` sequence in the dataset shares the state layout; 16 dims are extracted at training time. The model outputs 16-dim actions:
 
 ```
-[左臂关节位置(7), 左夹爪力矩(1), 右臂关节位置(7), 右夹爪力矩(1)]
+[left arm joint positions (7), left gripper effort (1), right arm joint positions (7), right gripper effort (1)]
 ```
 
-夹爪采用**力控**：平台接收 `[0, 1]` 的 trigger 值，按曲线映射为力矩（Nm），**两代曲线不同**
-（见各代 README）。训练时 `TeleavatarInputs` 用对应曲线的反函数把数据集中的夹爪力矩换算为
-trigger；推理输出后 `TeleavatarOutputs` 再换算回力矩，最终由 `ros2_interface` 换算为 trigger
-发布。**注意**：由于该换算发生在数据集 norm_stats 归一化之前，若修改该逻辑，必须重新运行
-`scripts/compute_norm_stats.py`。
+Grippers are **force-controlled**: the platform accepts a trigger value in `[0, 1]` and maps it to an effort (Nm) through a curve that **differs between the two generations** (see the per-generation READMEs). At training time, `TeleavatarInputs` applies the inverse of the corresponding curve to convert the dataset's gripper efforts to trigger values; at inference, `TeleavatarOutputs` converts the model output back to efforts, which `ros2_interface` finally converts to trigger values for publishing. **Note**: this conversion happens before dataset norm-stats normalization — if you change this logic, you must re-run `scripts/compute_norm_stats.py`.
