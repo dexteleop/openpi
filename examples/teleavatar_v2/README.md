@@ -12,6 +12,10 @@ For installation, the fine-tuning workflow, and the shared data format, see the 
 ## 📑 Table of Contents
 
 - [Client Dependencies](#-client-dependencies)
+- [Robot-Side Setup](#-robot-side-setup)
+  - [1. Switch the Robot to API Mode](#1-switch-the-robot-to-api-mode)
+  - [2. Point the Video Stream at Your Host](#2-point-the-video-stream-at-your-host)
+  - [3. Bridge ROS2 Topics with zenoh](#3-bridge-ros2-topics-with-zenoh)
 - [Deployment Data Flow](#-deployment-data-flow)
 - [Deployment Steps](#-deployment-steps)
   - [1. Zero the Robot (Client)](#1-zero-the-robot-client)
@@ -40,6 +44,46 @@ for e in rtph265depay h265parse nvh265dec videoconvert appsink; do
 done
 ```
 
+## 🔌 Robot-Side Setup
+
+Before deploying, the robot must be switched out of VR/teleoperation mode and connected to your client host. This setup is one-time (the configuration is persisted across reboots). The robot ships wired into the LAN; connect your client host to the same LAN. The robot's IP (referred to as `<ROBOT_IP>` below) can be checked in remoteApp — see the TA2 user manual for the configuration UI walkthrough.
+
+### 1. Switch the Robot to API Mode
+
+In the **System Config** panel (via remoteApp or a display attached to the robot), set:
+
+- **Run mode**: API (instead of VR)
+- **Left / right arm**: enabled, with control mode set to **joint** — the policy publishes joint position commands to `/api/<arm>/joint_cmd`
+
+Click **Save config** (persists the change), then **Apply** (takes effect immediately).
+
+### 2. Point the Video Stream at Your Host
+
+In the same config panel, fill the **remote IP** field with your client host's IP (must be on the same subnet as the robot). The robot then pushes the combined RTP/H.265 camera stream to your host (default port 8890 — see [Topics & Video Stream](#-topics--video-stream)).
+
+### 3. Bridge ROS2 Topics with zenoh
+
+The robot exposes its ROS2 topics across machines through zenoh: the robot runs a zenoh router, and your host connects to it with `zenoh-bridge-ros2dds`, after which the robot's topics are discoverable on your host as if they were local.
+
+Prerequisites: ROS2 Humble and `zenoh-bridge-ros2dds` installed on the client host, and `<ROBOT_IP>:9000` (TCP) reachable from it.
+
+```bash
+# Terminal 1: connect to the robot's zenoh router (keep this running)
+export ROS_DOMAIN_ID=29
+export ROS_DISTRO=humble
+zenoh-bridge-ros2dds -e tcp/<ROBOT_IP>:9000
+```
+
+Verify from another terminal:
+
+```bash
+export ROS_DOMAIN_ID=29
+ros2 topic list
+ros2 topic echo /right_arm/joint_states
+```
+
+> The bridge terminal must stay open — closing it disconnects the robot. **Every terminal that talks to the robot (including `zero.py` / `main.py` below) must export the same `ROS_DOMAIN_ID=29`**, otherwise the bridged topics are not discoverable. If the client runs inside a container, make sure the container network can reach `<ROBOT_IP>:9000`.
+
 ## 🔄 Deployment Data Flow
 
 ```
@@ -53,13 +97,16 @@ joints (ROS2)              ┘                          ▲                     
                                   /api/left_gripper/cmd,    /api/right_gripper/cmd    (trigger commands)
 ```
 
-> `serve_policy` runs on the **server** (uv environment); `zero.py` and `main.py` run on the **client** (conda + ROS2 environment). Do **not** run V1's `arm_pd_controller.py` on V2 — it publishes to the same topics as V2's `ros2_interface` and would conflict.
+> `serve_policy` runs on the **server** (uv environment); `zero.py` and `main.py` run on the **client** (conda + ROS2 environment). ROS2 traffic between the robot and the client goes through the zenoh bridge (see [Robot-Side Setup](#-robot-side-setup)). Do **not** run V1's `arm_pd_controller.py` on V2 — it publishes to the same topics as V2's `ros2_interface` and would conflict.
 
 ## 🚀 Deployment Steps
+
+The steps below assume [Robot-Side Setup](#-robot-side-setup) is complete: the robot is in API mode with joint control, the video stream is pushing to your host, and the zenoh bridge is running.
 
 ### 1. Zero the Robot (Client)
 
 ```bash
+export ROS_DOMAIN_ID=29
 python examples/teleavatar_v2/zero.py
 ```
 
@@ -80,6 +127,7 @@ uv run scripts/serve_policy.py policy:checkpoint \
 ### 3. Run the Robot Client (Client)
 
 ```bash
+export ROS_DOMAIN_ID=29
 python examples/teleavatar_v2/main.py --remote-host 127.0.0.1 --remote-port 8000 \
     --prompt "stack the three blocks"
 ```
