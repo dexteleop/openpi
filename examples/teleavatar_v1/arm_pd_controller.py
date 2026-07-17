@@ -59,10 +59,8 @@ class ArmVelocityController(Node):
         # Timeout for model commands (seconds)
         self.cmd_timeout = 0.5  # If no command for 0.5s, stop publishing
 
-        # Timeout for joint-state feedback (seconds). Joint states arrive at
-        # ~100 Hz; if they stop, the P law would keep computing velocity from
-        # a frozen position and drive the arm open-loop. On timeout, stop
-        # publishing (on this platform no command means no motion).
+        # Timeout for joint-state feedback (seconds, ~100 Hz nominal). On
+        # timeout, stop publishing (no command = no motion on this platform).
         self.state_timeout = 0.2
 
         # Subscribers for model commands (from policy)
@@ -164,18 +162,15 @@ class ArmVelocityController(Node):
             time_since_cmd = (now - self.left_cmd_last_time).nanoseconds / 1e9
             time_since_state = (now - self.left_state_last_time).nanoseconds / 1e9
             if time_since_cmd > self.cmd_timeout:
-                # Command timeout — drop the target and go silent. On this
-                # platform no command means no motion, so not publishing is
-                # the safe stop (and leaves the topic free for other nodes).
+                # Command timeout — drop the target and stop publishing
+                # (no command = no motion on this platform).
                 self.get_logger().warn(
                     f'Left arm model_joint_cmd timeout ({time_since_cmd:.2f}s), stopping control',
                     throttle_duration_sec=2.0
                 )
                 self.left_des_q = None
             elif time_since_state > self.state_timeout:
-                # Frozen feedback would turn the P law into a constant
-                # open-loop velocity command — skip publishing until joint
-                # states come back (no command = no motion).
+                # Joint-state feedback stale — skip publishing until it returns.
                 self.get_logger().warn(
                     f'Left arm joint_states stale ({time_since_state:.2f}s), pausing control',
                     throttle_duration_sec=2.0
@@ -202,18 +197,15 @@ class ArmVelocityController(Node):
             time_since_cmd = (now - self.right_cmd_last_time).nanoseconds / 1e9
             time_since_state = (now - self.right_state_last_time).nanoseconds / 1e9
             if time_since_cmd > self.cmd_timeout:
-                # Command timeout — drop the target and go silent. On this
-                # platform no command means no motion, so not publishing is
-                # the safe stop (and leaves the topic free for other nodes).
+                # Command timeout — drop the target and stop publishing
+                # (no command = no motion on this platform).
                 self.get_logger().warn(
                     f'Right arm model_joint_cmd timeout ({time_since_cmd:.2f}s), stopping control',
                     throttle_duration_sec=2.0
                 )
                 self.right_des_q = None
             elif time_since_state > self.state_timeout:
-                # Frozen feedback would turn the P law into a constant
-                # open-loop velocity command — skip publishing until joint
-                # states come back (no command = no motion).
+                # Joint-state feedback stale — skip publishing until it returns.
                 self.get_logger().warn(
                     f'Right arm joint_states stale ({time_since_state:.2f}s), pausing control',
                     throttle_duration_sec=2.0

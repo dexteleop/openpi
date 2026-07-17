@@ -60,11 +60,9 @@ class TeleavatarROS2Interface(Node):
 
         self.logger = self.get_logger()
         self.lock = Lock()
-        # Sensor data older than this (seconds) is treated as dead: cameras
-        # stream continuously and joint states arrive at ~100 Hz, so 1 s of
-        # silence means the source is gone, not slow. get_observation then
-        # returns None instead of the frozen last sample, so the policy never
-        # acts on dead sensors.
+        # Sensor data older than this (seconds) is treated as dead (cameras
+        # stream continuously, joint states ~100 Hz): get_observation returns
+        # None instead of the frozen last sample.
         self.sensor_timeout = sensor_timeout
 
         # Outgoing arm commands are clamped to the arm_config.yml joint

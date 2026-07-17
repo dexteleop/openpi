@@ -116,14 +116,10 @@ class JointInterpolator(Node):
             cmd_msg.position = interpolated_positions
         cmd_msg.velocity = [0.0] * 7
         des_position = np.array(cmd_msg.position)
-        # Clamp the target to the joint limits from arm_config.yml so the
-        # P term never drives a joint past its mechanical range.
         des_position = np.clip(des_position, self.lower, self.upper)
         cmd_msg.position = des_position.tolist()
         kp = np.array([ 7, 7, 10, 10, 10, 8, 8 ])
         vel_fb = kp * (des_position - self.current_pos)
-        # Clip the raw P term to ±0.3 * vel_limit; with a multi-radian error
-        # it would otherwise reach ~30 rad/s.
         vel_fb = np.clip(vel_fb, -0.3 * self.vel_limit, 0.3 * self.vel_limit)
         for i in range(len(self.enable_flags)):
             if self.enable_flags[i]:

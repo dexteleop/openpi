@@ -221,7 +221,7 @@ class TeleavatarOutputs(transforms.DataTransformFn):
         # Since the model may output more dimensions due to padding, we extract just what we need.
         # For your own dataset, replace `16` with the action dimension of your dataset.
         # Copy so the in-place gripper conversion below never mutates the
-        # caller's array (a second pass would double-convert the triggers).
+        # caller's array.
         actions = np.array(data["actions"][:, :16])
 
         # Convert normalized [0, 1] trigger values back to effort (Nm) for

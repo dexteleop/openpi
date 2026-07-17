@@ -113,8 +113,6 @@ class JointInterpolator(Node):
                 for i in range(len(self.current_pos))
             ]
             cmd_msg.position = interpolated_positions
-        # Clamp the command to the joint limits from arm_config.yml so the
-        # platform is never asked to go past the mechanical range.
         cmd_msg.position = np.clip(cmd_msg.position, self.lower, self.upper).tolist()
         # v2 des_q semantics: position = desired joint angle; the platform's
         # inner control loop computes velocities itself, so leave velocity 0.
