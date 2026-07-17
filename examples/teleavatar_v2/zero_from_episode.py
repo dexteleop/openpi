@@ -10,9 +10,9 @@ triggers, then holds the target until the measured positions converge
 (like zero.py) and exits.
 
 Usage (client conda env, robot enabled):
-    python examples/teleavatar_v2/zero_from_episode.py --dataset <数据集路径> --episode 0
-    python examples/teleavatar_v2/zero_from_episode.py --dataset <数据集路径> --episode 12 --frame -1   # last frame
-    python examples/teleavatar_v2/zero_from_episode.py --dataset <数据集路径> --episode 0 --dry-run     # no ROS2 needed
+    python examples/teleavatar_v2/zero_from_episode.py --dataset <dataset_path> --episode 0
+    python examples/teleavatar_v2/zero_from_episode.py --dataset <dataset_path> --episode 12 --frame -1   # last frame
+    python examples/teleavatar_v2/zero_from_episode.py --dataset <dataset_path> --episode 0 --dry-run     # no ROS2 needed
 """
 
 import argparse

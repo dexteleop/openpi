@@ -50,9 +50,9 @@ class JointInterpolator(Node):
             joint_4_down_pos = 0.0
         else:
             joint_2_down_pos, joint_4_down_pos = 0, 0
-        # 根据namespace设置不同的目标位置
+        # Pick the target pose for this namespace
         if self.namespace == "right_arm":
-            # 右臂目标位置
+            # Right arm target pose
             self.target_positions = [
                 -0.50,  # r_joint1
                 -0.92,  # r_joint2
@@ -63,7 +63,7 @@ class JointInterpolator(Node):
                 -0.52   # r_joint7
             ]
         else:  # left
-            # 左臂目标位置
+            # Left arm target pose
             self.target_positions = [
                 0.41,  # l_joint1
                 1.16,  # l_joint2

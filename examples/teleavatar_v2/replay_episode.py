@@ -17,9 +17,9 @@ so the arms never jump. Ctrl+C stops publishing immediately.
 
 Usage (client conda env, robot enabled; run zero.py first if you want a
 known home pose):
-    python examples/teleavatar_v2/replay_episode.py --dataset <数据集路径> --episode 0
-    python examples/teleavatar_v2/replay_episode.py --dataset <数据集路径> --episode 12 --speed 0.5
-    python examples/teleavatar_v2/replay_episode.py --dataset <数据集路径> --episode 0 --dry-run   # no ROS2 needed
+    python examples/teleavatar_v2/replay_episode.py --dataset <dataset_path> --episode 0
+    python examples/teleavatar_v2/replay_episode.py --dataset <dataset_path> --episode 12 --speed 0.5
+    python examples/teleavatar_v2/replay_episode.py --dataset <dataset_path> --episode 0 --dry-run   # no ROS2 needed
 
 Needs pandas + pyarrow for parquet reading (pip install pandas pyarrow).
 """

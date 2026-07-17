@@ -1,6 +1,6 @@
 # openpi
 
-> 📖 灵御（Teleavatar）双臂机器人专用说明（微调 + ROS2 真机部署）见 [README.md](README.md)。
+> 📖 For the TeleAvatar-specific documentation (fine-tuning + ROS2 real-robot deployment), see [README.md](README.md).
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
