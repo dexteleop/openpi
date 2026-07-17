@@ -7,7 +7,8 @@ from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Float32
 import numpy as np
 import yaml
-robot_config = yaml.safe_load(open("arm_config.yml"))
+from pathlib import Path
+robot_config = yaml.safe_load(open(Path(__file__).parents[2] / "arm_config.yml"))
 class JointInterpolator(Node):
     def __init__(self, namespace="right_arm", down=True, timer_on=False):
         super().__init__(f"{namespace}_joint_interpolator")

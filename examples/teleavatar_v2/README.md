@@ -107,10 +107,10 @@ The steps below assume [Robot-Side Setup](#-robot-side-setup) is complete: the r
 
 ```bash
 export ROS_DOMAIN_ID=29
-python -m examples.teleavatar_v2.zero
+python examples/teleavatar_v2/zero.py
 ```
 
-Interpolates from the current joint positions to a preset home pose over 5 seconds (the target pose is hardcoded in the script; joint limits are read from `arm_config.yml` in the working directory — the `-m` form only runs from the repository root, which guarantees the config file is found), publishing at 100 Hz to `/api/{left,right}_arm/joint_cmd` and setting `/api/fsm/enable=1` to enable the robot. It exits automatically once both arms converge.
+Interpolates from the current joint positions to a preset home pose over 5 seconds (the target pose is hardcoded in the script; joint limits are read from `arm_config.yml` at the repository root), publishing at 100 Hz to `/api/{left,right}_arm/joint_cmd` and setting `/api/fsm/enable=1` to enable the robot. It exits automatically once both arms converge.
 
 > Zeroing must finish **before** starting `main.py` — both publish commands to `/api/{arm}/joint_cmd` and would conflict if run simultaneously. Alternatively, use [`zero_from_episode.py`](zero_from_episode.py) to reset to the starting pose of a dataset episode (see [Additional Tools](#-additional-tools)).
 
