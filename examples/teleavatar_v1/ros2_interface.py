@@ -16,6 +16,7 @@ Image decoding strategy:
 """
 
 import logging
+import pathlib
 import time
 from collections import deque
 from threading import Lock
@@ -24,6 +25,7 @@ from typing import Dict, Optional
 import av
 import numpy as np
 import rclpy
+import yaml
 from ffmpeg_image_transport_msgs.msg import FFMPEGPacket
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -53,11 +55,31 @@ def _make_codec(name: str, options: dict | None = None) -> av.CodecContext:
 class TeleavatarROS2Interface(Node):
     """Thread-safe ROS2 interface for Teleavatar robot sensors and actuators."""
 
-    def __init__(self, node_name: str = "teleavatar_openpi_interface"):
+    def __init__(self, node_name: str = "teleavatar_openpi_interface", sensor_timeout: float = 1.0):
         super().__init__(node_name)
 
         self.logger = self.get_logger()
         self.lock = Lock()
+        # Sensor data older than this (seconds) is treated as dead: cameras
+        # stream continuously and joint states arrive at ~100 Hz, so 1 s of
+        # silence means the source is gone, not slow. get_observation then
+        # returns None instead of the frozen last sample, so the policy never
+        # acts on dead sensors.
+        self.sensor_timeout = sensor_timeout
+
+        # Outgoing arm commands are clamped to the arm_config.yml joint
+        # limits before publishing (see _clamp_arm_cmd).
+        arm_config = yaml.safe_load(
+            open(pathlib.Path(__file__).resolve().parents[2] / "arm_config.yml")
+        )
+        self.joint_lower = {
+            'left_arm': np.array(arm_config["arms"]["left_arm"]["lower"]),
+            'right_arm': np.array(arm_config["arms"]["right_arm"]["lower"]),
+        }
+        self.joint_upper = {
+            'left_arm': np.array(arm_config["arms"]["left_arm"]["upper"]),
+            'right_arm': np.array(arm_config["arms"]["right_arm"]["upper"]),
+        }
 
         # Storage for latest sensor data
         self.latest_images: Dict[str, np.ndarray] = {}
@@ -261,18 +283,37 @@ class TeleavatarROS2Interface(Node):
         """Get current observation from all sensors.
 
         Returns:
-            Dictionary with 'images' and 'state' keys, or None if data is incomplete.
+            Dictionary with 'images' and 'state' keys, or None if any sensor
+            is missing or older than sensor_timeout. Callers must treat None
+            as "do not act" — never fall back to a previous observation.
         """
+        now = time.time()
+        required_images = ['left_color', 'right_color', 'head_camera']
+        required_joints = ['left_arm', 'right_arm']
+
         with self.lock:
-            required_images = ['left_color', 'right_color', 'head_camera']
-            required_joints = ['left_arm', 'right_arm']
+            dead = []
+            for cam in required_images:
+                stamp = self.image_timestamps.get(cam)
+                if cam not in self.latest_images or stamp is None:
+                    dead.append(f"camera:{cam}: not received")
+                elif now - stamp > self.sensor_timeout:
+                    dead.append(f"camera:{cam}: {now - stamp:.1f}s stale")
+            for joint_group in required_joints:
+                stamp = self.joint_timestamps.get(joint_group)
+                if stamp is None:
+                    dead.append(f"joints:{joint_group}: not received")
+                elif now - stamp > self.sensor_timeout:
+                    dead.append(f"joints:{joint_group}: {now - stamp:.1f}s stale")
 
-            # Check if we have all required data
-            if not all(cam in self.latest_images for cam in required_images):
-                return None
-            if not all(joint in self.latest_joint_states for joint in required_joints):
-                return None
+        if dead:
+            self.logger.error(
+                "Observation unavailable — dead sensors: " + "; ".join(dead),
+                throttle_duration_sec=1.0,
+            )
+            return None
 
+        with self.lock:
             # Build 48-dimensional state vector
             # Layout: [positions(16), velocities(16), efforts(16)]
             state_48d = np.zeros(48, dtype=np.float32)
@@ -324,12 +365,28 @@ class TeleavatarROS2Interface(Node):
             result[:len(data)] = data
             return result
 
+    def _clamp_arm_cmd(self, arm: str, positions: np.ndarray) -> np.ndarray:
+        """Clamp an outgoing 7-dim arm position command to the arm_config.yml
+        joint limits. A throttled warning is logged whenever clamping engages
+        — frequent warnings mean the policy is commanding out-of-range
+        motions."""
+        target = np.asarray(positions, dtype=np.float64)
+        clamped = np.clip(target, self.joint_lower[arm], self.joint_upper[arm])
+        if not np.allclose(clamped, target, atol=1e-9):
+            self.logger.warning(
+                f"{arm} command clamped to joint limits, "
+                f"max deviation {np.max(np.abs(clamped - target)):.3f} rad",
+                throttle_duration_sec=2.0,
+            )
+        return clamped
+
     def publish_action(self, actions: np.ndarray):
         """Publish 16-dimensional action to ROS topics.
 
-        Publishes position commands to model_joint_cmd topics for arms.
-        A separate control node will subscribe to these and compute velocities
-        using PD control + feedforward.
+        Publishes position commands to model_joint_cmd topics for arms
+        (clamped to the arm_config.yml joint limits first); a separate
+        control node (arm_pd_controller) subscribes to these and computes
+        velocity commands. Gripper triggers are clipped to [0, 1].
 
         Args:
             actions: 16-dim array [left_arm_pos(7), left_gripper_effort(1),
@@ -351,7 +408,7 @@ class TeleavatarROS2Interface(Node):
         left_arm_msg.header.stamp = timestamp
         left_arm_msg.header.frame_id = 'left_arm'
         left_arm_msg.name = self.left_joint_names
-        left_arm_msg.position = actions[0:7].tolist()
+        left_arm_msg.position = self._clamp_arm_cmd('left_arm', actions[0:7]).tolist()
         left_arm_msg.velocity = np.zeros(7).tolist()
         left_arm_msg.effort = np.zeros(7).tolist()
         self.action_publishers['left_arm'].publish(left_arm_msg)
@@ -370,7 +427,7 @@ class TeleavatarROS2Interface(Node):
             data_left = 0.5 - grip_value_left / 7.0
         else:  # grip_value_left <= 0
             data_left = 0.5 - grip_value_left
-        left_gripper_msg.data = data_left
+        left_gripper_msg.data = float(np.clip(data_left, 0.0, 1.0))
         self.action_publishers['left_gripper'].publish(left_gripper_msg)
 
         # Right arm (position command)
@@ -378,7 +435,7 @@ class TeleavatarROS2Interface(Node):
         right_arm_msg.header.stamp = timestamp
         right_arm_msg.header.frame_id = 'right_arm'
         right_arm_msg.name = self.right_joint_names
-        right_arm_msg.position = actions[8:15].tolist()
+        right_arm_msg.position = self._clamp_arm_cmd('right_arm', actions[8:15]).tolist()
         right_arm_msg.velocity = np.zeros(7).tolist()
         right_arm_msg.effort = np.zeros(7).tolist()
         self.action_publishers['right_arm'].publish(right_arm_msg)
@@ -396,5 +453,5 @@ class TeleavatarROS2Interface(Node):
             data_right = 0.5 + grip_value_right / 7.0
         else:  # grip_value_right >= 0
             data_right = 0.5 + grip_value_right
-        right_gripper_msg.data = data_right
+        right_gripper_msg.data = float(np.clip(data_right, 0.0, 1.0))
         self.action_publishers['right_gripper'].publish(right_gripper_msg)

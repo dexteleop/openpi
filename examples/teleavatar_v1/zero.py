@@ -10,10 +10,9 @@ import yaml
 from pathlib import Path
 robot_config = yaml.safe_load(open(Path(__file__).parents[2] / "arm_config.yml"))
 class JointInterpolator(Node):
-    def __init__(self, namespace="right_arm", down=True, timer_on=False):
+    def __init__(self, namespace="right_arm", timer_on=False):
         super().__init__(f"{namespace}_joint_interpolator")
         self.namespace = namespace
-        self.down = down
         self.subscription = self.create_subscription(
             JointState,
             f"/{namespace}/joint_states",
@@ -43,13 +42,9 @@ class JointInterpolator(Node):
         self.enable_flags = [False] * (7 - num_activate) + [True] * num_activate
         self.upper = np.array(robot_config["arms"][namespace]["upper"])
         self.lower = np.array(robot_config["arms"][namespace]["lower"])
+        self.vel_limit = np.array(robot_config["arms"]["vel_limit"])
         # Timer to run at 100 Hz for publishing commands
         self.timer = self.create_timer(0.01, self.timer_callback)  # 100 Hz
-        if self.down:
-            joint_2_down_pos = 1.5 if self.namespace == "left" else -1.5
-            joint_4_down_pos = 0.0
-        else:
-            joint_2_down_pos, joint_4_down_pos = 0, 0
         # Pick the target pose for this namespace
         if self.namespace == "right_arm":
             # Right arm target pose
@@ -83,9 +78,11 @@ class JointInterpolator(Node):
         msg.data = 1.0
         self.enable_pub.publish(msg)
     def joint_state_callback(self, msg):
-        self.joint_names = msg.name
-        self.current_pos = np.array(msg.position)
-        self.current_vel = np.array(msg.velocity)
+        # Arm joint_states may carry extra entries (e.g. the gripper joint);
+        # keep only the 7 arm joints to match target_positions.
+        self.joint_names = list(msg.name[:7])
+        self.current_pos = np.array(msg.position[:7])
+        self.current_vel = np.array(msg.velocity[:7])
     def check_convergence(self, current_position, target_position):
         enabled_indices = [i for i, enabled in enumerate(self.enable_flags) if enabled]
         position_errors = np.abs(np.array(current_position) - np.array(target_position))
@@ -119,8 +116,15 @@ class JointInterpolator(Node):
             cmd_msg.position = interpolated_positions
         cmd_msg.velocity = [0.0] * 7
         des_position = np.array(cmd_msg.position)
+        # Clamp the target to the joint limits from arm_config.yml so the
+        # P term never drives a joint past its mechanical range.
+        des_position = np.clip(des_position, self.lower, self.upper)
+        cmd_msg.position = des_position.tolist()
         kp = np.array([ 7, 7, 10, 10, 10, 8, 8 ])
         vel_fb = kp * (des_position - self.current_pos)
+        # Clip the raw P term (same 0.3 * vel_limit cap as arm_pd_controller);
+        # with a multi-radian error it would otherwise reach ~30 rad/s.
+        vel_fb = np.clip(vel_fb, -0.3 * self.vel_limit, 0.3 * self.vel_limit)
         for i in range(len(self.enable_flags)):
             if self.enable_flags[i]:
                 cmd_msg.position[i] = self.current_pos[i]
@@ -159,16 +163,10 @@ class JointInterpolator(Node):
                         f"{self.namespace} arm: Position diverged, resetting convergence timer..."
                     )
                     self.convergence_start_time = None
-def main(args=None):
-    rclpy.init(args=args)
-    joint_interpolator = JointInterpolator()
-    rclpy.spin(joint_interpolator)
-    joint_interpolator.destroy_node()
-    rclpy.shutdown()
 def main_multithreaded(args=None):
     rclpy.init(args=args)
-    left_node = JointInterpolator(namespace="left_arm", down=True, timer_on=True)  # left arm
-    right_node = JointInterpolator(namespace="right_arm", down=True, timer_on=True)  # right arm
+    left_node = JointInterpolator(namespace="left_arm", timer_on=True)  # left arm
+    right_node = JointInterpolator(namespace="right_arm", timer_on=True)  # right arm
     executor = MultiThreadedExecutor()
     executor.add_node(left_node)
     executor.add_node(right_node)

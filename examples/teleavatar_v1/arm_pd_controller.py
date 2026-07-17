@@ -9,10 +9,10 @@ Subscribes to:
   - /right_arm/joint_states
 
 Publishes to:
-  - /left_arm/joint_cmd (velocity commands at 100Hz)
-  - /right_arm/joint_cmd (velocity commands at 100Hz)
+  - /api/left_arm/joint_cmd (velocity commands at 100Hz)
+  - /api/right_arm/joint_cmd (velocity commands at 100Hz)
 
-Control law: v = kp * (des_q - state_q) + feedforward
+Control law: v = clip(kp * (des_q - state_q), ±0.3 * vel_limit)
 """
 
 import numpy as np
@@ -22,7 +22,7 @@ from sensor_msgs.msg import JointState
 
 
 class ArmVelocityController(Node):
-    """PD controller with feedforward for arm velocity control."""
+    """Proportional controller for arm velocity control."""
 
     def __init__(self):
         super().__init__('arm_velocity_controller')
@@ -35,22 +35,29 @@ class ArmVelocityController(Node):
         self.kp_err_left = np.array([7.0, 7.0, 10.0, 10.0, 10.0, 8.0, 8.0])
         self.kp_err_right = np.array([7.0, 7.0, 10.0, 10.0, 10.0, 8.0, 8.0])
         self.joint_vel_limit = np.array([15.0, 15.0, 20.0, 20.0, 44.0, 33.0, 33.0])
-        self.joint_vel_limit = np.array([15.0, 15.0, 20.0, 20.0, 44.0, 33.0, 33.0])
 
         # State storage - Left arm
         self.left_des_q = None
         self.left_state_q = None
         self.left_cmd_last_time = None  # Last time we received model_joint_cmd
+        self.left_state_last_time = None  # Last time we received joint_states
         self.left_joint_names = ['l_joint1', 'l_joint2', 'l_joint3', 'l_joint4', 'l_joint5', 'l_joint6', 'l_joint7']
 
         # State storage - Right arm
         self.right_des_q = None
         self.right_state_q = None
         self.right_cmd_last_time = None  # Last time we received model_joint_cmd
+        self.right_state_last_time = None  # Last time we received joint_states
         self.right_joint_names = ['r_joint1', 'r_joint2', 'r_joint3', 'r_joint4', 'r_joint5', 'r_joint6', 'r_joint7']
 
         # Timeout for model commands (seconds)
         self.cmd_timeout = 0.5  # If no command for 0.5s, stop publishing
+
+        # Timeout for joint-state feedback (seconds). Joint states arrive at
+        # ~100 Hz; if they stop, the P law would keep computing velocity from
+        # a frozen position and drive the arm open-loop. On timeout, stop
+        # publishing (on this platform no command means no motion).
+        self.state_timeout = 0.2
 
         # Subscribers for model commands (from policy)
         self.create_subscription(
@@ -113,15 +120,17 @@ class ArmVelocityController(Node):
         """Receive actual joint states for left arm."""
         if len(msg.position) >= self.num_joints:
             self.left_state_q = np.array(msg.position[:self.num_joints])
+            self.left_state_last_time = self.get_clock().now()
 
     def right_state_callback(self, msg: JointState):
         """Receive actual joint states for right arm."""
         if len(msg.position) >= self.num_joints:
             self.right_state_q = np.array(msg.position[:self.num_joints])
+            self.right_state_last_time = self.get_clock().now()
 
     def get_target_v(self, des_q, state_q, kp_err):
         """
-        Compute target velocity using simple PD control.
+        Compute target velocity using proportional control.
 
         Args:
             des_q: Desired position
@@ -142,63 +151,79 @@ class ArmVelocityController(Node):
 
         # Control left arm
         if self.left_des_q is not None and self.left_state_q is not None:
-            # Check if command is still fresh
-            if self.left_cmd_last_time is not None:
-                time_since_cmd = (now - self.left_cmd_last_time).nanoseconds / 1e9
-                if time_since_cmd > self.cmd_timeout:
-                    # Command timeout - stop publishing
-                    self.get_logger().warn(
-                        f'Left arm model_joint_cmd timeout ({time_since_cmd:.2f}s), stopping control',
-                        throttle_duration_sec=2.0
-                    )
-                    self.left_des_q = None
-                    return
+            time_since_cmd = (now - self.left_cmd_last_time).nanoseconds / 1e9
+            time_since_state = (now - self.left_state_last_time).nanoseconds / 1e9
+            if time_since_cmd > self.cmd_timeout:
+                # Command timeout — drop the target and go silent. On this
+                # platform no command means no motion, so not publishing is
+                # the safe stop (and leaves the topic free for other nodes).
+                self.get_logger().warn(
+                    f'Left arm model_joint_cmd timeout ({time_since_cmd:.2f}s), stopping control',
+                    throttle_duration_sec=2.0
+                )
+                self.left_des_q = None
+            elif time_since_state > self.state_timeout:
+                # Frozen feedback would turn the P law into a constant
+                # open-loop velocity command — skip publishing until joint
+                # states come back (no command = no motion).
+                self.get_logger().warn(
+                    f'Left arm joint_states stale ({time_since_state:.2f}s), pausing control',
+                    throttle_duration_sec=2.0
+                )
+            else:
+                left_vel = self.get_target_v(
+                    self.left_des_q,
+                    self.left_state_q,
+                    self.kp_err_left
+                )
 
-            left_vel = self.get_target_v(
-                self.left_des_q,
-                self.left_state_q,
-                self.kp_err_left
-            )
-
-            # Publish left arm command (position + velocity)
-            left_msg = JointState()
-            left_msg.header.stamp = timestamp
-            left_msg.name = self.left_joint_names
-            left_msg.header.frame_id = 'left_arm'
-            left_msg.position = self.left_des_q.tolist()
-            left_msg.velocity = left_vel.tolist()
-            left_msg.effort = np.zeros(self.num_joints).tolist()
-            self.left_cmd_pub.publish(left_msg)
+                # Publish left arm command (position + velocity)
+                left_msg = JointState()
+                left_msg.header.stamp = timestamp
+                left_msg.name = self.left_joint_names
+                left_msg.header.frame_id = 'left_arm'
+                left_msg.position = self.left_des_q.tolist()
+                left_msg.velocity = left_vel.tolist()
+                left_msg.effort = np.zeros(self.num_joints).tolist()
+                self.left_cmd_pub.publish(left_msg)
 
         # Control right arm
         if self.right_des_q is not None and self.right_state_q is not None:
-            # Check if command is still fresh
-            if self.right_cmd_last_time is not None:
-                time_since_cmd = (now - self.right_cmd_last_time).nanoseconds / 1e9
-                if time_since_cmd > self.cmd_timeout:
-                    # Command timeout - stop publishing
-                    self.get_logger().warn(
-                        f'Right arm model_joint_cmd timeout ({time_since_cmd:.2f}s), stopping control',
-                        throttle_duration_sec=2.0
-                    )
-                    self.right_des_q = None
-                    return
+            time_since_cmd = (now - self.right_cmd_last_time).nanoseconds / 1e9
+            time_since_state = (now - self.right_state_last_time).nanoseconds / 1e9
+            if time_since_cmd > self.cmd_timeout:
+                # Command timeout — drop the target and go silent. On this
+                # platform no command means no motion, so not publishing is
+                # the safe stop (and leaves the topic free for other nodes).
+                self.get_logger().warn(
+                    f'Right arm model_joint_cmd timeout ({time_since_cmd:.2f}s), stopping control',
+                    throttle_duration_sec=2.0
+                )
+                self.right_des_q = None
+            elif time_since_state > self.state_timeout:
+                # Frozen feedback would turn the P law into a constant
+                # open-loop velocity command — skip publishing until joint
+                # states come back (no command = no motion).
+                self.get_logger().warn(
+                    f'Right arm joint_states stale ({time_since_state:.2f}s), pausing control',
+                    throttle_duration_sec=2.0
+                )
+            else:
+                right_vel = self.get_target_v(
+                    self.right_des_q,
+                    self.right_state_q,
+                    self.kp_err_right
+                )
 
-            right_vel = self.get_target_v(
-                self.right_des_q,
-                self.right_state_q,
-                self.kp_err_right
-            )
-
-            # Publish right arm command (position + velocity)
-            right_msg = JointState()
-            right_msg.header.stamp = timestamp
-            right_msg.header.frame_id = 'right_arm'
-            right_msg.name = self.right_joint_names
-            right_msg.position = self.right_des_q.tolist()
-            right_msg.velocity = right_vel.tolist()
-            right_msg.effort = np.zeros(self.num_joints).tolist()
-            self.right_cmd_pub.publish(right_msg)
+                # Publish right arm command (position + velocity)
+                right_msg = JointState()
+                right_msg.header.stamp = timestamp
+                right_msg.header.frame_id = 'right_arm'
+                right_msg.name = self.right_joint_names
+                right_msg.position = self.right_des_q.tolist()
+                right_msg.velocity = right_vel.tolist()
+                right_msg.effort = np.zeros(self.num_joints).tolist()
+                self.right_cmd_pub.publish(right_msg)
 
 
 def main(args=None):

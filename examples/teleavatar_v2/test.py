@@ -113,7 +113,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval-s", type=float, default=2.0)
     parser.add_argument("--initial-timeout-s", type=float, default=10.0)
     parser.add_argument("--duration-s", type=float, help="Record for this many seconds after the first frame")
-    parser.add_argument("--output-fps", type=float, default=30.0)
+    # Default matches the ~45 fps RTP stream; a mismatched value makes the
+    # recorded MP4s play faster/slower than reality.
+    parser.add_argument("--output-fps", type=float, default=45.0)
     parser.add_argument(
         "--split-output-dir",
         type=Path,

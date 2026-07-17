@@ -917,12 +917,12 @@ _CONFIGS = [
             pi05=True,
             action_horizon=30,
             discrete_state_input=False,
-            action_dim=32  # Teleavatar uses 16-dim actions
+            action_dim=32  # Keep 32 to match the pretrained weights; teleavatar uses the first 16 dims
         ),
         data=LeRobotTeleavatarV1DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=True,  # No prompts in teleavatar dataset
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,
@@ -944,7 +944,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_teleavatar_v1",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        # Full fine-tune of pi0 on Teleavatar V1 data.
         model=pi0_config.Pi0Config(
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=30
@@ -952,10 +952,10 @@ _CONFIGS = [
         data=LeRobotTeleavatarV1DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=True,  #
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_joint_actions=False,  # Use end-effector representation
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
             # Official robot head camera is mounted upside-down; the recorded
             # frames are raw upside-down stereo in both training and inference.
             rotate_head_camera=True,
@@ -978,10 +978,10 @@ _CONFIGS = [
         data=LeRobotTeleavatarV1DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=False,  # No prompts in teleavatar dataset
+                prompt_from_task=False,  # Use a fixed placeholder prompt (language channel disabled)
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_joint_actions=False,  # Use end-effector representation
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
             # Official robot head camera is mounted upside-down; the recorded
             # frames are raw upside-down stereo in both training and inference.
             rotate_head_camera=True,
@@ -1008,12 +1008,12 @@ _CONFIGS = [
             pi05=True,
             action_horizon=30,
             discrete_state_input=False,
-            action_dim=32  # Teleavatar uses 16-dim actions
+            action_dim=32  # Keep 32 to match the pretrained weights; teleavatar uses the first 16 dims
         ),
         data=LeRobotTeleavatarV2DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=True,  # No prompts in teleavatar dataset
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,
@@ -1036,7 +1036,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_teleavatar_v2",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        # Full fine-tune of pi0 on Teleavatar V2 data.
         model=pi0_config.Pi0Config(
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=30
@@ -1044,10 +1044,10 @@ _CONFIGS = [
         data=LeRobotTeleavatarV2DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=True,  #
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_joint_actions=False,  # Use end-effector representation
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
             # v2 robot: head camera is right-side-up, so no 180° rotation
             # before the left-eye crop. Set True only for v1 datasets, whose
             # head camera was mounted upside-down.
@@ -1071,10 +1071,10 @@ _CONFIGS = [
         data=LeRobotTeleavatarV2DataConfig(
             repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=False,  # No prompts in teleavatar dataset
+                prompt_from_task=False,  # Use a fixed placeholder prompt (language channel disabled)
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_joint_actions=False,  # Use end-effector representation
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
             # v2 robot: head camera is right-side-up, so no 180° rotation
             # before the left-eye crop. Set True only for v1 datasets, whose
             # head camera was mounted upside-down.

@@ -30,6 +30,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import rclpy
+import yaml
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32
@@ -61,11 +62,29 @@ class TeleavatarROS2Interface(Node):
         node_name: str = "teleavatar_openpi_interface",
         rtp_port: int = 8890,
         rtp_payload: int = 96,
+        sensor_timeout: float = 1.0,
     ):
         super().__init__(node_name)
 
         self.logger = self.get_logger()
         self.lock = Lock()
+        # Sensor data older than this (seconds) is treated as dead: video runs
+        # ~45 fps and joint states ~100 Hz, so 1 s of silence means the source
+        # is gone, not slow. get_observation then returns None instead of the
+        # frozen last sample, so the policy never acts on dead sensors.
+        self.sensor_timeout = sensor_timeout
+
+        # Outgoing arm commands are clamped to the arm_config.yml joint
+        # limits before publishing (see _clamp_arm_cmd).
+        arm_config = yaml.safe_load(open(_REPO_ROOT / "arm_config.yml"))
+        self.joint_lower = {
+            'left_arm': np.array(arm_config["arms"]["left_arm"]["lower"]),
+            'right_arm': np.array(arm_config["arms"]["right_arm"]["lower"]),
+        }
+        self.joint_upper = {
+            'left_arm': np.array(arm_config["arms"]["left_arm"]["upper"]),
+            'right_arm': np.array(arm_config["arms"]["right_arm"]["upper"]),
+        }
 
         # Storage for latest joint data (images live in the RTP interface)
         self.latest_joint_states: Dict[str, JointState] = {}
@@ -183,41 +202,63 @@ class TeleavatarROS2Interface(Node):
         """Get current observation from all sensors.
 
         Returns:
-            Dictionary with 'images' and 'state' keys, or None if data is incomplete.
+            Dictionary with 'images' and 'state' keys, or None if any sensor
+            is missing or older than sensor_timeout. Callers must treat None
+            as "do not act" — never fall back to a previous observation.
         """
+        now = time.time()
+        dead: list = []
+
+        if self._video.stream_ended():
+            dead.append("video: RTP pipeline stopped (EOS/error)")
+
         # Split views from the RTP stream (already copies; no shared buffers).
-        rtp_images = self._video.get_latest_images()
-        if any(view not in rtp_images for view in _POLICY_TO_RTP_VIEW.values()):
-            return None
+        rtp_images, rtp_stamps = self._video.get_latest_images_with_timestamps()
+        for view in _POLICY_TO_RTP_VIEW.values():
+            stamp = rtp_stamps.get(view)
+            if view not in rtp_images or stamp is None:
+                dead.append(f"video:{view}: not received")
+            elif now - stamp > self.sensor_timeout:
+                dead.append(f"video:{view}: {now - stamp:.1f}s stale")
 
         with self.lock:
-            required_joints = ['left_arm', 'right_arm']
-            if not all(joint in self.latest_joint_states for joint in required_joints):
-                return None
+            left_arm = self.latest_joint_states.get('left_arm')
+            right_arm = self.latest_joint_states.get('right_arm')
+            joint_stamps = dict(self.joint_timestamps)
 
-            # Build 48-dimensional state vector
-            # Layout: [positions(16), velocities(16), efforts(16)]
-            # The v2 training data appends 14 EE-pose dims (indices 48-61),
-            # but the policy only reads joint positions (indices 0:7 and
-            # 8:15), which are identical in both layouts — so the client
-            # doesn't need to send them.
-            state_48d = np.zeros(48, dtype=np.float32)
+        for joint_group in ('left_arm', 'right_arm'):
+            stamp = joint_stamps.get(joint_group)
+            if stamp is None:
+                dead.append(f"joints:{joint_group}: not received")
+            elif now - stamp > self.sensor_timeout:
+                dead.append(f"joints:{joint_group}: {now - stamp:.1f}s stale")
 
-            # Extract joint data
-            left_arm = self.latest_joint_states['left_arm']
-            right_arm = self.latest_joint_states['right_arm']
+        if dead:
+            self.logger.error(
+                "Observation unavailable — dead sensors: " + "; ".join(dead),
+                throttle_duration_sec=1.0,
+            )
+            return None
 
-            # Positions (indices 0-15)
-            state_48d[0:7] = self._extract_joint_field(left_arm, 'position', 7)
-            state_48d[8:15] = self._extract_joint_field(right_arm, 'position', 7)
+        # Build 48-dimensional state vector
+        # Layout: [positions(16), velocities(16), efforts(16)]
+        # The v2 training data appends 14 EE-pose dims (indices 48-61),
+        # but the policy only reads joint positions (indices 0:7 and
+        # 8:15), which are identical in both layouts — so the client
+        # doesn't need to send them.
+        state_48d = np.zeros(48, dtype=np.float32)
 
-            # Velocities (indices 16-31)
-            state_48d[16:23] = self._extract_joint_field(left_arm, 'velocity', 7)
-            state_48d[24:31] = self._extract_joint_field(right_arm, 'velocity', 7)
+        # Positions (indices 0-15)
+        state_48d[0:7] = self._extract_joint_field(left_arm, 'position', 7)
+        state_48d[8:15] = self._extract_joint_field(right_arm, 'position', 7)
 
-            # Efforts (indices 32-47)
-            state_48d[32:39] = self._extract_joint_field(left_arm, 'effort', 7)
-            state_48d[40:47] = self._extract_joint_field(right_arm, 'effort', 7)
+        # Velocities (indices 16-31)
+        state_48d[16:23] = self._extract_joint_field(left_arm, 'velocity', 7)
+        state_48d[24:31] = self._extract_joint_field(right_arm, 'velocity', 7)
+
+        # Efforts (indices 32-47)
+        state_48d[32:39] = self._extract_joint_field(left_arm, 'effort', 7)
+        state_48d[40:47] = self._extract_joint_field(right_arm, 'effort', 7)
 
         return {
             'images': {policy_key: rtp_images[view] for policy_key, view in _POLICY_TO_RTP_VIEW.items()},
@@ -236,13 +277,29 @@ class TeleavatarROS2Interface(Node):
             result[:len(data)] = data
             return result
 
+    def _clamp_arm_cmd(self, arm: str, positions: np.ndarray) -> np.ndarray:
+        """Clamp an outgoing 7-dim arm position command to the arm_config.yml
+        joint limits. A throttled warning is logged whenever clamping engages
+        — frequent warnings mean the policy is commanding out-of-range
+        motions."""
+        target = np.asarray(positions, dtype=np.float64)
+        clamped = np.clip(target, self.joint_lower[arm], self.joint_upper[arm])
+        if not np.allclose(clamped, target, atol=1e-9):
+            self.logger.warning(
+                f"{arm} command clamped to joint limits, "
+                f"max deviation {np.max(np.abs(clamped - target)):.3f} rad",
+                throttle_duration_sec=2.0,
+            )
+        return clamped
+
     def publish_action(self, actions: np.ndarray):
         """Publish 16-dimensional action to ROS topics.
 
         Publishes joint position commands directly to the platform's
         /api/<arm>/joint_cmd topics (the v2 platform runs its own low-level
         controller from positions) and gripper trigger values to
-        /api/<side>_gripper/cmd.
+        /api/<side>_gripper/cmd. Arm commands are clamped first (see
+        _clamp_arm_cmd); gripper triggers are clipped to [0, 1].
 
         Args:
             actions: 16-dim array [left_arm_pos(7), left_gripper_effort(1),
@@ -264,7 +321,7 @@ class TeleavatarROS2Interface(Node):
         left_arm_msg.header.stamp = timestamp
         left_arm_msg.header.frame_id = 'left_arm'
         left_arm_msg.name = self.left_joint_names
-        left_arm_msg.position = actions[0:7].tolist()
+        left_arm_msg.position = self._clamp_arm_cmd('left_arm', actions[0:7]).tolist()
         left_arm_msg.velocity = np.zeros(7).tolist()
         left_arm_msg.effort = np.zeros(7).tolist()
         self.action_publishers['left_arm'].publish(left_arm_msg)
@@ -288,7 +345,7 @@ class TeleavatarROS2Interface(Node):
         right_arm_msg.header.stamp = timestamp
         right_arm_msg.header.frame_id = 'right_arm'
         right_arm_msg.name = self.right_joint_names
-        right_arm_msg.position = actions[8:15].tolist()
+        right_arm_msg.position = self._clamp_arm_cmd('right_arm', actions[8:15]).tolist()
         right_arm_msg.velocity = np.zeros(7).tolist()
         right_arm_msg.effort = np.zeros(7).tolist()
         self.action_publishers['right_arm'].publish(right_arm_msg)

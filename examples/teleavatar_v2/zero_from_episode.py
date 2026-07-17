@@ -17,11 +17,17 @@ Usage (client conda env, robot enabled):
 
 import argparse
 import pathlib
+import sys
 import time
 
 import numpy as np
 
-from replay_episode import load_episode
+# Make the repo root importable regardless of cwd (for the package import below).
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from examples.teleavatar_v2.replay_episode import load_episode  # noqa: E402
 
 
 def main():

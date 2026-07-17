@@ -121,7 +121,7 @@ python examples/teleavatar_v1/main.py --remote-host 127.0.0.1 --remote-port 8000
     --prompt "stack the three blocks"
 ```
 
-Common flags (see `Args` in `main.py`): `--control-frequency` (control loop rate), `--action-horizon` (steps per action chunk), `--open-loop-horizon` (steps executed before re-querying the policy), `--prompt` (language instruction). The client performs action chunking via `ActionChunkBroker`.
+Common flags (see `Args` in `main.py`): `--control-frequency` (control loop rate), `--open-loop-horizon` (steps executed before re-querying the policy), `--prompt` (language instruction). The client performs action chunking via `ActionChunkBroker`.
 
 ## 📡 ROS2 Topics
 

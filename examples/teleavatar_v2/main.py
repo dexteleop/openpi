@@ -34,7 +34,7 @@ class Args:
     """Command-line arguments for Teleavatar deployment."""
 
     # Remote policy server settings
-    remote_host: str = "0.0.0.0"
+    remote_host: str = "127.0.0.1"
     """IP address of the policy server (e.g., '192.168.1.100')"""
 
     remote_port: int = 8000
@@ -42,16 +42,15 @@ class Args:
 
     # Control settings
     control_frequency: float = 20.0
-    """Control loop frequency in Hz (default: 15 Hz, matching DROID)"""
-
-    action_horizon: int = 30
-    """Number of actions in each chunk returned by policy (default: 10)"""
+    """Control loop frequency in Hz"""
 
     open_loop_horizon: int = 16
-    """Number of actions to execute before querying policy again (default: 8)"""
+    """Number of actions to execute before querying the policy again. Must not
+    exceed the action chunk length of the trained model (30 for the teleavatar
+    configs)."""
 
     # Task settings
-    prompt: str = "Stack the three blocks'"
+    prompt: str = "Stack the three blocks"
     """Language instruction for the robot"""
 
     # Episode settings
@@ -70,17 +69,9 @@ def main(args: Args) -> None:
     logging.info("=" * 60)
     logging.info(f"Policy server: ws://{args.remote_host}:{args.remote_port}")
     logging.info(f"Control frequency: {args.control_frequency} Hz")
-    logging.info(f"Action horizon: {args.action_horizon} steps")
     logging.info(f"Open-loop horizon: {args.open_loop_horizon} steps")
     logging.info(f"Prompt: '{args.prompt}'")
     logging.info("=" * 60)
-
-    # Validate settings
-    if args.open_loop_horizon > args.action_horizon:
-        logging.warning(
-            f"open_loop_horizon ({args.open_loop_horizon}) > action_horizon ({args.action_horizon}). "
-            f"This means the policy will be queried before the previous chunk is exhausted."
-        )
 
     # Create WebSocket client policy
     ws_client_policy = _websocket_client_policy.WebsocketClientPolicy(

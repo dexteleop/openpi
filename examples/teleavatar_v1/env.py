@@ -41,7 +41,12 @@ class TeleavatarEnvironment(_environment.Environment):
         logging.info(f"TeleavatarEnvironment initialized with prompt: '{prompt}'")
 
     def _init_ros2(self):
-        """Initialize ROS2 in a background thread and wait for initial sensor data."""
+        """Initialize ROS2 in a background thread and wait for initial sensor data.
+
+        The executor runs in a daemon thread for the lifetime of the process;
+        there is no teardown, so only one environment per process is supported
+        (rclpy.init() cannot be called twice).
+        """
         import rclpy
         import time
 
@@ -92,7 +97,7 @@ class TeleavatarEnvironment(_environment.Environment):
                 "Failed to receive initial sensor data. "
                 "Please check that ROS2 topics are publishing:\n"
                 "  ros2 topic list\n"
-                "  ros2 topic hz /left/color/image_raw\n"
+                "  ros2 topic hz /left/color/image_raw/ffmpeg\n"
                 "  ros2 topic echo /left_arm/joint_states --once"
             )
 
@@ -138,7 +143,10 @@ class TeleavatarEnvironment(_environment.Environment):
         # Get raw observation from ROS2
         raw_obs = self._ros_interface.get_observation()
         if raw_obs is None:
-            raise RuntimeError("Failed to get observation from ROS2 interface")
+            raise RuntimeError(
+                "Observation unavailable (sensor data missing or stale — see the "
+                "interface log above). Stopping instead of acting on frozen sensors."
+            )
 
         # Process images: keep original resolution AND keep (H, W, C) format
         # Policy's _parse_image will handle format conversion if needed
@@ -183,8 +191,3 @@ class TeleavatarEnvironment(_environment.Environment):
         """
         self._prompt = prompt
         logging.info(f"Updated prompt to: '{prompt}'")
-
-    def __del__(self):
-        """Cleanup when environment is destroyed."""
-        if self._ros_thread is not None and self._ros_thread.is_alive():
-            logging.info("Shutting down ROS2 thread...")

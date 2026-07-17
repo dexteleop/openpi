@@ -77,6 +77,7 @@ class RTPH265VideoInterface:
         self._thread: Optional[threading.Thread] = None
         self._first_frame = threading.Event()
         self._eos_or_error = threading.Event()
+        self._stop_requested = False
 
         self._frame_count = 0
         self._rtp_packet_count = 0
@@ -121,17 +122,25 @@ class RTPH265VideoInterface:
         self._loop = GLib.MainLoop()
         self._first_frame.clear()
         self._eos_or_error.clear()
+        self._stop_requested = False
 
         self._thread = threading.Thread(target=self._run_loop, name="rtp-h265-video", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         """Stop receiving images."""
-        if self._loop is not None and self._loop.is_running():
-            self._loop.quit()
+        self._stop_requested = True
 
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            # quit() is a no-op on a loop that has not started running yet,
+            # so retry until the loop thread actually exits (bounded).
+            deadline = time.monotonic() + 2.0
+            while self._thread.is_alive() and time.monotonic() < deadline:
+                if self._loop is not None and self._loop.is_running():
+                    self._loop.quit()
+                self._thread.join(timeout=0.1)
+            if self._thread.is_alive():
+                self.logger.warning("RTP decoder thread did not exit within 2s")
 
         if self._pipeline is not None:
             self._pipeline.set_state(Gst.State.NULL)
@@ -181,6 +190,10 @@ class RTPH265VideoInterface:
 
     def has_initial_frame(self) -> bool:
         return self._first_frame.is_set()
+
+    def stream_ended(self) -> bool:
+        """True once the pipeline hit EOS or an unrecoverable error (no new frames will arrive)."""
+        return self._eos_or_error.is_set()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Wait for EOS/error. Returns True if the stream ended."""
@@ -233,7 +246,11 @@ class RTPH265VideoInterface:
             return
 
         try:
-            loop.run()
+            # stop() may have been requested before the loop started running;
+            # quit() would have been lost, so check the flag first (stop()
+            # also keeps retrying quit() until this thread exits).
+            if not self._stop_requested:
+                loop.run()
         finally:
             pipeline.set_state(Gst.State.NULL)
 

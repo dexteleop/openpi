@@ -151,7 +151,7 @@ class TeleavatarInputs(transforms.DataTransformFn):
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.True_,
+                "right_wrist_0_rgb": np.True_,
             },
         }
 
@@ -220,7 +220,9 @@ class TeleavatarOutputs(transforms.DataTransformFn):
         # Only return the first 16 actions for teleavatar.
         # Since the model may output more dimensions due to padding, we extract just what we need.
         # For your own dataset, replace `16` with the action dimension of your dataset.
-        actions = np.asarray(data["actions"][:, :16])
+        # Copy so the in-place gripper conversion below never mutates the
+        # caller's array (a second pass would double-convert the triggers).
+        actions = np.array(data["actions"][:, :16])
 
         # Convert normalized [0, 1] trigger values back to effort (Nm) for
         # robot execution (inverse of the effort→trigger map in

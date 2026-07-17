@@ -10,10 +10,9 @@ import yaml
 from pathlib import Path
 robot_config = yaml.safe_load(open(Path(__file__).parents[2] / "arm_config.yml"))
 class JointInterpolator(Node):
-    def __init__(self, namespace="right_arm", down=True, timer_on=False):
+    def __init__(self, namespace="right_arm", timer_on=False):
         super().__init__(f"{namespace}_joint_interpolator")
         self.namespace = namespace
-        self.down = down
         self.subscription = self.create_subscription(
             JointState,
             f"/{namespace}/joint_states",
@@ -45,11 +44,6 @@ class JointInterpolator(Node):
         self.lower = np.array(robot_config["arms"][namespace]["lower"])
         # Timer to run at 100 Hz for publishing commands
         self.timer = self.create_timer(0.01, self.timer_callback)  # 100 Hz
-        if self.down:
-            joint_2_down_pos = 1.5 if self.namespace == "left" else -1.5
-            joint_4_down_pos = 0.0
-        else:
-            joint_2_down_pos, joint_4_down_pos = 0, 0
         # Pick the target pose for this namespace
         if self.namespace == "right_arm":
             # Right arm target pose
@@ -83,9 +77,11 @@ class JointInterpolator(Node):
         msg.data = 1.0
         self.enable_pub.publish(msg)
     def joint_state_callback(self, msg):
-        self.joint_names = msg.name
-        self.current_pos = np.array(msg.position)
-        self.current_vel = np.array(msg.velocity)
+        # Arm joint_states may carry extra entries (e.g. the gripper joint);
+        # keep only the 7 arm joints to match target_positions.
+        self.joint_names = list(msg.name[:7])
+        self.current_pos = np.array(msg.position[:7])
+        self.current_vel = np.array(msg.velocity[:7])
     def check_convergence(self, current_position, target_position):
         enabled_indices = [i for i, enabled in enumerate(self.enable_flags) if enabled]
         position_errors = np.abs(np.array(current_position) - np.array(target_position))
@@ -117,6 +113,9 @@ class JointInterpolator(Node):
                 for i in range(len(self.current_pos))
             ]
             cmd_msg.position = interpolated_positions
+        # Clamp the command to the joint limits from arm_config.yml so the
+        # platform is never asked to go past the mechanical range.
+        cmd_msg.position = np.clip(cmd_msg.position, self.lower, self.upper).tolist()
         # v2 des_q semantics: position = desired joint angle; the platform's
         # inner control loop computes velocities itself, so leave velocity 0.
         # (v1 instead sent kp*(des-q) in the velocity field with position
@@ -156,16 +155,10 @@ class JointInterpolator(Node):
                         f"{self.namespace} arm: Position diverged, resetting convergence timer..."
                     )
                     self.convergence_start_time = None
-def main(args=None):
-    rclpy.init(args=args)
-    joint_interpolator = JointInterpolator()
-    rclpy.spin(joint_interpolator)
-    joint_interpolator.destroy_node()
-    rclpy.shutdown()
 def main_multithreaded(args=None):
     rclpy.init(args=args)
-    left_node = JointInterpolator(namespace="left_arm", down=True, timer_on=True)  # left arm
-    right_node = JointInterpolator(namespace="right_arm", down=True, timer_on=True)  # right arm
+    left_node = JointInterpolator(namespace="left_arm", timer_on=True)  # left arm
+    right_node = JointInterpolator(namespace="right_arm", timer_on=True)  # right arm
     executor = MultiThreadedExecutor()
     executor.add_node(left_node)
     executor.add_node(right_node)
