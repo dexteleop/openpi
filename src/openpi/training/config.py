@@ -916,7 +916,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=30,
-            discrete_state_input=False,
+            discrete_state_input=True,
             action_dim=32  # Keep 32 to match the pretrained weights; teleavatar uses the first 16 dims
         ),
         data=LeRobotTeleavatarV1DataConfig(
@@ -1007,7 +1007,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=30,
-            discrete_state_input=False,
+            discrete_state_input=True,
             action_dim=32  # Keep 32 to match the pretrained weights; teleavatar uses the first 16 dims
         ),
         data=LeRobotTeleavatarV2DataConfig(
