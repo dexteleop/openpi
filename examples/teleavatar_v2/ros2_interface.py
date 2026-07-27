@@ -63,6 +63,9 @@ class TeleavatarROS2Interface(Node):
         rtp_port: int = 8890,
         rtp_payload: int = 96,
         sensor_timeout: float = 1.0,
+        control_frequency: float = 30.0,
+        interp_frequency: float = 200.0,
+        interpolate: bool = True,
     ):
         super().__init__(node_name)
 
@@ -102,6 +105,33 @@ class TeleavatarROS2Interface(Node):
         # Setup subscribers and publishers
         self._setup_subscribers()
         self._setup_publishers()
+
+        # publish_action() sets a target; a timer ramps des_q linearly from the last
+        # published position over one control period, smoothing the platform's zero-order-hold
+        # staircase (which otherwise steps the inner velocity loop into spikes).
+        self._interpolate = interpolate
+        self._cmd_lock = Lock()
+        self._ctrl_period = 1.0 / max(control_frequency, 1e-3)  # ramp duration per command
+        self._interp_period = 1.0 / max(interp_frequency, 1.0)
+        self._ramp_from: Optional[np.ndarray] = None   # (14,) arm des_q at ramp start
+        self._ramp_to: Optional[np.ndarray] = None     # (14,) arm des_q target
+        self._ramp_t0: Optional[float] = None          # monotonic time at ramp start
+        self._last_cmd_pos: Optional[np.ndarray] = None  # (14,) last published arm des_q
+        self._gripper_target = np.zeros(2)             # [left, right] effort (Nm)
+        self._have_target = False
+        self._enable_counter = 0
+        if self._interpolate:
+            self._interp_timer = self.create_timer(self._interp_period, self._interp_publish)
+            self.logger.info(
+                f"des_q interpolation ON: {control_frequency:.0f} Hz command -> "
+                f"{interp_frequency:.0f} Hz publish (ramp {self._ctrl_period*1e3:.0f} ms)"
+            )
+        else:
+            self._interp_timer = None
+            self.logger.info(
+                f"des_q interpolation OFF: publishing raw commands at ~{control_frequency:.0f} Hz "
+                "(platform ZOH-holds them to its inner-loop rate -- may jitter)"
+            )
 
         self.logger.info("TeleavatarROS2Interface initialized (waiting for sensor data in background)")
 
@@ -296,69 +326,98 @@ class TeleavatarROS2Interface(Node):
         return clamped
 
     def publish_action(self, actions: np.ndarray):
-        """Publish 16-dimensional action to ROS topics.
-
-        Publishes joint position commands directly to the platform's
-        /api/<arm>/joint_cmd topics (the v2 platform runs its own low-level
-        controller from positions) and gripper trigger values to
-        /api/<side>_gripper/cmd. Arm commands are clamped first (see
-        _clamp_arm_cmd); gripper triggers are clipped to [0, 1].
-
-        Args:
-            actions: 16-dim array [left_arm_pos(7), left_gripper_effort(1),
-                                   right_arm_pos(7), right_gripper_effort(1)]
-        """
+        """Set the latest action as the interpolation target (16-dim:
+        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)])."""
         if actions.shape != (16,):
             self.logger.error(f"Expected 16-dim action, got shape {actions.shape}")
             return
 
+        arm14 = np.concatenate([actions[0:7], actions[8:15]]).astype(np.float64)
+        grip2 = np.array([actions[7], actions[15]], dtype=np.float64)
+        if not self._interpolate:
+            self._publish_cmd(arm14, grip2)
+            return
+        now = time.monotonic()
+        with self._cmd_lock:
+            if self._last_cmd_pos is None:
+                start = self._current_arm_positions()  # take off from the measured pose
+                self._last_cmd_pos = start if start is not None else arm14.copy()
+            self._ramp_from = self._last_cmd_pos.copy()
+            self._ramp_to = arm14
+            self._ramp_t0 = now
+            self._gripper_target = grip2
+            self._have_target = True
+
+    def _current_arm_positions(self) -> Optional[np.ndarray]:
+        """Latest measured [left(7), right(7)] joint positions, or None if unavailable."""
+        with self.lock:
+            left = self.latest_joint_states.get('left_arm')
+            right = self.latest_joint_states.get('right_arm')
+        if left is None or right is None:
+            return None
+        return np.concatenate([
+            self._extract_joint_field(left, 'position', 7),
+            self._extract_joint_field(right, 'position', 7),
+        ]).astype(np.float64)
+
+    def _interp_publish(self):
+        """Ramp des_q toward the latest target over one control period; alpha clamps to [0, 1],
+        so a late command holds at the target and an early one resumes from the current pose."""
+        with self._cmd_lock:
+            if not self._have_target:
+                return
+            alpha = (time.monotonic() - self._ramp_t0) / self._ctrl_period
+            alpha = min(max(alpha, 0.0), 1.0)
+            pos = self._ramp_from + alpha * (self._ramp_to - self._ramp_from)
+            self._last_cmd_pos = pos.copy()
+            grip = self._gripper_target.copy()
+        self._publish_cmd(pos, grip)
+
+    @staticmethod
+    def _gripper_trigger(effort: float) -> float:
+        """Invert the v2 trigger->effort curve (>0 opens, <0 closes); clipped to [0, 1]."""
+        if effort > 0:
+            trigger = 0.10 * (1.0 - effort / 2.0)
+        else:
+            trigger = 0.10 - effort * 0.90 / 1.6
+        return float(np.clip(trigger, 0.0, 1.0))
+
+    def _publish_cmd(self, arm14: np.ndarray, grip2: np.ndarray):
+        """Publish one des_q frame: both arms (clamped, velocity=0) + grippers + enable heartbeat."""
         timestamp = self.get_clock().now().to_msg()
 
-        # Enable FSM
-        enable_msg = Float32()
-        enable_msg.data = 1.0
-        self.enable_pub.publish(enable_msg)
+        # enable heartbeat, ~50 Hz
+        self._enable_counter += 1
+        if self._enable_counter % 4 == 0:
+            enable_msg = Float32()
+            enable_msg.data = 1.0
+            self.enable_pub.publish(enable_msg)
 
-        # Left arm (position command)
+        # Left arm (position command).
         left_arm_msg = JointState()
         left_arm_msg.header.stamp = timestamp
         left_arm_msg.header.frame_id = 'left_arm'
         left_arm_msg.name = self.left_joint_names
-        left_arm_msg.position = self._clamp_arm_cmd('left_arm', actions[0:7]).tolist()
+        left_arm_msg.position = self._clamp_arm_cmd('left_arm', arm14[0:7]).tolist()
         left_arm_msg.velocity = np.zeros(7).tolist()
         left_arm_msg.effort = np.zeros(7).tolist()
         self.action_publishers['left_arm'].publish(left_arm_msg)
 
-        # Left gripper: convert the model's effort (Nm) to the platform's
-        # [0, 1] trigger value — inverse of the v2 piecewise trigger→effort
-        # curve (same for both arms; see teleavatar_v2_policy). Positive effort =
-        # opening (trigger < 0.10), negative = closing (trigger > 0.10).
-        # Clipped because the platform expects a 0~1 trigger.
-        left_gripper_msg = Float32()
-        effort_left = float(actions[7])
-        if effort_left > 0:
-            trigger_left = 0.10 * (1.0 - effort_left / 2.0)
-        else:  # effort_left <= 0
-            trigger_left = 0.10 - effort_left * 0.90 / 1.6
-        left_gripper_msg.data = float(np.clip(trigger_left, 0.0, 1.0))
-        self.action_publishers['left_gripper'].publish(left_gripper_msg)
-
-        # Right arm (position command)
+        # Right arm.
         right_arm_msg = JointState()
         right_arm_msg.header.stamp = timestamp
         right_arm_msg.header.frame_id = 'right_arm'
         right_arm_msg.name = self.right_joint_names
-        right_arm_msg.position = self._clamp_arm_cmd('right_arm', actions[8:15]).tolist()
+        right_arm_msg.position = self._clamp_arm_cmd('right_arm', arm14[7:14]).tolist()
         right_arm_msg.velocity = np.zeros(7).tolist()
         right_arm_msg.effort = np.zeros(7).tolist()
         self.action_publishers['right_arm'].publish(right_arm_msg)
 
-        # Right gripper: same v2 effort → trigger conversion as the left.
+        # grippers: effort -> [0, 1] trigger
+        left_gripper_msg = Float32()
+        left_gripper_msg.data = self._gripper_trigger(float(grip2[0]))
+        self.action_publishers['left_gripper'].publish(left_gripper_msg)
+
         right_gripper_msg = Float32()
-        effort_right = float(actions[15])
-        if effort_right > 0:
-            trigger_right = 0.10 * (1.0 - effort_right / 2.0)
-        else:  # effort_right <= 0
-            trigger_right = 0.10 - effort_right * 0.90 / 1.6
-        right_gripper_msg.data = float(np.clip(trigger_right, 0.0, 1.0))
+        right_gripper_msg.data = self._gripper_trigger(float(grip2[1]))
         self.action_publishers['right_gripper'].publish(right_gripper_msg)

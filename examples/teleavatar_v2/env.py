@@ -21,11 +21,17 @@ class TeleavatarEnvironment(_environment.Environment):
     def __init__(
         self,
         prompt: str = "pick a toy and put it in the basket using left gripper",
+        control_frequency: float = 30.0,
+        interp_frequency: float = 200.0,
+        interpolate: bool = True,
     ):
         """Initialize Teleavatar environment.
 
         Args:
             prompt: Default language instruction for the policy
+            control_frequency: Rate (Hz) apply_action is called; sets the interp ramp duration.
+            interp_frequency: Rate (Hz) the interface republishes interpolated des_q (~200 Hz).
+            interpolate: Enable des_q interpolation (False = raw ZOH publish).
 
         Note: Images are NOT resized here. All three views arrive from the
         RTP/H265 composite stream (rtp_video_interface) already split to single
@@ -34,6 +40,9 @@ class TeleavatarEnvironment(_environment.Environment):
         the training videos.
         """
         self._prompt = prompt
+        self._control_frequency = control_frequency
+        self._interp_frequency = interp_frequency
+        self._interpolate = interpolate
 
         # Initialize ROS2 interface in a separate thread
         self._ros_interface: Optional[ros2_interface.TeleavatarROS2Interface] = None
@@ -57,7 +66,11 @@ class TeleavatarEnvironment(_environment.Environment):
 
         def ros_spin():
             rclpy.init()
-            self._ros_interface = ros2_interface.TeleavatarROS2Interface()
+            self._ros_interface = ros2_interface.TeleavatarROS2Interface(
+                control_frequency=self._control_frequency,
+                interp_frequency=self._interp_frequency,
+                interpolate=self._interpolate,
+            )
 
             # Spin in background
             executor = rclpy.executors.MultiThreadedExecutor()

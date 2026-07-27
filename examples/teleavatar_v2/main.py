@@ -41,8 +41,14 @@ class Args:
     """Port of the policy server"""
 
     # Control settings
-    control_frequency: float = 20.0
-    """Control loop frequency in Hz"""
+    control_frequency: float = 30.0
+    """Control loop frequency in Hz (rate at which the policy command is stepped)"""
+
+    interp_frequency: float = 200.0
+    """Rate (Hz) to republish des_q, interpolated from the command stream (~200 Hz)."""
+
+    interpolate: bool = True
+    """Interpolate des_q up to interp_frequency; --no-interpolate publishes raw (ZOH)."""
 
     open_loop_horizon: int = 16
     """Number of actions to execute before querying the policy again. Must not
@@ -69,6 +75,10 @@ def main(args: Args) -> None:
     logging.info("=" * 60)
     logging.info(f"Policy server: ws://{args.remote_host}:{args.remote_port}")
     logging.info(f"Control frequency: {args.control_frequency} Hz")
+    if args.interpolate:
+        logging.info(f"des_q interp publish: {args.interp_frequency} Hz (ZOH-staircase fix)")
+    else:
+        logging.info("des_q interpolation: OFF (raw commands, original ZOH behavior)")
     logging.info(f"Open-loop horizon: {args.open_loop_horizon} steps")
     logging.info(f"Prompt: '{args.prompt}'")
     logging.info("=" * 60)
@@ -87,6 +97,9 @@ def main(args: Args) -> None:
     # Note: Images are kept at original resolution to match training data
     environment = _env.TeleavatarEnvironment(
         prompt=args.prompt,
+        control_frequency=args.control_frequency,
+        interp_frequency=args.interp_frequency,
+        interpolate=args.interpolate,
     )
 
     # Create policy agent with action chunking
