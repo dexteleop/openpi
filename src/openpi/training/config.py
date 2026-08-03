@@ -406,27 +406,21 @@ class LeRobotTeleavatarV1DataConfig(DataConfigFactory):
             inputs=[_transforms.RepackTransform(repack_structure)]
         )
 
-        # Data transforms for teleavatar policy
+        # Delta is handled inside TeleavatarInputs/Outputs (see there for why).
         data_transforms = _transforms.Group(
             inputs=[
                 teleavatar_v1_policy.TeleavatarInputs(
                     model_type=model_config.model_type,
                     rotate_head_camera=self.rotate_head_camera,
+                    use_delta_joint_actions=self.use_delta_joint_actions,
                 )
             ],
-            outputs=[teleavatar_v1_policy.TeleavatarOutputs()],
+            outputs=[
+                teleavatar_v1_policy.TeleavatarOutputs(
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
         )
-
-        # Apply delta actions if requested (for joint positions/velocities, not gripper efforts)
-        # Actions are 16 dimensions: 7 left arm joints, 1 left gripper, 7 right arm joints, 1 right gripper
-        if self.use_delta_joint_actions:
-            # Apply delta left arm joints (first 7 dims), leave left gripper (8th dim) absolute
-            # Apply delta right arm joints (dims 9-15), leave right gripper (16th dim) absolute
-            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
 
         # Model transforms
         model_transforms = ModelTransformFactory()(model_config)
@@ -478,27 +472,21 @@ class LeRobotTeleavatarV2DataConfig(DataConfigFactory):
             inputs=[_transforms.RepackTransform(repack_structure)]
         )
 
-        # Data transforms for teleavatar policy
+        # Delta is handled inside TeleavatarInputs/Outputs (see there for why).
         data_transforms = _transforms.Group(
             inputs=[
                 teleavatar_v2_policy.TeleavatarInputs(
                     model_type=model_config.model_type,
                     rotate_head_camera=self.rotate_head_camera,
+                    use_delta_joint_actions=self.use_delta_joint_actions,
                 )
             ],
-            outputs=[teleavatar_v2_policy.TeleavatarOutputs()],
+            outputs=[
+                teleavatar_v2_policy.TeleavatarOutputs(
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
         )
-
-        # Apply delta actions if requested (for joint positions/velocities, not gripper efforts)
-        # Actions are 16 dimensions: 7 left arm joints, 1 left gripper, 7 right arm joints, 1 right gripper
-        if self.use_delta_joint_actions:
-            # Apply delta left arm joints (first 7 dims), leave left gripper (8th dim) absolute
-            # Apply delta right arm joints (dims 9-15), leave right gripper (16th dim) absolute
-            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
 
         # Model transforms
         model_transforms = ModelTransformFactory()(model_config)

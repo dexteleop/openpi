@@ -110,6 +110,10 @@ class TeleavatarInputs(transforms.DataTransformFn):
     #           v1 officially released robot — its training data is upside-down too)
     #   False → frame already right-side-up before this transform (v2 robot)
     rotate_head_camera: bool = False
+    # Arm joints only, gripper stays absolute. Done here rather than via the
+    # generic DeltaActions transform, since state (14-dim) and actions
+    # (16-dim, gripper-interleaved) don't share a layout it can index by position.
+    use_delta_joint_actions: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Parse images to uint8 (H,W,C) format
@@ -181,6 +185,11 @@ class TeleavatarInputs(transforms.DataTransformFn):
             selected_actions[:, 7] = _gripper_effort_to_trigger(selected_actions[:, 7])
             selected_actions[:, 15] = _gripper_effort_to_trigger(selected_actions[:, 15])
 
+            # state_14d has no gripper slot, so right arm is at 7:14 here vs 8:15 in actions.
+            if self.use_delta_joint_actions:
+                selected_actions[:, 0:7] -= state_14d[np.newaxis, 0:7]
+                selected_actions[:, 8:15] -= state_14d[np.newaxis, 7:14]
+
             inputs["actions"] = selected_actions
 
         # Pass the prompt (aka language instruction) to the model. During
@@ -216,6 +225,9 @@ class TeleavatarOutputs(transforms.DataTransformFn):
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
 
+    # Must match the TeleavatarInputs setting for this config.
+    use_delta_joint_actions: bool = False
+
     def __call__(self, data: dict) -> dict:
         # Only return the first 16 actions for teleavatar.
         # Since the model may output more dimensions due to padding, we extract just what we need.
@@ -223,6 +235,12 @@ class TeleavatarOutputs(transforms.DataTransformFn):
         # Copy so the in-place gripper conversion below never mutates the
         # caller's array.
         actions = np.array(data["actions"][:, :16])
+
+        # data["state"] is the un-normalized 14-dim state: [left_arm(7), right_arm(7)].
+        if self.use_delta_joint_actions:
+            state = np.asarray(data["state"])
+            actions[:, 0:7] += state[0:7]
+            actions[:, 8:15] += state[7:14]
 
         # Convert normalized [0, 1] trigger values back to effort (Nm) for
         # robot execution (inverse of the effort→trigger map in
