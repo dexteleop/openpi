@@ -64,8 +64,8 @@ class AssetsConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
-    # LeRobot repo id. If None, fake data will be created.
-    repo_id: str | None = None
+    # LeRobot repo id, or a list of repo ids to train on jointly. If None, fake data will be created.
+    repo_id: str | Sequence[str] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -166,8 +166,8 @@ class ModelTransformFactory(GroupFactory):
 
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
-    # The LeRobot repo id.
-    repo_id: str = tyro.MISSING
+    # The LeRobot repo id, or a list of repo ids to train on jointly.
+    repo_id: str | Sequence[str] = tyro.MISSING
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -179,21 +179,32 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        # An absolute-path repo_id (local dataset) must not be used as the
-        # asset_id: every `... / asset_id` join would resolve to the dataset
-        # directory (absolute paths win in path joins), so checkpoints's
-        # assets/ would silently stay empty and serving would only work with
-        # the dataset mounted at the same path. Use the dataset basename
-        # instead, so norm stats really get packaged into the checkpoint.
-        is_local_path = repo_id is not None and pathlib.PurePath(repo_id).is_absolute()
-        asset_id = self.assets.asset_id or (pathlib.PurePath(repo_id).name if is_local_path else repo_id)
-        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
-        if norm_stats is None and is_local_path:
-            # Convention for local datasets: compute_norm_stats.py writes
-            # <dataset>/norm_stats.json (its output path joins the absolute
-            # repo_id). Load from there so the stats live with the data and
-            # get copied into the checkpoint's assets/<basename>/ on save.
-            norm_stats = self._load_norm_stats(epath.Path(repo_id).parent, pathlib.PurePath(repo_id).name)
+        is_multi_dataset = repo_id is not None and not isinstance(repo_id, str)
+        if is_multi_dataset:
+            # No single basename to derive an asset id from, so require one explicitly.
+            if not self.assets.asset_id:
+                raise ValueError(
+                    "assets.asset_id must be set explicitly when repo_id is a list of datasets "
+                    f"(got repo_id={list(repo_id)})."
+                )
+            asset_id = self.assets.asset_id
+            norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+        else:
+            # An absolute-path repo_id (local dataset) must not be used as the
+            # asset_id: every `... / asset_id` join would resolve to the dataset
+            # directory (absolute paths win in path joins), so checkpoints's
+            # assets/ would silently stay empty and serving would only work with
+            # the dataset mounted at the same path. Use the dataset basename
+            # instead, so norm stats really get packaged into the checkpoint.
+            is_local_path = repo_id is not None and pathlib.PurePath(repo_id).is_absolute()
+            asset_id = self.assets.asset_id or (pathlib.PurePath(repo_id).name if is_local_path else repo_id)
+            norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+            if norm_stats is None and is_local_path:
+                # Convention for local datasets: compute_norm_stats.py writes
+                # <dataset>/norm_stats.json (its output path joins the absolute
+                # repo_id). Load from there so the stats live with the data and
+                # get copied into the checkpoint's assets/<basename>/ on save.
+                norm_stats = self._load_norm_stats(epath.Path(repo_id).parent, pathlib.PurePath(repo_id).name)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,

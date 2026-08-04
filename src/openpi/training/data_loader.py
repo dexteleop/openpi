@@ -127,6 +127,23 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _create_single_torch_dataset(repo_id: str, data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+    """Create a torch dataset for a single LeRobot repo id."""
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset = lerobot_dataset.LeRobotDataset(
+        repo_id,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+    )
+
+    if data_config.prompt_from_task:
+        # task_index is local to each dataset, so apply the mapping before concatenating.
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    return dataset
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,18 +154,11 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
-
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
-    return dataset
+    repo_ids = [repo_id] if isinstance(repo_id, str) else list(repo_id)
+    datasets = [_create_single_torch_dataset(rid, data_config, action_horizon) for rid in repo_ids]
+    if len(datasets) == 1:
+        return datasets[0]
+    return torch.utils.data.ConcatDataset(datasets)
 
 
 def create_rlds_dataset(

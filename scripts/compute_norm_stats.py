@@ -6,6 +6,7 @@ to the config assets directory.
 """
 
 import numpy as np
+import torch.utils.data
 import tqdm
 import tyro
 
@@ -60,15 +61,11 @@ class SkipVideoDataset:
         return len(self._dataset)
 
 
-def _create_torch_dataset_skip_video(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+def _create_single_torch_dataset_skip_video(
+    repo_id: str, data_config: _config.DataConfig, action_horizon: int
 ) -> _data_loader.Dataset:
-    """Same as create_torch_dataset but wraps LeRobotDataset with SkipVideoDataset before transforms."""
+    """Wraps a single LeRobotDataset with SkipVideoDataset before transforms."""
     from lerobot.common.datasets import lerobot_dataset
-
-    repo_id = data_config.repo_id
-    if repo_id is None:
-        raise ValueError("Repo ID is not set.")
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -79,7 +76,7 @@ def _create_torch_dataset_skip_video(
         },
     )
     # Wrap *before* TransformedDataset so we have access to raw LeRobotDataset internals
-    print("Skipping video decoding (using dummy images) for faster norm stats computation.")
+    print(f"Skipping video decoding (using dummy images) for faster norm stats computation on {repo_id}.")
     dataset = SkipVideoDataset(dataset)
 
     if data_config.prompt_from_task:
@@ -87,6 +84,20 @@ def _create_torch_dataset_skip_video(
         dataset = _data_loader.TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
+
+
+def _create_torch_dataset_skip_video(
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+) -> _data_loader.Dataset:
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set.")
+
+    repo_ids = [repo_id] if isinstance(repo_id, str) else list(repo_id)
+    datasets = [_create_single_torch_dataset_skip_video(rid, data_config, action_horizon) for rid in repo_ids]
+    if len(datasets) == 1:
+        return datasets[0]
+    return torch.utils.data.ConcatDataset(datasets)
 
 
 def create_torch_dataloader(
@@ -181,7 +192,12 @@ def main(config_name: str, max_frames: int | None = None, skip_video: bool = Tru
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # Single repo id: keep writing to assets_dirs/repo_id (preserves the local-dataset convention, see
+    # DataConfigFactory.create_base_config). List of repo ids: fall back to the required asset_id.
+    repo_id = data_config.repo_id
+    output_path = (
+        config.assets_dirs / repo_id if isinstance(repo_id, str) else config.assets_dirs / data_config.asset_id
+    )
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
