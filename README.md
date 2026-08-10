@@ -1,54 +1,107 @@
-# openpi
+# openpi for TeleAvatar Dual-Arm Robots
 
-openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/release/python-3110/)
+[![ROS2 Humble](https://img.shields.io/badge/ROS2-Humble-blue.svg)](https://docs.ros.org/en/humble/)
 
-Currently, this repo contains three types of models:
-- the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based vision-language-action model (VLA).
-- the [π₀-FAST model](https://www.physicalintelligence.company/research/fast), an autoregressive VLA, based on the FAST action tokenizer.
-- the [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05), an upgraded version of π₀ with better open-world generalization trained with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation). Note that, in this repository, we currently only support the flow matching head for both $\pi_{0.5}$ training and inference.
+This repository is based on [openpi](https://github.com/Physical-Intelligence/openpi) and targets the TeleAvatar dual-arm robots (TeleAvatar V1 and TeleAvatar V2). It provides open-source base VLA models, the fine-tuning pipeline, and the complete ROS2 stack for deploying policies on the real robots.
 
-For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours of robot data, and examples for using them out of the box or fine-tuning them to your own datasets.
+> 📖 For the general upstream openpi documentation (PyTorch support, full model list, troubleshooting, etc.), see [README_openpi.md](README_openpi.md).
 
-This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
+The following base VLA model weights are provided for fine-tuning:
 
-## Updates
+| Base model | Usage       | Description                                                          | Checkpoint path                            |
+| ---------- | ----------- | -------------------------------------------------------------------- | ------------------------------------------ |
+| π₀         | Fine-tuning | [π₀ base model](https://www.physicalintelligence.company/blog/pi0)   | `gs://openpi-assets/checkpoints/pi0_base`  |
+| π₀.₅       | Fine-tuning | [π₀.₅ base model](https://www.physicalintelligence.company/blog/pi05) | `gs://openpi-assets/checkpoints/pi05_base` |
 
-- [Sept 2025] We released PyTorch support in openpi.
-- [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
-- [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
+## 📑 Table of Contents
 
+- [Robot Generations](#-robot-generations)
+- [System Requirements](#-system-requirements)
+- [Installation](#-installation)
+  - [Server Environment (uv)](#server-environment-uv)
+  - [Client Environment (conda + ROS2)](#client-environment-conda--ros2)
+- [Fine-Tuning](#-fine-tuning)
+  - [1. Download the Base Model](#1-download-the-base-model)
+  - [2. Convert Teleoperation Data to a LeRobot Dataset](#2-convert-teleoperation-data-to-a-lerobot-dataset)
+  - [3. Choose and Configure a Training Config](#3-choose-and-configure-a-training-config)
+  - [4. Compute Normalization Statistics](#4-compute-normalization-statistics)
+  - [5. Launch Training](#5-launch-training)
+- [Real-Robot Deployment](#-real-robot-deployment)
+- [Data Format (Shared)](#-data-format-shared)
+- [License](#-license)
+- [Acknowledgments](#-acknowledgments)
 
-## Requirements
+## 🤖 Robot Generations
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+This repository supports both TeleAvatar generations side by side; the two codepaths are **fully separated** (mirroring the upstream aloha/droid multi-robot layout). This document covers only what the two generations **share** (installation, fine-tuning workflow, common data format). For each generation's **deployment procedure, topics, camera formats, and gripper mapping**, see its own README:
 
-| Mode               | Memory Required | Example GPU        |
-| ------------------ | --------------- | ------------------ |
-| Inference          | > 8 GB          | RTX 4090           |
-| Fine-Tuning (LoRA) | > 22.5 GB       | RTX 4090           |
-| Fine-Tuning (Full) | > 70 GB         | A100 (80GB) / H100 |
+- **TeleAvatar V1**: [examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
+- **TeleAvatar V2**: [examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
 
-The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
+| | TeleAvatar V1 | TeleAvatar V2 |
+| --- | --- | --- |
+| Training configs | `pi0_teleavatar_v1` / `pi05_teleavatar_v1` / `pi0_teleavatar_v1_low_mem_finetune` | `pi0_teleavatar_v2` / `pi05_teleavatar_v2` / `pi0_teleavatar_v2_low_mem_finetune` |
+| Policy module | [`teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py) | [`teleavatar_v2_policy.py`](src/openpi/policies/teleavatar_v2_policy.py) |
+| Client | [`examples/teleavatar_v1/`](examples/teleavatar_v1/) | [`examples/teleavatar_v2/`](examples/teleavatar_v2/) |
+| Dataset conversion | [rosbag_to_dataset_TA1](https://github.com/dexteleop/rosbag_to_dataset_TA1) | [rosbag_to_dataset_TA2](https://github.com/dexteleop/rosbag_to_dataset_TA2) |
+| Cameras | ROS2 FFMPEGPacket topics (upside-down stereo head + mono wrists, PyAV decoding) | Single RTP/H.265 combined stream (three stereo cameras, one eye each, GStreamer decoding) |
+| Arm control | `model_joint_cmd` + `arm_pd_controller` (100 Hz PD velocity relay) | Position commands published directly to `/api/<arm>/joint_cmd` |
+| Gripper mapping | Asymmetric ±7 linear curve | Symmetric piecewise curve (zero crossing at trigger = 0.10) |
 
-## Installation
+## 📋 System Requirements
 
-When cloning this repo, make sure to update submodules:
+Running the models in this repository requires an NVIDIA GPU with at least the following specs. The training script does not currently support multi-node training.
+
+| Mode                | Required VRAM | Example GPU        |
+| ------------------- | ------------- | ------------------ |
+| Inference           | > 8 GB        | RTX 4090           |
+| Fine-tuning (LoRA)  | > 22 GB       | RTX 4090 / A100    |
+| Fine-tuning (full)  | > 70 GB       | A100 (80GB) / H100 |
+
+The client-side software dependencies for real-robot deployment (ROS2, etc.) are installed together via [`environment.yml`](environment.yml) — see [Installation](#-installation). An NVIDIA GPU is recommended on the client for camera decoding; the decoding dependencies differ between the two generations, see the per-generation READMEs.
+
+## 🔧 Installation
+
+When cloning this repository, make sure to fetch the submodules:
 
 ```bash
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
-
-# Or if you already cloned the repo:
-git submodule update --init --recursive
+git clone --recurse-submodules https://github.com/dexteleop/openpi.git
 ```
 
-We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
+The project uses **two separate environments**, which may live on different (or the same) machines:
+
+| Environment | Purpose                                                        | Contains            | Installed with          |
+| ----------- | -------------------------------------------------------------- | ------------------- | ----------------------- |
+| Server      | Training, norm stats, policy inference service (JAX/GPU)       | openpi itself       | `uv`                    |
+| Client      | Real-robot deployment: collect observations, send actions (ROS2) | ROS2 + client code | `conda environment.yml` |
+
+> Training and norm-stats computation only need the server environment. For real-robot deployment, the server runs the policy service and the client talks to it over WebSocket.
+
+### Server Environment (uv)
+
+We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies.
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Or, if you don't have curl, use wget
+wget -qO- https://astral.sh/uv/install.sh | sh
+```
+
+Once uv is installed, run the following to set up the environment:
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 GIT_LFS_SKIP_SMUDGE=1 uv pip install webdataset
 ```
+
+Note: `GIT_LFS_SKIP_SMUDGE=1` is required to pull LeRobot as a dependency.
+
+The WebDataset training path (`pi0_lingyu_wds`) decodes video on the GPU, which
+needs decord built from source with CUDA — the PyPI wheel is CPU-only:
 
 ```bash
 git clone --recursive https://github.com/dmlc/decord
@@ -61,275 +114,176 @@ cd .. && cd python
 ~/openpi/.venv/bin/python -c "import decord._C; print('GPU decord ready')"
 ```
 
-NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
+### Client Environment (conda + ROS2)
 
-**Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
-
-
-
-
-## Model Checkpoints
-
-### Base Models
-We provide multiple base VLA model checkpoints. These checkpoints have been pre-trained on 10k+ hours of robot data, and can be used for fine-tuning.
-
-| Model        | Use Case    | Description                                                                                                 | Checkpoint Path                                |
-| ------------ | ----------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| $\pi_0$      | Fine-Tuning | Base [π₀ model](https://www.physicalintelligence.company/blog/pi0) for fine-tuning                | `gs://openpi-assets/checkpoints/pi0_base`      |
-| $\pi_0$-FAST | Fine-Tuning | Base autoregressive [π₀-FAST model](https://www.physicalintelligence.company/research/fast) for fine-tuning | `gs://openpi-assets/checkpoints/pi0_fast_base` |
-| $\pi_{0.5}$    | Fine-Tuning | Base [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05) for fine-tuning    | `gs://openpi-assets/checkpoints/pi05_base`      |
-
-### Fine-Tuned Models
-We also provide "expert" checkpoints for various robot platforms and tasks. These models are fine-tuned from the base models above and intended to run directly on the target robot. These may or may not work on your particular robot. Since these checkpoints were fine-tuned on relatively small datasets collected with more widely available robots, such as ALOHA and the DROID Franka setup, they might not generalize to your particular setup, though we found some of these, especially the DROID checkpoint, to generalize quite broadly in practice.
-
-| Model                    | Use Case    | Description                                                                                                                                                                                              | Checkpoint Path                                       |
-| ------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| $\pi_0$-FAST-DROID       | Inference   | $\pi_0$-FAST model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): can perform a wide range of simple table-top manipulation tasks 0-shot in new scenes on the DROID robot platform | `gs://openpi-assets/checkpoints/pi0_fast_droid`       |
-| $\pi_0$-DROID            | Fine-Tuning | $\pi_0$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): faster inference than $\pi_0$-FAST-DROID, but may not follow language commands as well                                | `gs://openpi-assets/checkpoints/pi0_droid`            |
-| $\pi_0$-ALOHA-towel      | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can fold diverse towels 0-shot on ALOHA robot platforms                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_towel`      |
-| $\pi_0$-ALOHA-tupperware | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can unpack food from a tupperware container                                                                                                             | `gs://openpi-assets/checkpoints/pi0_aloha_tupperware` |
-| $\pi_0$-ALOHA-pen-uncap  | Inference   | $\pi_0$ model fine-tuned on public [ALOHA](https://dit-policy.github.io/) data: can uncap a pen                                                                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap`  |
-| $\pi_{0.5}$-LIBERO      | Inference   | $\pi_{0.5}$ model fine-tuned for the [LIBERO](https://libero-project.github.io/datasets) benchmark: gets state-of-the-art performance (see [LIBERO README](examples/libero/README.md)) | `gs://openpi-assets/checkpoints/pi05_libero`      |
-| $\pi_{0.5}$-DROID      | Inference / Fine-Tuning | $\pi_{0.5}$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/) with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation): fast inference and good language-following | `gs://openpi-assets/checkpoints/pi05_droid`      |
-
-
-By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
-
-
-
-
-## Running Inference for a Pre-Trained Model
-
-Our pre-trained model checkpoints can be run with a few lines of code (here our $\pi_0$-FAST-DROID model):
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
-
-# Create a trained policy.
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference on a dummy example.
-example = {
-    "observation/exterior_image_1_left": ...,
-    "observation/wrist_image_left": ...,
-    ...
-    "prompt": "pick up the fork"
-}
-action_chunk = policy.infer(example)["actions"]
-```
-You can also test this out in the [example notebook](examples/inference.ipynb).
-
-We provide detailed step-by-step examples for running inference of our pre-trained checkpoints on [DROID](examples/droid/README.md) and [ALOHA](examples/aloha_real/README.md) robots.
-
-**Remote Inference**: We provide [examples and code](docs/remote_inference.md) for running inference of our models **remotely**: the model can run on a different server and stream actions to the robot via a websocket connection. This makes it easy to use more powerful GPUs off-robot and keep robot and policy environments separate.
-
-**Test inference without a robot**: We provide a [script](examples/simple_client/README.md) for testing inference without a robot. This script will generate a random observation and run inference with the model. See [here](examples/simple_client/README.md) for more details.
-
-
-
-
-
-## Fine-Tuning Base Models on Your Own Data
-
-We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-project.github.io/datasets) as a running example for how to fine-tune a base model on your own data. We will explain three steps:
-1. Convert your data to a LeRobot dataset (which we use for training)
-2. Defining training configs and running training
-3. Spinning up a policy server and running inference
-
-### 1. Convert your data to a LeRobot dataset
-
-We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:
+The robot side needs ROS2. This repository ships a conda environment file [`environment.yml`](environment.yml) (robostack-based ROS2 Humble, including `rclpy`, `ffmpeg_image_transport_msgs`, `av`, etc.). Create and activate it with conda/mamba:
 
 ```bash
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
+conda env create -n teleavatar_client -f environment.yml
+conda activate teleavatar_client
 ```
 
-**Note:** If you just want to fine-tune on LIBERO, you can skip this step, because our LIBERO fine-tuning configs point to a pre-converted LIBERO dataset. This step is merely an example that you can adapt to your own data.
-
-### 2. Defining training configs and running training
-
-To fine-tune a base model on your own data, you need to define configs for data processing and training. We provide example configs with detailed comments for LIBERO below, which you can modify for your own dataset:
-
-- [`LiberoInputs` and `LiberoOutputs`](src/openpi/policies/libero_policy.py): Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
-- [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
-- [`TrainConfig`](src/openpi/training/config.py): Defines fine-tuning hyperparameters, data config, and weight loader.
-
-We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
-
-Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
+The client scripts depend on this repository's `openpi-client` subpackage; install it inside the same environment:
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_libero
+pip install -e packages/openpi-client
 ```
 
-Now we can kick off training with the following command (the `--overwrite` flag is used to overwrite existing checkpoints if you rerun fine-tuning with the same config):
+The camera decoding dependencies (PyAV for V1, GStreamer/PyGObject for V2) are already installed via `environment.yml`. Self-check instructions and the extra install commands for environments created from an older `environment.yml` are in the "Client Dependencies" section of each generation's README.
 
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
-```
+## 🚀 Fine-Tuning
 
-The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
+### 1. Download the Base Model
 
-**Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
+Place `pi0_base` (or `pi05_base`) under `~/.cache/openpi/openpi-assets/checkpoints/` ahead of time. Alternatively, the `weight_loader` can pull it directly from `gs://openpi-assets/...` at training time.
 
-### 3. Spinning up a policy server and running inference
+### 2. Convert Teleoperation Data to a LeRobot Dataset
 
-Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
+Each generation has its own conversion toolkit for turning rosbags into LeRobot datasets:
 
-```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
-```
+- **TeleAvatar V1**: [rosbag_to_dataset_TA1](https://github.com/dexteleop/rosbag_to_dataset_TA1)
+- **TeleAvatar V2**: [rosbag_to_dataset_TA2](https://github.com/dexteleop/rosbag_to_dataset_TA2)
 
-This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
+The converted dataset must follow the state layout and `action` sequence conventions described in [Data Format (Shared)](#-data-format-shared). Camera keys and resolutions are generation-specific — see the per-generation READMEs.
 
-For running the LIBERO eval in particular, we provide (and recommend using) a Dockerized workflow that handles both the policy server and the evaluation script together. See the [LIBERO README](examples/libero/README.md) for more details.
+### 3. Choose and Configure a Training Config
 
-If you want to embed a policy server call in your own robot runtime, we have a minimal example of how to do so in the [remote inference docs](docs/remote_inference.md).
+[`src/openpi/training/config.py`](src/openpi/training/config.py) pre-defines 3 training configs per generation; choose based on your VRAM and needs:
 
+| Config (V1 / V2)                   | Base model | Fine-tuning | batch_size | Notes                              |
+| ---------------------------------- | ---------- | ----------- | ---------- | ---------------------------------- |
+| `pi0_teleavatar_v1` / `pi0_teleavatar_v2`   | π₀        | Full        | 64         | Default choice                     |
+| `pi05_teleavatar_v1` / `pi05_teleavatar_v2` | π₀.₅      | Full        | 64         | Cosine LR schedule + EMA           |
+| `pi0_teleavatar_v1_low_mem_finetune` / `pi0_teleavatar_v2_low_mem_finetune` | π₀ | LoRA | 16 | Low VRAM: frozen backbone, EMA off |
 
+Edit the corresponding `TrainConfig` to adjust training parameters. **The one field you MUST edit is `repo_id`** — point it at your converted LeRobot dataset; everything else has working defaults.
 
-### More Examples
-
-We provide more examples for how to fine-tune and run inference with our models on the ALOHA platform in the following READMEs:
-- [ALOHA Simulator](examples/aloha_sim)
-- [ALOHA Real](examples/aloha_real)
-- [UR5](examples/ur5)
-
-## PyTorch Support
-
-openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
-
-- The π₀-FAST model
-- Mixed precision training
-- FSDP (fully-sharded data parallelism) training
-- LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
-
-### Setup
-1. Make sure that you have the latest version of all dependencies installed: `uv sync`
-
-2. Double check that you have transformers 4.53.2 installed: `uv pip show transformers`
-
-3. Apply the transformers library patches:
-   ```bash
-   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-   ```
-
-This overwrites several files in the transformers library with necessary model changes: 1) supporting AdaRMS, 2) correctly controlling the precision of activations, and 3) allowing the KV cache to be used without being updated.
-
-**WARNING**: With the default uv link mode (hardlink), this will permanently affect the transformers library in your uv cache, meaning the changes will survive reinstallations of transformers and could even propagate to other projects that use transformers. To fully undo this operation, you must run `uv cache clean transformers`.
-
-### Converting JAX Models to PyTorch
-
-To convert a JAX model checkpoint to PyTorch format:
-
-```bash
-uv run examples/convert_jax_model_to_pytorch.py \
-    --checkpoint_dir /path/to/jax/checkpoint \
-    --config_name <config name> \
-    --output_path /path/to/converted/pytorch/checkpoint
-```
-
-### Running Inference with PyTorch
-
-The PyTorch implementation uses the same API as the JAX version - you only need to change the checkpoint path to point to the converted PyTorch model:
+**TeleAvatar V1 example** (`pi0_teleavatar_v1`):
 
 ```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = "/path/to/converted/pytorch/checkpoint"
-
-# Create a trained policy (automatically detects PyTorch format)
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference (same API as JAX)
-action_chunk = policy.infer(example)["actions"]
+TrainConfig(
+    name="pi0_teleavatar_v1",
+    model=pi0_config.Pi0Config(
+        action_dim=32,      # keep 32 to match the pi0_base pretrained weights
+        action_horizon=30,  # predict 30 action steps per inference
+    ),
+    data=LeRobotTeleavatarV1DataConfig(
+        repo_id="/data/lerobot/teleavatar_v1_pick_place",  # REQUIRED: your local dataset path
+        base_config=DataConfig(
+            prompt_from_task=True,   # read language instructions from the LeRobot task
+            action_sequence_keys=("action",),
+        ),
+        use_delta_joint_actions=False,  # absolute joint positions (not deltas)
+        rotate_head_camera=True,        # V1 head camera is mounted upside-down
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader(
+        "gs://openpi-assets/checkpoints/pi0_base/params"
+    ),
+    batch_size=64,
+    num_train_steps=20_000,
+),
 ```
 
-### Policy Server with PyTorch
+**TeleAvatar V2 example** (`pi0_teleavatar_v2`):
 
-The policy server works identically with PyTorch models - just point to the converted checkpoint directory:
+```python
+TrainConfig(
+    name="pi0_teleavatar_v2",
+    model=pi0_config.Pi0Config(
+        action_dim=32,      # keep 32 to match the pi0_base pretrained weights
+        action_horizon=30,  # predict 30 action steps per inference
+    ),
+    data=LeRobotTeleavatarV2DataConfig(
+        repo_id="/data/lerobot/teleavatar_v2_pick_place",  # REQUIRED: your local dataset path
+        base_config=DataConfig(
+            prompt_from_task=True,   # read language instructions from the LeRobot task
+            action_sequence_keys=("action",),
+        ),
+        use_delta_joint_actions=False,  # absolute joint positions (not deltas)
+        rotate_head_camera=False,       # V2 head camera is mounted right-side-up
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader(
+        "gs://openpi-assets/checkpoints/pi0_base/params"
+    ),
+    batch_size=64,
+    num_train_steps=20_000,
+),
+```
+
+**Key fields**:
+
+- `repo_id`: Path to your local LeRobot dataset. **This is the required change.**
+- `prompt_from_task`: When `True`, the language instruction is injected from the dataset's `meta.tasks` by `task_index`; when `False`, every sample uses a fixed placeholder instruction and the language channel is effectively disabled.
+- `rotate_head_camera`: Whether to rotate the head camera 180° before the left-eye crop; must match the camera orientation at data-collection time (V1 upside-down → `True`, V2 right-side-up → `False`; both are the defaults of the corresponding data config class).
+- `use_delta_joint_actions`: Whether to use delta actions for joint positions (grippers always stay absolute). Default `False`.
+
+Checkpoint location and training behavior can be further controlled via `checkpoint_base_dir`, `overwrite`, `resume`, `wandb_enabled`, etc.
+
+### 4. Compute Normalization Statistics
+
+Before launching training, compute the normalization statistics of the training data. Run the script with the config name you just configured:
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_droid \
-    --policy.dir=/path/to/converted/pytorch/checkpoint
+uv run scripts/compute_norm_stats.py --config-name pi0_teleavatar_v2
 ```
 
-### Finetuning with PyTorch
+Where `norm_stats.json` is written depends on how `repo_id` is set:
 
-To finetune a model in PyTorch:
+- **`repo_id` is an absolute dataset path** (the recommended usage in this repository): stats are written into the **dataset directory itself** (`<dataset>/norm_stats.json`), next to the data; training reads them from there at startup.
+- **`repo_id` is a bare name** (used together with `HF_LEROBOT_HOME`): stats are written to `./assets/<config_name>/<repo_id>/`, relative to **the working directory the command was run from** — training must be launched from the same directory to find them.
 
-1. Convert the JAX base model to PyTorch format:
-   ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
-       --config_name <config name> \
-       --checkpoint_dir /path/to/jax/base/model \
-       --output_path /path/to/pytorch/base/model
-   ```
+Either way, when training saves a checkpoint it copies the norm stats into the checkpoint's `<step>/assets/<dataset_name>/norm_stats.json`; inference reads them from inside the checkpoint, so a checkpoint copied to another machine works as-is. If the training startup log shows `Norm stats not found in ..., skipping.`, the stats were not found and training **silently continues without normalization** — make sure the log shows `Loaded norm stats from ...` before proceeding.
 
-2. Specify the converted PyTorch model path in your config using `pytorch_weight_path`
+### 5. Launch Training
 
-3. Launch training using one of these modes:
+Start training with the following command (for V1, substitute the corresponding `*_v1` config name):
 
 ```bash
-# Single GPU training:
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
-
-# Example:
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
-
-# Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
-
-# Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
-
-# Multi-Node Training:
-uv run torchrun \
-    --nnodes=<num_nodes> \
-    --nproc_per_node=<gpus_per_node> \
-    --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> \
-    --master_port=<port> \
-    scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_teleavatar_v2 --exp-name=my_experiment
 ```
 
-### Precision Settings
+- `--exp-name`: Experiment name, used to distinguish checkpoint save paths across different runs. With the command above, weights are saved under `<checkpoint_base_dir>/pi0_teleavatar_v2/my_experiment/<step>`.
+- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`: Lets JAX use up to 90% of GPU memory (default 75%) to maximize VRAM utilization.
 
-JAX and PyTorch implementations handle precision as follows:
+Training can be monitored on the Weights & Biases dashboard (requires `wandb_enabled=True`).
 
-**JAX:**
-1. Inference: most weights and computations in bfloat16, with a few computations in float32 for stability
-2. Training: defaults to mixed precision: weights and gradients in float32, (most) activations and computations in bfloat16. You can change to full float32 training by setting `dtype` to float32 in the config.
+## 🎮 Real-Robot Deployment
 
-**PyTorch:**
-1. Inference: matches JAX -- most weights and computations in bfloat16, with a few weights converted to float32 for stability
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. Mixed precision is not yet supported.
+Deployment uses a **policy server + robot client** architecture: the policy server (uv environment) loads the checkpoint and serves inference over WebSocket; the robot side (conda + ROS2 environment) collects observations, requests actions from the server, and issues commands. The camera pipelines and arm control differ between the two generations — **see each generation's README for the concrete deployment steps, topic list, and troubleshooting**:
 
-With torch.compile, inference speed is comparable between JAX and PyTorch.
+- **TeleAvatar V1**: [examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
+- **TeleAvatar V2**: [examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
 
-## Troubleshooting
+> General caveat: at serve time, `--policy.config` must match the training config of the checkpoint — the two generations differ in image cropping and gripper conversion, and using the wrong generation fails silently.
 
-We will collect common issues and their solutions here. If you encounter an issue, please check here first. If you can't find a solution, please file an issue on the repo (see [here](CONTRIBUTING.md) for guidelines).
+## 📊 Data Format (Shared)
 
-| Issue                                     | Resolution                                                                                                                                                                                   |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
-| Training runs out of GPU memory           | Make sure you set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (or higher) before running training to allow JAX to use more GPU memory. You can also use `--fsdp-devices <n>` where `<n>` is your number of GPUs, to enable [fully-sharded data parallelism](https://engineering.fb.com/2021/07/15/open-source/fsdp/), which reduces memory usage in exchange for slower training (the amount of slowdown depends on your particular setup). If you are still running out of memory, you may way to consider disabling EMA.        |
-| Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
-| Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
-| Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |
-| CUDA/GPU errors                           | Verify NVIDIA drivers are installed correctly. For Docker, ensure nvidia-container-toolkit is installed. Check GPU compatibility. You do NOT need CUDA libraries installed at a system level --- they will be installed via uv. You may even want to try *uninstalling* system CUDA libraries if you run into CUDA issues, since system libraries can sometimes cause conflicts. |
-| Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
-| Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
-| Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+The conventions below apply to both generations; camera formats and gripper curves differ per generation, see the per-generation READMEs. The implementations live in [`teleavatar_v1_policy.py`](src/openpi/policies/teleavatar_v1_policy.py) and [`teleavatar_v2_policy.py`](src/openpi/policies/teleavatar_v2_policy.py).
+
+### State (`observation/state`)
+
+The proprioceptive state stored in the dataset uses a 48-dim base layout of `[positions (16), velocities (16), efforts (16)]` (identical across both generations); arbitrary extra fields (e.g. end-effector poses, chassis motors) may be appended after it. The model reads fixed indices only, so appended fields are ignored automatically. Each 16-dim block shares the same internal layout:
+
+```
+[left arm joints 1-7, left gripper, right arm joints 1-7, right gripper]
+```
+
+The model actually uses only the **14 joint-position dims**: left arm positions (7) + right arm positions (7), whose indices are identical in all layouts.
+
+### Action (16-dim)
+
+The `action` sequence in the dataset shares the state layout; 16 dims are extracted at training time. The model outputs 16-dim actions:
+
+```
+[left arm joint positions (7), left gripper effort (1), right arm joint positions (7), right gripper effort (1)]
+```
+
+Grippers are **force-controlled**: the platform accepts a trigger value in `[0, 1]` and maps it to an effort (Nm) through a curve that **differs between the two generations** (see the per-generation READMEs). At training time, `TeleavatarInputs` applies the inverse of the corresponding curve to convert the dataset's gripper efforts to trigger values; at inference, `TeleavatarOutputs` converts the model output back to efforts, which `ros2_interface` finally converts to trigger values for publishing. **Note**: this conversion happens before dataset norm-stats normalization — if you change this logic, you must re-run `scripts/compute_norm_stats.py`.
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 — see [LICENSE](LICENSE).
+
+## 🙏 Acknowledgments
+
+Built on [openpi](https://github.com/Physical-Intelligence/openpi) by Physical Intelligence (Apache 2.0).

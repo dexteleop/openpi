@@ -8,7 +8,6 @@ to the config assets directory.
 import numpy as np
 import tqdm
 import tyro
-import multiprocessing as mp
 
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
@@ -22,48 +21,72 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
-class RemoveImages(transforms.DataTransformFn):
-    """Remove image and image_mask keys since they don't need norm stats."""
-    def __call__(self, x: dict) -> dict:
-        return {k: v for k, v in x.items() if k not in ("image", "image_mask")}
+class SkipVideoDataset:
+    """Wraps a raw LeRobotDataset to skip expensive video decoding.
 
-
-class TracedTransform:
-    """Wrapper to trace and print the data flow through a transform (only once).
-
-    Uses multiprocessing.Value so that across all worker processes spawned
-    by the DataLoader, each transform prints at most once. The shared flag
-    survives pickle serialization because multiprocessing.Value implements
-    __reduce__ to reconstruct a handle to the same shared-memory block in
-    child processes created via the "spawn" start method.
+    Replaces video frame tensors with dummy data,
+    since compute_norm_stats only needs state and actions.
+    Must wrap the LeRobotDataset *before* TransformedDataset.
     """
 
-    def __init__(self, obj):
-        self.obj = obj
-        self.name = getattr(obj, "__name__", obj.__class__.__name__)
-        self._printed = mp.get_context("spawn").Value("b", False)
+    def __init__(self, dataset):
+        self._dataset = dataset
+        self._video_keys = set(dataset.meta.video_keys)
 
-    def __call__(self, x: dict) -> dict:
-        print_once = False
-        with self._printed.get_lock():
-            if not self._printed.value:
-                self._printed.value = True
-                print_once = True
+    def __getitem__(self, index):
+        # Access the underlying hf_dataset row directly (no video decode)
+        item = self._dataset.hf_dataset[index]
+        ep_idx = item["episode_index"].item()
 
-        if print_once:
-            print(f"\n[Run Transform] -> {self.name}")
-            in_keys = set(x.keys())
-            print(f"   -> Input Keys  : {list(in_keys)}")
-        result = self.obj(x)
-        if print_once:
-            out_keys = set(result.keys())
-            print(f"   <- Output Keys : {list(out_keys)}")
+        # Handle delta_timestamps (action sequences) without video
+        if self._dataset.delta_indices is not None:
+            query_indices, padding = self._dataset._get_query_indices(index, ep_idx)
+            query_result = self._dataset._query_hf_dataset(query_indices)
+            item = {**item, **padding}
+            for key, val in query_result.items():
+                item[key] = val
 
-        return result
+        # Insert dummy image tensors for video keys
+        for vid_key in self._video_keys:
+            item[vid_key] = np.zeros((3, 224, 224), dtype=np.float32)
+
+        # Add task string
+        task_idx = item["task_index"].item()
+        item["task"] = self._dataset.meta.tasks[task_idx]
+
+        return item
+
+    def __len__(self):
+        return len(self._dataset)
 
 
-def trace_transform(transform_obj):
-    return TracedTransform(transform_obj)
+def _create_torch_dataset_skip_video(
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+) -> _data_loader.Dataset:
+    """Same as create_torch_dataset but wraps LeRobotDataset with SkipVideoDataset before transforms."""
+    from lerobot.common.datasets import lerobot_dataset
+
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set.")
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset = lerobot_dataset.LeRobotDataset(
+        repo_id,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)]
+            for key in data_config.action_sequence_keys
+        },
+    )
+    # Wrap *before* TransformedDataset so we have access to raw LeRobotDataset internals
+    print("Skipping video decoding (using dummy images) for faster norm stats computation.")
+    dataset = SkipVideoDataset(dataset)
+
+    if data_config.prompt_from_task:
+        from openpi import transforms as _transforms
+        dataset = _data_loader.TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    return dataset
 
 
 def create_torch_dataloader(
@@ -73,23 +96,22 @@ def create_torch_dataloader(
     model_config: _model.BaseModelConfig,
     num_workers: int,
     max_frames: int | None = None,
+    skip_video: bool = False,
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
-    
-    raw_transforms = [
-        *data_config.repack_transforms.inputs,
-        *data_config.data_transforms.inputs,
-        # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-        RemoveStrings(),
-        RemoveImages(),
-    ]
-    traced_transforms = [trace_transform(t) for t in raw_transforms]
-    
+    if skip_video:
+        dataset = _create_torch_dataset_skip_video(data_config, action_horizon, model_config)
+    else:
+        dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
     dataset = _data_loader.TransformedDataset(
         dataset,
-        traced_transforms,
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+            RemoveStrings(),
+        ],
     )
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
@@ -114,27 +136,21 @@ def create_rlds_dataloader(
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
     dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
-    
-    raw_transforms = [
-        *data_config.repack_transforms.inputs,
-        *data_config.data_transforms.inputs,
-        # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-        RemoveStrings(),
-    ]
-    traced_transforms = [trace_transform(t) for t in raw_transforms]
-    
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
-        traced_transforms,
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+            RemoveStrings(),
+        ],
         is_batched=True,
     )
-    
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
     else:
         # NOTE: this length is currently hard-coded for DROID.
         num_batches = len(dataset) // batch_size
-        
     data_loader = _data_loader.RLDSDataLoader(
         dataset,
         num_batches=num_batches,
@@ -142,7 +158,7 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, skip_video: bool = True):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -152,7 +168,8 @@ def main(config_name: str, max_frames: int | None = None):
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames,
+            skip_video=skip_video,
         )
 
     keys = ["state", "actions"]
@@ -160,13 +177,11 @@ def main(config_name: str, max_frames: int | None = None):
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
-            val = np.asarray(batch[key])
-            stats[key].update(val)
+            stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
     output_path = config.assets_dirs / data_config.repo_id
-    output_path.mkdir(parents=True, exist_ok=True)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

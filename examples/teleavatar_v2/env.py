@@ -12,7 +12,7 @@ from openpi_client import image_tools
 from openpi_client.runtime import environment as _environment
 from typing_extensions import override
 
-from examples.teleavatar import ros2_interface
+from examples.teleavatar_v2 import ros2_interface
 
 
 class TeleavatarEnvironment(_environment.Environment):
@@ -21,16 +21,28 @@ class TeleavatarEnvironment(_environment.Environment):
     def __init__(
         self,
         prompt: str = "pick a toy and put it in the basket using left gripper",
+        control_frequency: float = 30.0,
+        interp_frequency: float = 200.0,
+        interpolate: bool = True,
     ):
         """Initialize Teleavatar environment.
 
         Args:
             prompt: Default language instruction for the policy
+            control_frequency: Rate (Hz) apply_action is called; sets the interp ramp duration.
+            interp_frequency: Rate (Hz) the interface republishes interpolated des_q (~200 Hz).
+            interpolate: Enable des_q interpolation (False = raw ZOH publish).
 
-        Note: Images are NOT resized here - they are kept at original resolution
-        to match training data format (480×848 for stereo, 1080×1920 for head).
+        Note: Images are NOT resized here. All three views arrive from the
+        RTP/H265 composite stream (rtp_video_interface) already split to single
+        eyes (head 960×960, wrists 400×640; see
+        ros2_interface._POLICY_TO_RTP_VIEW), matching the crops applied to
+        the training videos.
         """
         self._prompt = prompt
+        self._control_frequency = control_frequency
+        self._interp_frequency = interp_frequency
+        self._interpolate = interpolate
 
         # Initialize ROS2 interface in a separate thread
         self._ros_interface: Optional[ros2_interface.TeleavatarROS2Interface] = None
@@ -40,7 +52,12 @@ class TeleavatarEnvironment(_environment.Environment):
         logging.info(f"TeleavatarEnvironment initialized with prompt: '{prompt}'")
 
     def _init_ros2(self):
-        """Initialize ROS2 in a background thread and wait for initial sensor data."""
+        """Initialize ROS2 in a background thread and wait for initial sensor data.
+
+        The executor runs in a daemon thread for the lifetime of the process;
+        there is no teardown, so only one environment per process is supported
+        (rclpy.init() cannot be called twice).
+        """
         import rclpy
         import time
 
@@ -49,7 +66,11 @@ class TeleavatarEnvironment(_environment.Environment):
 
         def ros_spin():
             rclpy.init()
-            self._ros_interface = ros2_interface.TeleavatarROS2Interface()
+            self._ros_interface = ros2_interface.TeleavatarROS2Interface(
+                control_frequency=self._control_frequency,
+                interp_frequency=self._interp_frequency,
+                interpolate=self._interpolate,
+            )
 
             # Spin in background
             executor = rclpy.executors.MultiThreadedExecutor()
@@ -89,9 +110,11 @@ class TeleavatarEnvironment(_environment.Environment):
         if not self._ros_interface.wait_for_initial_data(timeout=30.0):
             raise RuntimeError(
                 "Failed to receive initial sensor data. "
-                "Please check that ROS2 topics are publishing:\n"
+                "Please check that the RTP video stream and ROS2 joint topics are up:\n"
+                "  - S100 is pushing the RTP/H265 stream to this machine (default port 8890, payload 96)\n"
+                "  - GStreamer H265 decode works (gst-inspect-1.0 nvh265dec)\n"
+                "  - ROS_DOMAIN_ID matches the robot (export ROS_DOMAIN_ID=29) in this shell\n"
                 "  ros2 topic list\n"
-                "  ros2 topic hz /left/color/image_raw\n"
                 "  ros2 topic echo /left_arm/joint_states --once"
             )
 
@@ -125,10 +148,13 @@ class TeleavatarEnvironment(_environment.Environment):
                 - 'images': Dict of camera images in (H, W, C) format at ORIGINAL resolution
                 - 'prompt': Language instruction
 
-        Note: Images are kept at original resolution to match training data:
-            - left_color, right_color: 480×848×3 (H,W,C)
-            - head_camera: 1080×1920×3 (H,W,C)
-        The policy's _parse_image will handle any format conversion if needed.
+        Note: Image formats match the (cropped) training data:
+            - left_color: RTP split `left_wrist_right_eye`, 400×640×3 (H,W,C)
+            - right_color: RTP split `right_wrist_left_eye`, 400×640×3 (H,W,C)
+            - head_camera: RTP split `head_left_eye`, 960×960×3 (H,W,C)
+        All views are split from the RTP composite frame by the
+        RTP video interface; the policy's _parse_image will handle any
+        remaining format conversion if needed.
         """
         if self._ros_interface is None:
             raise RuntimeError("ROS2 interface not initialized")
@@ -136,11 +162,14 @@ class TeleavatarEnvironment(_environment.Environment):
         # Get raw observation from ROS2
         raw_obs = self._ros_interface.get_observation()
         if raw_obs is None:
-            raise RuntimeError("Failed to get observation from ROS2 interface")
+            raise RuntimeError(
+                "Observation unavailable (sensor data missing or stale — see the "
+                "interface log above). Stopping instead of acting on frozen sensors."
+            )
 
         # Process images: keep original resolution AND keep (H, W, C) format
         # Policy's _parse_image will handle format conversion if needed
-        # Return with the exact keys expected by teleavatar_policy.py
+        # Return with the exact keys expected by teleavatar_v2_policy.py
         return {
             'observation/state': raw_obs['state'],
             'observation/images/left_color': image_tools.convert_to_uint8(raw_obs['images']['left_color']),
@@ -181,8 +210,3 @@ class TeleavatarEnvironment(_environment.Environment):
         """
         self._prompt = prompt
         logging.info(f"Updated prompt to: '{prompt}'")
-
-    def __del__(self):
-        """Cleanup when environment is destroyed."""
-        if self._ros_thread is not None and self._ros_thread.is_alive():
-            logging.info("Shutting down ROS2 thread...")

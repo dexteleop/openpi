@@ -20,8 +20,8 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
-import openpi.policies.teleavatar_policy as teleavatar_policy
-import openpi.policies.teleavatar_policy_endeffector as teleavatar_policy_endeffector
+import openpi.policies.teleavatar_v1_policy as teleavatar_v1_policy
+import openpi.policies.teleavatar_v2_policy as teleavatar_v2_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -185,12 +185,26 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        asset_id = self.assets.asset_id or repo_id
+        # An absolute-path repo_id (local dataset) must not be used as the
+        # asset_id: every `... / asset_id` join would resolve to the dataset
+        # directory (absolute paths win in path joins), so checkpoints's
+        # assets/ would silently stay empty and serving would only work with
+        # the dataset mounted at the same path. Use the dataset basename
+        # instead, so norm stats really get packaged into the checkpoint.
+        is_local_path = repo_id is not None and pathlib.PurePath(repo_id).is_absolute()
+        asset_id = self.assets.asset_id or (pathlib.PurePath(repo_id).name if is_local_path else repo_id)
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+        if norm_stats is None and is_local_path:
+            # Convention for local datasets: compute_norm_stats.py writes
+            # <dataset>/norm_stats.json (its output path joins the absolute
+            # repo_id). Load from there so the stats live with the data and
+            # get copied into the checkpoint's assets/<basename>/ on save.
+            norm_stats = self._load_norm_stats(epath.Path(repo_id).parent, pathlib.PurePath(repo_id).name)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=norm_stats,
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -363,49 +377,56 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotTeleavatarDataConfig(DataConfigFactory):
+class LeRobotTeleavatarV1DataConfig(DataConfigFactory):
     """
-    Config for training on Teleavatar dual-arm robot dataset.
+    Config for training on the Teleavatar v1 (officially released) dual-arm robot dataset.
 
     This config handles the 48-dimensional state (joint positions, velocities, efforts)
     and 3 camera feeds (left_color, right_color, head_color).
     """
     use_delta_joint_actions: bool = False
+    # Whether the head camera should be rotated 180° before the left-eye crop.
+    # Property of the source dataset orientation; forwarded to TeleavatarInputs.
+    rotate_head_camera: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Repack transform to match dataset keys to inference keys
+        # Repack transform to match dataset keys to inference keys.
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/images/head_camera": "observation.images.head_camera",
+            "observation/state": "observation.state",
+            "action": "action",  # Keep action as action
+        }
+        # When prompt_from_task is on, PromptFromLeRobotTask injects a top-level
+        # "prompt" string from meta.tasks[task_index]. RepackTransform rebuilds
+        # the dict from scratch, so the key has to be listed here or it's lost
+        # and TeleavatarInputs falls back to its hardcoded default for every
+        # sample. Only request the key when it will actually be present;
+        # otherwise the flat_item lookup would KeyError.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/images/left_color": "observation.images.left_color",
-                        "observation/images/right_color": "observation.images.right_color",
-                        "observation/images/head_camera": "observation.images.head_camera",
-                        "observation/state": "observation.state",
-                        "action": "action",  # Keep action as action
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_structure)]
         )
 
-        # Data transforms for teleavatar policy
+        # Delta is handled inside TeleavatarInputs/Outputs (see there for why).
         data_transforms = _transforms.Group(
-            inputs=[teleavatar_policy.TeleavatarInputs(model_type=model_config.model_type)],
-            outputs=[teleavatar_policy.TeleavatarOutputs()],
+            inputs=[
+                teleavatar_v1_policy.TeleavatarInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
+            outputs=[
+                teleavatar_v1_policy.TeleavatarOutputs(
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
         )
-
-        # Apply delta actions if requested (for joint positions/velocities, not gripper efforts)
-        # Actions are 16 dimensions: 7 left arm joints, 1 left gripper, 7 right arm joints, 1 right gripper
-        if self.use_delta_joint_actions:
-            # Apply delta left arm joints (first 7 dims), leave left gripper (8th dim) absolute
-            # Apply delta right arm joints (dims 9-15), leave right gripper (16th dim) absolute
-            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
 
         # Model transforms
         model_transforms = ModelTransformFactory()(model_config)
@@ -416,53 +437,62 @@ class LeRobotTeleavatarDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
-
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotTeleavatarEndEffectorDataConfig(DataConfigFactory):
+class LeRobotTeleavatarV2DataConfig(DataConfigFactory):
     """
-    Config for training on Teleavatar dual-arm robot dataset using end-effector representation.
+    Config for training on the Teleavatar v2 dual-arm robot dataset.
 
-    This config handles the extended state with end-effector poses (position + quaternion)
-    and 3 camera feeds (left_color, right_color, head_camera).
-    
-    State format: [left_ee_pose(7), left_gripper_effort(1), right_ee_pose(7), right_gripper_effort(1)]
+    Handles the v2 proprioceptive state (62-dim: positions, velocities,
+    efforts + EE poses; 72-dim datasets append chassis dims — the indices
+    used are identical) and 3 side-by-side stereo camera feeds:
+    TeleavatarInputs crops one eye per camera (head → left eye,
+    left → right eye, right → left eye). For the v1 (officially released)
+    robot use LeRobotTeleavatarV1DataConfig instead.
     """
-    use_delta_ee_actions: bool = False
+    use_delta_joint_actions: bool = False
+    # Whether the head camera should be rotated 180° before the left-eye crop.
+    # Property of the source dataset orientation; forwarded to TeleavatarInputs.
+    rotate_head_camera: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Repack transform to match dataset keys to inference keys
+        # Repack transform to match dataset keys to inference keys.
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/images/head_camera": "observation.images.head_camera",
+            "observation/state": "observation.state",
+            "action": "action",  # Keep action as action
+        }
+        # When prompt_from_task is on, PromptFromLeRobotTask injects a top-level
+        # "prompt" string from meta.tasks[task_index]. RepackTransform rebuilds
+        # the dict from scratch, so the key has to be listed here or it's lost
+        # and TeleavatarInputs falls back to its hardcoded default for every
+        # sample. Only request the key when it will actually be present;
+        # otherwise the flat_item lookup would KeyError.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/images/left_color": "observation.images.left_color",
-                        "observation/images/right_color": "observation.images.right_color",
-                        "observation/images/head_camera": "observation.images.head_camera",
-                        "observation/state": "observation.state",
-                        "action": "action",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_structure)]
         )
 
-        # Data transforms for teleavatar end-effector policy
+        # Delta is handled inside TeleavatarInputs/Outputs (see there for why).
         data_transforms = _transforms.Group(
-            inputs=[teleavatar_policy_endeffector.TeleavatarEndEffectorInputs(model_type=model_config.model_type)],
-            outputs=[teleavatar_policy_endeffector.TeleavatarEndEffectorOutputs()],
+            inputs=[
+                teleavatar_v2_policy.TeleavatarInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
+            outputs=[
+                teleavatar_v2_policy.TeleavatarOutputs(
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
         )
-
-        # Apply delta actions if requested (for end-effector pose, not gripper efforts)
-        # Inputs are 16 dimensions: 7 left ee pose, 1 left gripper, 7 right ee pose, 1 right gripper
-        if self.use_delta_ee_actions:
-            # Apply delta to left ee pose (first 7 dims), leave left gripper (8th dim) absolute
-            # Apply delta to right ee pose (dims 9-15), leave right gripper (16th dim) absolute
-            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
 
         # Model transforms
         model_transforms = ModelTransformFactory()(model_config)
@@ -473,7 +503,6 @@ class LeRobotTeleavatarEndEffectorDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
-
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -899,23 +928,26 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
-    # Fine-tuning Teleavatar configs.
+    # Fine-tuning Teleavatar v1 configs.
     #
     TrainConfig(
-        name="pi05_teleavatar",
+        name="pi05_teleavatar_v1",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=30,
-            discrete_state_input=False,
-            action_dim=32  # Teleavatar uses 16-dim actions
+            discrete_state_input=True,
+            action_dim=32  # Keep 32 to match the pretrained weights; teleavatar uses the first 16 dims
         ),
-        data=LeRobotTeleavatarDataConfig(
-            repo_id="inference",  # Your local dataset name
+        data=LeRobotTeleavatarV1DataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=True,  # No prompts in teleavatar dataset
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,
+            # Official robot head camera is mounted upside-down; the recorded
+            # frames are raw upside-down stereo in both training and inference.
+            rotate_head_camera=True,
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -930,20 +962,23 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     TrainConfig(
-        name="pi0_teleavatar",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        name="pi0_teleavatar_v1",
+        # Full fine-tune of pi0 on Teleavatar V1 data.
         model=pi0_config.Pi0Config(
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=50
+            action_horizon=30
         ),
         checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
-        data=LeRobotTeleavatarDataConfig(
+        data=LeRobotTeleavatarV1DataConfig(
             repo_id="/DATA/disk0/haoran/lerobot_insert_flower",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=True,  #
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_joint_actions=False,  # Use end-effector representation
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
+            # Official robot head camera is mounted upside-down; the recorded
+            # frames are raw upside-down stereo in both training and inference.
+            rotate_head_camera=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         # weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
@@ -953,42 +988,118 @@ _CONFIGS = [
         
     ),
     TrainConfig(
-        name="pi0_teleavatar_endeffector",
+        name="pi0_teleavatar_v1_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=10
+            action_horizon=30
         ),
-        data=LeRobotTeleavatarEndEffectorDataConfig(
-            repo_id="inference",  # Your local dataset name
+        data=LeRobotTeleavatarV1DataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=True,  # No prompts in teleavatar dataset
+                prompt_from_task=False,  # Use a fixed placeholder prompt (language channel disabled)
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_ee_actions=False,  # Use end-effector representation
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
+            # Official robot head camera is mounted upside-down; the recorded
+            # frames are raw upside-down stereo in both training and inference.
+            rotate_head_camera=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         batch_size=16,
+        num_train_steps=20000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_config.Pi0Config(
+            action_dim=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+    #
+    # Fine-tuning Teleavatar v2 configs.
+    #
+    TrainConfig(
+        name="pi05_teleavatar_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            action_dim=32  # Keep 32 to match the pretrained weights; teleavatar uses the first 16 dims
+        ),
+        data=LeRobotTeleavatarV2DataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
+            base_config=DataConfig(
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
+                action_sequence_keys=("action",)  # Use 'action' not 'actions'
+            ),
+            use_delta_joint_actions=False,
+            # v2 robot: head camera is right-side-up, so no 180° rotation
+            # before the left-eye crop. Set True only for v1 datasets, whose
+            # head camera was mounted upside-down.
+            rotate_head_camera=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi0_teleavatar_v2",
+        # Full fine-tune of pi0 on Teleavatar V2 data.
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
+            action_horizon=30
+        ),
+        data=LeRobotTeleavatarV2DataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
+            base_config=DataConfig(
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
+                action_sequence_keys=("action",)  # Use 'action' not 'actions'
+            ),
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
+            # v2 robot: head camera is right-side-up, so no 180° rotation
+            # before the left-eye crop. Set True only for v1 datasets, whose
+            # head camera was mounted upside-down.
+            rotate_head_camera=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=64,
         num_train_steps=20000,
 
         
     ),
     TrainConfig(
-        name="pi0_teleavatar_low_mem_finetune",
+        name="pi0_teleavatar_v2_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=10
+            action_horizon=30
         ),
-        data=LeRobotTeleavatarDataConfig(
-            repo_id="lerobot/right_dataset",  # Your local dataset name
+        data=LeRobotTeleavatarV2DataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
-                prompt_from_task=False,  # No prompts in teleavatar dataset
+                prompt_from_task=False,  # Use a fixed placeholder prompt (language channel disabled)
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_joint_actions=False,  # Use end-effector representation
+            use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
+            # v2 robot: head camera is right-side-up, so no 180° rotation
+            # before the left-eye crop. Set True only for v1 datasets, whose
+            # head camera was mounted upside-down.
+            rotate_head_camera=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         batch_size=16,
@@ -1002,70 +1113,6 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_teleavatar_low_mem_finetune_endeffector",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
-            action_horizon=10
-        ),
-        data=LeRobotTeleavatarEndEffectorDataConfig(
-            repo_id="left_dataset",  # Your local dataset name
-            base_config=DataConfig(
-                prompt_from_task=False,  # No prompts in teleavatar dataset
-                action_sequence_keys=("action",)  # Use 'action' not 'actions'
-            ),
-            use_delta_ee_actions=False,  # Use end-effector representation
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        batch_size=16,
-        num_train_steps=20000,
-        # The freeze filter defines which parameters should be frozen during training.
-        # We have a convenience function in the model config that returns the default freeze filter
-        # for the given model config for LoRA finetuning. Just make sure it matches the model config
-        # you chose above.
-        freeze_filter=pi0_config.Pi0Config(
-            action_dim=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-    ),
-    #
-    # Fine-tuning Aloha configs.
-    #
-    # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
-    TrainConfig(
-        name="pi0_aloha_pen_uncap",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="uncap the pen",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
     ),
     TrainConfig(
         name="pi05_aloha_pen_uncap",

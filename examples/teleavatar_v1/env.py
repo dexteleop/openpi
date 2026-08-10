@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Environment wrapper for Teleavatar robot using end-effector representation.
+Environment wrapper for Teleavatar robot using openpi_client.runtime framework.
 """
 
 import logging
@@ -12,35 +12,41 @@ from openpi_client import image_tools
 from openpi_client.runtime import environment as _environment
 from typing_extensions import override
 
-from examples.teleavatar import ros2_interface_endeffector
+from examples.teleavatar_v1 import ros2_interface
 
 
-class TeleavatarEndEffectorEnvironment(_environment.Environment):
-    """Environment for Teleavatar dual-arm robot with end-effector representation."""
+class TeleavatarEnvironment(_environment.Environment):
+    """Environment for Teleavatar dual-arm robot."""
 
     def __init__(
         self,
         prompt: str = "pick a toy and put it in the basket using left gripper",
     ):
-        """Initialize Teleavatar end-effector environment.
+        """Initialize Teleavatar environment.
 
         Args:
             prompt: Default language instruction for the policy
 
-        Note: Images are NOT resized here - they are kept at original resolution
-        to match training data format (480×848 for stereo, 1080×1920 for head).
+        Note: Images are NOT resized here. Stereo cameras stay at 480×848; the
+        head camera arrives already cropped to the left eye and rotated 180°
+        from the ROS2 PyAV decode (224×224), matching the training head view.
         """
         self._prompt = prompt
 
         # Initialize ROS2 interface in a separate thread
-        self._ros_interface: Optional[ros2_interface_endeffector.TeleavatarEndEffectorROS2Interface] = None
+        self._ros_interface: Optional[ros2_interface.TeleavatarROS2Interface] = None
         self._ros_thread: Optional[threading.Thread] = None
         self._init_ros2()
 
-        logging.info(f"TeleavatarEndEffectorEnvironment initialized with prompt: '{prompt}'")
+        logging.info(f"TeleavatarEnvironment initialized with prompt: '{prompt}'")
 
     def _init_ros2(self):
-        """Initialize ROS2 in a background thread and wait for initial sensor data."""
+        """Initialize ROS2 in a background thread and wait for initial sensor data.
+
+        The executor runs in a daemon thread for the lifetime of the process;
+        there is no teardown, so only one environment per process is supported
+        (rclpy.init() cannot be called twice).
+        """
         import rclpy
         import time
 
@@ -49,7 +55,7 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
 
         def ros_spin():
             rclpy.init()
-            self._ros_interface = ros2_interface_endeffector.TeleavatarEndEffectorROS2Interface()
+            self._ros_interface = ros2_interface.TeleavatarROS2Interface()
 
             # Spin in background
             executor = rclpy.executors.MultiThreadedExecutor()
@@ -83,7 +89,7 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
         if not spin_started.wait(timeout=5.0):
             raise RuntimeError("ROS2 executor failed to start spinning")
 
-        logging.info("ROS2 executor started, waiting for initial sensor data (including end-effector poses)...")
+        logging.info("ROS2 executor started, waiting for initial sensor data...")
 
         # Now wait for initial sensor data (callbacks can now be triggered)
         if not self._ros_interface.wait_for_initial_data(timeout=30.0):
@@ -91,13 +97,11 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
                 "Failed to receive initial sensor data. "
                 "Please check that ROS2 topics are publishing:\n"
                 "  ros2 topic list\n"
-                "  ros2 topic hz /left/color/image_raw\n"
-                "  ros2 topic echo /left_arm/joint_states --once\n"
-                "  ros2 topic echo /left_arm/ee_pose --once\n"
-                "  ros2 topic echo /right_arm/ee_pose --once"
+                "  ros2 topic hz /left/color/image_raw/ffmpeg\n"
+                "  ros2 topic echo /left_arm/joint_states --once"
             )
 
-        logging.info("ROS2 interface initialized successfully with sensor data (including end-effector poses)")
+        logging.info("ROS2 interface initialized successfully with sensor data")
 
     @override
     def reset(self) -> None:
@@ -123,13 +127,15 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
 
         Returns:
             Dictionary with keys:
-                - 'state': 62-dim proprioceptive state (includes end-effector poses)
+                - 'state': 48-dim proprioceptive state
                 - 'images': Dict of camera images in (H, W, C) format at ORIGINAL resolution
                 - 'prompt': Language instruction
 
-        Note: State is 62-dimensional:
-            [joint_positions(16), joint_velocities(16), joint_efforts(16), 
-             left_ee_pose(7), right_ee_pose(7)]
+        Note: Image formats match the training data:
+            - left_color, right_color: 480×848×3 (H,W,C)
+            - head_camera: 224×224×3 (H,W,C), already left-eye-cropped + rot180
+              by the ROS2 PyAV decode callback.
+        The policy's _parse_image will handle any format conversion if needed.
         """
         if self._ros_interface is None:
             raise RuntimeError("ROS2 interface not initialized")
@@ -137,11 +143,14 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
         # Get raw observation from ROS2
         raw_obs = self._ros_interface.get_observation()
         if raw_obs is None:
-            raise RuntimeError("Failed to get observation from ROS2 interface")
+            raise RuntimeError(
+                "Observation unavailable (sensor data missing or stale — see the "
+                "interface log above). Stopping instead of acting on frozen sensors."
+            )
 
         # Process images: keep original resolution AND keep (H, W, C) format
         # Policy's _parse_image will handle format conversion if needed
-        # Return with the exact keys expected by teleavatar_policy_endeffector.py
+        # Return with the exact keys expected by teleavatar_policy.py
         return {
             'observation/state': raw_obs['state'],
             'observation/images/left_color': image_tools.convert_to_uint8(raw_obs['images']['left_color']),
@@ -156,8 +165,6 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
 
         Args:
             action: Dictionary containing 'actions' key with 16-dim action array
-                    [left_ee_pose(7), left_gripper_effort(1), 
-                     right_ee_pose(7), right_gripper_effort(1)]
         """
         if self._ros_interface is None:
             raise RuntimeError("ROS2 interface not initialized")
@@ -184,9 +191,3 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
         """
         self._prompt = prompt
         logging.info(f"Updated prompt to: '{prompt}'")
-
-    def __del__(self):
-        """Cleanup when environment is destroyed."""
-        if self._ros_thread is not None and self._ros_thread.is_alive():
-            logging.info("Shutting down ROS2 thread...")
-
