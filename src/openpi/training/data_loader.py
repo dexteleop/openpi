@@ -247,6 +247,7 @@ def create_data_loader(
         return create_wds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
+            action_dim=config.model.action_dim,
             batch_size=config.batch_size,
             sharding=sharding,
             shuffle=shuffle,
@@ -353,6 +354,7 @@ def create_wds_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
+    action_dim: int | None = None,
     sharding: jax.sharding.Sharding | None = None,
     shuffle: bool = False,
     num_batches: int | None = None,
@@ -384,6 +386,7 @@ def create_wds_data_loader(
         dataset_dir=data_config.wds_data_dir,
         local_batch_size=local_batch_size,
         action_horizon=action_horizon,
+        action_dim=action_dim,
         sharding=sharding,
         memory_ratio=data_config.wds_memory_ratio,
         shuffle_buffer_size=data_config.wds_shuffle_buffer_size,
@@ -585,7 +588,7 @@ class RLDSDataLoader:
 
 
 class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | WDSDataLoader | RLDSDataLoader):
         self._data_config = data_config
         self._data_loader = data_loader
 
