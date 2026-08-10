@@ -25,7 +25,6 @@ import openpi.policies.teleavatar_policy_endeffector as teleavatar_policy_endeff
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -937,20 +936,20 @@ _CONFIGS = [
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=50
         ),
-        checkpoint_base_dir="/home/zyz/shihaoran/intel_test/openpi/checkpoints",
+        checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
         data=LeRobotTeleavatarDataConfig(
-            repo_id="/home/zyz/shihaoran/intel_test/openpi/data/build_blocks",  # Your local dataset name
+            repo_id="/DATA/disk0/haoran/lerobot_insert_flower",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  #
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,  # Use end-effector representation
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
-        batch_size=2,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
+        batch_size=32,
         num_train_steps=20000,
-
+        wandb_enabled=False,
         
     ),
     TrainConfig(
@@ -1245,26 +1244,22 @@ _CONFIGS = [
         name="pi0_lingyu_wds",
         model=pi0_config.Pi0Config(
             action_dim=32,
-            action_horizon=50,
+            action_horizon=30,
         ),
-        checkpoint_base_dir="/home/zyz/shihaoran/intel_test/openpi/checkpoints",
+        checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
         data=WDSLingyuDataConfig(
             repo_id="lingyu",
-            wds_data_dir="/mnt/data6t/shihaoran_data/test_wds",
+            wds_data_dir="/DATA/disk0/haoran/infra_wds",
             wds_memory_ratio=0.6,
-            wds_shuffle_buffer_size=10000,
+            wds_shuffle_buffer_size=5000,
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
-        num_workers=32,
-        batch_size=2,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
+        num_workers= 32,
+        batch_size = 64,
         num_train_steps=20000,
-        wandb_enabled=False,
+        wandb_enabled=True,
     ),
-    #
-    # RoboArena configs.
-    #
-    *roboarena_config.get_roboarena_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
