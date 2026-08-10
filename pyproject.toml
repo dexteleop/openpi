@@ -61,7 +61,9 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# av 14.3.0/14.4.0 ship no prebuilt wheels; building from source requires ffmpeg 7 headers.
+# Pin to 14.2.0, the newest release with cp311 manylinux wheels.
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "av==14.2.0"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
