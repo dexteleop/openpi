@@ -1,10 +1,48 @@
 import dataclasses
+import typing
 
 import jax
+import torch.utils.data
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+class _FakeLeRobotDatasetMeta:
+    def __init__(self, repo_id: str):
+        self.repo_id = repo_id
+        self.fps = 10
+        self.tasks = {0: "do the thing"}
+
+
+class _FakeLeRobotDataset:
+    """Stand-in for lerobot_dataset.LeRobotDataset, keyed by repo_id, that avoids touching real data."""
+
+    LENGTHS: typing.ClassVar = {"repo_a": 5, "repo_b": 7}
+
+    def __init__(self, repo_id: str, delta_timestamps=None):
+        self._repo_id = repo_id
+
+    def __len__(self) -> int:
+        return self.LENGTHS[self._repo_id]
+
+    def __getitem__(self, index):
+        return {"task_index": 0, "value": index}
+
+
+def test_create_torch_dataset_concatenates_multiple_repo_ids(monkeypatch):
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", _FakeLeRobotDatasetMeta)
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDataset", _FakeLeRobotDataset)
+
+    data_config = _config.DataConfig(repo_id=["repo_a", "repo_b"], action_sequence_keys=("actions",))
+    dataset = _data_loader.create_torch_dataset(data_config, action_horizon=1, model_config=None)
+
+    assert isinstance(dataset, torch.utils.data.ConcatDataset)
+    assert len(dataset) == sum(_FakeLeRobotDataset.LENGTHS.values())
+    assert dataset[0] == {"task_index": 0, "value": 0}
+    # Index 5 falls in the second (repo_b) dataset, at local index 0.
+    assert dataset[5] == {"task_index": 0, "value": 0}
 
 
 def test_torch_data_loader():
