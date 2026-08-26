@@ -116,6 +116,7 @@ class TeleavatarROS2Interface(Node):
         self._ramp_from: Optional[np.ndarray] = None   # (14,) arm des_q at ramp start
         self._ramp_to: Optional[np.ndarray] = None     # (14,) arm des_q target
         self._ramp_t0: Optional[float] = None          # monotonic time at ramp start
+        self._ramp_duration = self._ctrl_period        # seconds to traverse the current ramp
         self._last_cmd_pos: Optional[np.ndarray] = None  # (14,) last published arm des_q
         self._gripper_target = np.zeros(2)             # [left, right] effort (Nm)
         self._have_target = False
@@ -325,9 +326,15 @@ class TeleavatarROS2Interface(Node):
             )
         return clamped
 
-    def publish_action(self, actions: np.ndarray):
+    def publish_action(self, actions: np.ndarray, ramp_duration: Optional[float] = None):
         """Set the latest action as the interpolation target (16-dim:
-        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)])."""
+        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]).
+
+        ramp_duration overrides the default one-control-period ramp. Use a
+        longer one for the first command after a sensor outage: the arm has
+        been frozen at _last_cmd_pos, and traversing a large pose delta in the
+        usual 33 ms would be a jerk.
+        """
         if actions.shape != (16,):
             self.logger.error(f"Expected 16-dim action, got shape {actions.shape}")
             return
@@ -345,6 +352,9 @@ class TeleavatarROS2Interface(Node):
             self._ramp_from = self._last_cmd_pos.copy()
             self._ramp_to = arm14
             self._ramp_t0 = now
+            self._ramp_duration = max(
+                self._ctrl_period if ramp_duration is None else ramp_duration, 1e-3
+            )
             self._gripper_target = grip2
             self._have_target = True
 
@@ -361,12 +371,18 @@ class TeleavatarROS2Interface(Node):
         ]).astype(np.float64)
 
     def _interp_publish(self):
-        """Ramp des_q toward the latest target over one control period; alpha clamps to [0, 1],
-        so a late command holds at the target and an early one resumes from the current pose."""
+        """Ramp des_q toward the latest target over _ramp_duration; alpha clamps to [0, 1],
+        so a late command holds at the target and an early one resumes from the current pose.
+
+        Holding at the target is also what freezes the arm during a sensor
+        outage: the control loop stops calling publish_action, alpha saturates
+        at 1.0, and this timer keeps republishing the last des_q plus the
+        enable heartbeat in _publish_cmd.
+        """
         with self._cmd_lock:
             if not self._have_target:
                 return
-            alpha = (time.monotonic() - self._ramp_t0) / self._ctrl_period
+            alpha = (time.monotonic() - self._ramp_t0) / self._ramp_duration
             alpha = min(max(alpha, 0.0), 1.0)
             pos = self._ramp_from + alpha * (self._ramp_to - self._ramp_from)
             self._last_cmd_pos = pos.copy()

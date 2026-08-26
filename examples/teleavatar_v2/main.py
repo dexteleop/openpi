@@ -110,6 +110,10 @@ def main(args: Args) -> None:
         )
     )
 
+    # Let the environment drop the cached action chunk after a sensor outage,
+    # so it never replays actions computed from pre-outage images.
+    environment.attach_agent(agent)
+
     # Create runtime
     runtime = _runtime.Runtime(
         environment=environment,

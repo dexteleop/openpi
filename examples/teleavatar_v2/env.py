@@ -5,6 +5,7 @@ Environment wrapper for Teleavatar robot using openpi_client.runtime framework.
 
 import logging
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -24,6 +25,8 @@ class TeleavatarEnvironment(_environment.Environment):
         control_frequency: float = 30.0,
         interp_frequency: float = 200.0,
         interpolate: bool = True,
+        recovery_ramp_s: float = 0.75,
+        outage_poll_hz: float = 100.0,
     ):
         """Initialize Teleavatar environment.
 
@@ -32,6 +35,10 @@ class TeleavatarEnvironment(_environment.Environment):
             control_frequency: Rate (Hz) apply_action is called; sets the interp ramp duration.
             interp_frequency: Rate (Hz) the interface republishes interpolated des_q (~200 Hz).
             interpolate: Enable des_q interpolation (False = raw ZOH publish).
+            recovery_ramp_s: Ramp duration for the first command after a sensor
+                outage. The arm has been frozen, so traversing a large pose
+                delta in the usual one control period would be a jerk.
+            outage_poll_hz: Rate to re-check sensors while frozen.
 
         Note: Images are NOT resized here. All three views arrive from the
         RTP/H265 composite stream (rtp_video_interface) already split to single
@@ -43,6 +50,13 @@ class TeleavatarEnvironment(_environment.Environment):
         self._control_frequency = control_frequency
         self._interp_frequency = interp_frequency
         self._interpolate = interpolate
+        self._recovery_ramp_s = recovery_ramp_s
+        self._outage_poll_period = 1.0 / max(outage_poll_hz, 1.0)
+
+        # Set by attach_agent(); used to drop the cached action chunk after an
+        # outage so we never replay actions computed from pre-outage images.
+        self._agent = None
+        self._pending_recovery = False
 
         # Initialize ROS2 interface in a separate thread
         self._ros_interface: Optional[ros2_interface.TeleavatarROS2Interface] = None
@@ -50,6 +64,15 @@ class TeleavatarEnvironment(_environment.Environment):
         self._init_ros2()
 
         logging.info(f"TeleavatarEnvironment initialized with prompt: '{prompt}'")
+
+    def attach_agent(self, agent) -> None:
+        """Register the agent so a sensor outage can invalidate its action chunk.
+
+        ActionChunkBroker caches a whole chunk (16 steps here) and keeps
+        serving it without re-querying the policy. After an outage those
+        actions were computed from stale images, so they must be discarded.
+        """
+        self._agent = agent
 
     def _init_ros2(self):
         """Initialize ROS2 in a background thread and wait for initial sensor data.
@@ -59,7 +82,6 @@ class TeleavatarEnvironment(_environment.Environment):
         (rclpy.init() cannot be called twice).
         """
         import rclpy
-        import time
 
         # Event to signal when executor starts spinning
         spin_started = threading.Event()
@@ -142,6 +164,10 @@ class TeleavatarEnvironment(_environment.Environment):
     def get_observation(self) -> dict:
         """Get current observation from robot sensors.
 
+        Blocks until the sensors are fresh. If any sensor is missing or stale,
+        this freezes the robot at its last commanded pose and waits for
+        recovery rather than raising — see _wait_for_fresh_observation.
+
         Returns:
             Dictionary with keys:
                 - 'state': 48-dim proprioceptive state
@@ -162,10 +188,7 @@ class TeleavatarEnvironment(_environment.Environment):
         # Get raw observation from ROS2
         raw_obs = self._ros_interface.get_observation()
         if raw_obs is None:
-            raise RuntimeError(
-                "Observation unavailable (sensor data missing or stale — see the "
-                "interface log above). Stopping instead of acting on frozen sensors."
-            )
+            raw_obs = self._wait_for_fresh_observation()
 
         # Process images: keep original resolution AND keep (H, W, C) format
         # Policy's _parse_image will handle format conversion if needed
@@ -177,6 +200,48 @@ class TeleavatarEnvironment(_environment.Environment):
             'observation/images/head_camera': image_tools.convert_to_uint8(raw_obs['images']['head_camera']),
             'prompt': self._prompt,
         }
+
+    def _wait_for_fresh_observation(self) -> dict:
+        """Block until the sensors are live again, freezing the robot meanwhile.
+
+        Freezing requires no action of its own: by not returning, the control
+        loop stops calling apply_action, so the 200 Hz _interp_publish timer in
+        ros2_interface keeps republishing the last des_q (alpha saturates at
+        1.0) and keeps the 50 Hz /api/fsm/enable heartbeat alive. The arm holds
+        position and stays enabled.
+
+        This deliberately never raises. Exiting the process on a stale
+        observation also kills the enable heartbeat, which is a worse outcome
+        than waiting — a video outage is usually transient (the RTP watchdog
+        restarts the pipeline if the fault is on our side).
+        """
+        outage_start = time.time()
+        logging.error(
+            "Sensors unavailable — freezing the robot at its last commanded pose and waiting. "
+            "See the interface log above for which sensors are dead."
+        )
+        last_log = outage_start
+
+        while True:
+            time.sleep(self._outage_poll_period)
+            raw_obs = self._ros_interface.get_observation()
+            if raw_obs is not None:
+                duration = time.time() - outage_start
+                logging.warning(
+                    "SENSOR_OUTAGE_END duration=%.2fs — discarding the cached action chunk "
+                    "and easing back in over %.2fs",
+                    duration,
+                    self._recovery_ramp_s,
+                )
+                if self._agent is not None:
+                    self._agent.reset()
+                self._pending_recovery = True
+                return raw_obs
+
+            now = time.time()
+            if now - last_log >= 5.0:
+                logging.error("Still frozen: sensors unavailable for %.1fs", now - outage_start)
+                last_log = now
 
     @override
     def apply_action(self, action: dict) -> None:
@@ -199,8 +264,14 @@ class TeleavatarEnvironment(_environment.Environment):
         if actions.shape != (16,):
             raise ValueError(f"Expected 16-dim action, got shape {actions.shape}")
 
+        # First command after an outage gets a longer ramp: the arm has been
+        # frozen, so covering a large pose delta in one control period (33 ms)
+        # would be a jerk.
+        ramp_duration = self._recovery_ramp_s if self._pending_recovery else None
+        self._pending_recovery = False
+
         # Publish to ROS2
-        self._ros_interface.publish_action(actions)
+        self._ros_interface.publish_action(actions, ramp_duration=ramp_duration)
 
     def set_prompt(self, prompt: str):
         """Update the language instruction prompt.
