@@ -5,7 +5,14 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+from collections.abc import Sequence
+import glob
+import io
+import os
+import tarfile
+
 import numpy as np
+from torch.utils.data import IterableDataset as TorchIterableDataset
 import tqdm
 import tyro
 
@@ -129,6 +136,107 @@ def create_torch_dataloader(
     return data_loader, num_batches
 
 
+class WDSStateActionDataset(TorchIterableDataset):
+    """Iterates the WDS .tar shards reading only .state_action.npz.
+
+    compute_norm_stats needs nothing but state / action, so this bypasses the
+    whole training WDS pipeline (webdataset + decord video decode + VideoReader
+    warmup, which costs ~5s per mp4). Reading the tars sequentially with
+    tarfile is enough: no shuffling is needed since RunningStats is
+    order-independent, and every sample must be visited exactly once anyway.
+
+    Yields the same tuple layout as the training pipeline's decode_images
+    (key, frames, state, action) so the config's WDSTuple2Dict repack transform
+    applies unchanged; `frames` carries dummy images (see _DUMMY_FRAME).
+    """
+
+    # 1:1 aspect so TeleavatarInputs._extract_stereo_view's `width >= 2*height`
+    # guard leaves it alone, and small so stacking it into a batch is cheap.
+    # Never read: RunningStats only touches state / actions.
+    _DUMMY_FRAME = np.zeros((4, 4, 3), dtype=np.uint8)
+
+    def __init__(self, dataset_dir: str, topics: Sequence[str]):
+        self._tars = sorted(glob.glob(os.path.join(dataset_dir, "*.tar")))
+        if not self._tars:
+            raise FileNotFoundError(f"No .tar files found in {dataset_dir}")
+        self._topics = list(topics)
+        self._num_samples: int | None = None
+
+    def __iter__(self):
+        for tar_path in self._tars:
+            with tarfile.open(tar_path) as tf:
+                for member in tf:
+                    if not member.name.endswith(".state_action.npz"):
+                        continue
+                    npz = np.load(io.BytesIO(tf.extractfile(member).read()))
+                    frames = dict.fromkeys(self._topics, self._DUMMY_FRAME)
+                    yield (
+                        member.name.split(".")[0],
+                        frames,
+                        npz["state"].astype(np.float32),
+                        npz["action"].astype(np.float32),
+                    )
+
+    def __len__(self) -> int:
+        # Counting member names (no payload read) over all shards; ~3s for the
+        # 478-shard / 47760-sample set. Cached, since main() needs it before
+        # iterating to size the tqdm bar.
+        if self._num_samples is None:
+            total = 0
+            for tar_path in self._tars:
+                with tarfile.open(tar_path) as tf:
+                    total += sum(1 for m in tf if m.name.endswith(".state_action.npz"))
+            self._num_samples = total
+        return self._num_samples
+
+
+def create_wds_dataloader(
+    data_config: _config.DataConfig,
+    batch_size: int,
+    max_frames: int | None = None,
+) -> tuple[_data_loader.DataLoader, int]:
+    """Norm-stats loader for the Lingyu WDS .tar datasets.
+
+    Same transform chain as create_torch_dataloader (repack -> data_transforms
+    -> RemoveStrings), only the source dataset differs, so the resulting
+    norm_stats.json is identical in format to the LeRobot path.
+    """
+    assert data_config.wds_data_dir is not None, "wds_data_dir must be set for the WDS loader."
+
+    # The repack group starts with WDSTuple2Dict, whose topic_camera_mapping is
+    # the authoritative topic list; reuse it instead of hardcoding the topics.
+    topics = next(
+        (tf.topic_camera_mapping for tf in data_config.repack_transforms.inputs if isinstance(tf, transforms.WDSTuple2Dict)),
+        {},
+    )
+    dataset = WDSStateActionDataset(data_config.wds_data_dir, topics)
+    num_samples = len(dataset)
+
+    dataset = _data_loader.IterableTransformedDataset(
+        dataset,
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+            RemoveStrings(),
+        ],
+    )
+    if max_frames is not None and max_frames < num_samples:
+        num_batches = max_frames // batch_size
+    else:
+        num_batches = num_samples // batch_size
+
+    # num_workers=0: reading npz off local disk is not the bottleneck, and a
+    # single pass keeps every sample counted exactly once.
+    data_loader = _data_loader.WDSDataLoader(
+        dataset,
+        local_batch_size=batch_size,
+        num_workers=0,
+        num_batches=num_batches,
+    )
+    return data_loader, num_batches
+
+
 def create_rlds_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -162,7 +270,9 @@ def main(config_name: str, max_frames: int | None = None, skip_video: bool = Tru
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    if data_config.rlds_data_dir is not None:
+    if data_config.wds_data_dir is not None:
+        data_loader, num_batches = create_wds_dataloader(data_config, config.batch_size, max_frames)
+    elif data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )

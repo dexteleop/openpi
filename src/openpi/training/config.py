@@ -100,9 +100,11 @@ class DataConfig:
     # Directory containing WDS .tar files for the Lingyu WebDataset loader.
     wds_data_dir: str | None = None
     # Fraction of system memory to use for WDS shuffle buffer (default 0.4 = 40%).
-    wds_memory_ratio: float = 0.1
+    wds_memory_ratio: float = 0.4
     # Shuffle buffer size for WDS near-global shuffling.
-    wds_shuffle_buffer_size: int = 10000
+    wds_shuffle_buffer_size: int = 5000
+    # The prompt only used for WebDataset loader. If None, will use the default prompt defined in the model config.
+    wds_prompt: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -565,27 +567,70 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class WDSLingyuDataConfig(DataConfigFactory):
-    """Config for training on Lingyu WebDataset (WDS) .tar files.
-
-    WDS data loader handles video frame decoding, normalization, and tokenization
-    inside its collate_fn, skipping the standard transforms pipeline entirely.
+class WDSLingyuTeleavatarV2DataConfig(DataConfigFactory):
     """
+    Config for training on the Teleavatar v2 dual-arm robot dataset.
 
-    # Path to directory containing .tar files.
-    wds_data_dir: str = tyro.MISSING
-    # Fraction of system memory to use for WDS shuffle buffer.
-    wds_memory_ratio: float = 0.4
-    # Shuffle buffer size for WDS near-global shuffling.
-    wds_shuffle_buffer_size: int = 10000
+    Handles the v2 proprioceptive state (62-dim: positions, velocities,
+    efforts + EE poses; 72-dim datasets append chassis dims — the indices
+    used are identical) and 3 side-by-side stereo camera feeds:
+    TeleavatarInputs crops one eye per camera (head → left eye,
+    left → right eye, right → left eye). For the v1 (officially released)
+    robot use LeRobotTeleavatarV1DataConfig instead.
+    """
+    use_delta_joint_actions: bool = False
+    # Whether the head camera should be rotated 180° before the left-eye crop.
+    # Property of the source dataset orientation; forwarded to TeleavatarInputs.
+    rotate_head_camera: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform to match dataset keys to inference keys.
+        repack_structure = {
+            "observation/images/left_color": "observation/images/left_color",
+            "observation/images/right_color": "observation/images/right_color",
+            "observation/images/head_camera": "observation/images/head_camera",
+            "observation/state": "observation/state",
+            "action": "action",  # Keep action as action
+        }
+        # RepackTransform rebuilds the dict from scratch, so "prompt" has to be
+        # listed here or it is lost and TeleavatarInputs falls back to its
+        # hardcoded default for every sample. The value is the SOURCE KEY that
+        # WDSTuple2Dict wrote the task text under, not the text itself.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.wds_prompt is not None:
+            repack_structure["prompt"] = "prompt"
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.WDSTuple2Dict(prompt=base_cfg.wds_prompt),
+                _transforms.RepackTransform(repack_structure),
+            ]
+        )
+
+        # Delta is handled inside TeleavatarInputs/Outputs (see there for why).
+        data_transforms = _transforms.Group(
+            inputs=[
+                teleavatar_v2_policy.TeleavatarInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
+            outputs=[
+                teleavatar_v2_policy.TeleavatarOutputs(
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
+        )
+
+        # Model transforms
+        model_transforms = ModelTransformFactory()(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            wds_data_dir=self.wds_data_dir,
-            wds_memory_ratio=self.wds_memory_ratio,
-            wds_shuffle_buffer_size=self.wds_shuffle_buffer_size,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
         )
 
 
@@ -1081,6 +1126,27 @@ _CONFIGS = [
         
     ),
     TrainConfig(
+        name="pi0_teleavatar_v2_lingyu_wds",
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
+            action_horizon=30,
+        ),
+        checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
+        data=WDSLingyuTeleavatarV2DataConfig(
+            repo_id="stack_the_second_layer_of_blocks",
+            base_config=DataConfig(
+                action_sequence_keys=("action",),  # Use 'action' not 'actions'
+                wds_data_dir="/DATA/disk0/haoran/infra_wds",
+                wds_prompt="Stack the second layer of blocks.", # Fill in the prompt accurately
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
+        batch_size = 64,
+        num_train_steps=40000,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
         name="pi0_teleavatar_v2_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(
@@ -1283,29 +1349,6 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
-    ),
-    #
-    # Lingyu WDS configs.
-    #
-    TrainConfig(
-        name="pi0_lingyu_wds",
-        model=pi0_config.Pi0Config(
-            action_dim=32,
-            action_horizon=30,
-        ),
-        checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
-        data=WDSLingyuDataConfig(
-            repo_id="lingyu",
-            wds_data_dir="/DATA/disk0/haoran/infra_wds",
-            wds_memory_ratio=0.6,
-            wds_shuffle_buffer_size=5000,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
-        num_workers= 32,
-        batch_size = 64,
-        num_train_steps=20000,
-        wandb_enabled=True,
     ),
 ]
 

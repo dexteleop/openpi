@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import gc
 import logging
 import platform
 from typing import Any
@@ -274,6 +275,15 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+
+    # Shut the data loader down here rather than leaving it to the garbage
+    # collector: otherwise DataLoader.__del__ joins its worker processes during
+    # interpreter finalization, where any error it hits can only be reported as
+    # "Exception ignored in: <function _MultiProcessingDataLoaderIter.__del__>".
+    # Closing the iterator releases the torch iterator the generators hold.
+    data_iter.close()
+    del data_iter, batch, data_loader
+    gc.collect()
 
 
 if __name__ == "__main__":

@@ -14,8 +14,14 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
-from openpi.training.lingyu_dataloader.wds_pi0train import WDSDataLoader
+from openpi.training.lingyu_dataloader.webdataset_load_tar import build_dataset
 import openpi.transforms as _transforms
+
+# torch.utils.data.DataLoader picks map-style vs iterable-style with an
+# isinstance() check, so a dataset handed to it must really subclass this one.
+# The IterableDataset Protocol defined below is structural typing only and is
+# invisible to that check. Aliased to keep the two names distinguishable.
+TorchIterableDataset = torch.utils.data.IterableDataset
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -63,7 +69,7 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
-class IterableTransformedDataset(IterableDataset[T_co]):
+class IterableTransformedDataset(TorchIterableDataset, IterableDataset[T_co]):
     def __init__(
         self,
         dataset: IterableDataset,
@@ -148,6 +154,52 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    return dataset
+
+
+class WDSDataset(TorchIterableDataset, IterableDataset):
+    def __init__(self, dataset_dir, memory_ratio,
+            batch_size, num_workers, shuffle_buffer_size
+        ):
+        self._dataset = build_dataset(
+            dataset_dir, memory_ratio, 
+            batch_size, num_workers, shuffle_buffer_size
+        )
+
+    def __iter__(self):
+        """ Iterator over the dataset. """
+        return iter(self._dataset)
+
+    def __len__(self):
+        # 重写：检查.tar包，然后知道训练样本个数
+        return 80000
+
+
+def create_wds_dataset(
+    data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
+    batch_size: int,
+    num_workers: int,
+) -> IterableDataset:
+    """Create a dataset for training.
+
+    batch_size / num_workers are passed in rather than read off data_config:
+    they are TrainConfig fields, not DataConfig ones.
+    """
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set. Cannot create dataset.")
+    if repo_id == "fake":
+        return FakeDataset(model_config, num_samples=1024)
+
+    dataset = WDSDataset(
+        dataset_dir=data_config.wds_data_dir,
+        memory_ratio=data_config.wds_memory_ratio,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle_buffer_size=data_config.wds_shuffle_buffer_size,
+    )
 
     return dataset
 
@@ -246,11 +298,10 @@ def create_data_loader(
     if data_config.wds_data_dir is not None:
         return create_wds_data_loader(
             data_config,
-            action_horizon=config.model.action_horizon,
-            action_dim=config.model.action_dim,
+            model_config=config.model,
             batch_size=config.batch_size,
             sharding=sharding,
-            shuffle=shuffle,
+            skip_norm_stats=skip_norm_stats,
             num_batches=num_batches,
             num_workers=config.num_workers,
         )
@@ -351,12 +402,11 @@ def create_torch_data_loader(
 
 def create_wds_data_loader(
     data_config: _config.DataConfig,
-    action_horizon: int,
+    model_config: _model.BaseModelConfig,
     batch_size: int,
     *,
-    action_dim: int | None = None,
     sharding: jax.sharding.Sharding | None = None,
-    shuffle: bool = False,
+    skip_norm_stats: bool = False,
     num_batches: int | None = None,
     num_workers: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
@@ -367,10 +417,10 @@ def create_wds_data_loader(
 
     Args:
         data_config: The data configuration.
-        action_horizon: The action horizon.
+        model_config: The model configuration.
         batch_size: The batch size.
         sharding: The sharding to use for the data loader.
-        shuffle: Whether to shuffle the data.
+        skip_norm_stats: Whether to skip data normalization.
         num_batches: Determines the number of batches to return.
         num_workers: Number of worker processes for the WDS data loader.
     """
@@ -379,17 +429,16 @@ def create_wds_data_loader(
 
     assert data_config.wds_data_dir is not None, "wds_data_dir must be set for WDS data loader."
 
+    dataset = create_wds_dataset(data_config, model_config, batch_size, num_workers)
+    dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
     local_batch_size = batch_size // jax.process_count()
-    logging.info(f"WDS local_batch_size: {local_batch_size}")
+    logging.info(f"local_batch_size: {local_batch_size}")
 
     data_loader = WDSDataLoader(
-        dataset_dir=data_config.wds_data_dir,
+        dataset=dataset,
         local_batch_size=local_batch_size,
-        action_horizon=action_horizon,
-        action_dim=action_dim,
         sharding=sharding,
-        memory_ratio=data_config.wds_memory_ratio,
-        shuffle_buffer_size=data_config.wds_shuffle_buffer_size,
         num_batches=num_batches,
         num_workers=num_workers,
     )
@@ -526,6 +575,103 @@ class TorchDataLoader:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
+
+
+class WDSDataLoader:
+    """Torch data loader implementation."""
+
+    def __init__(
+        self,
+        dataset,
+        local_batch_size: int,
+        *,
+        sharding: jax.sharding.Sharding | None = None,
+        num_batches: int | None = None,
+        num_workers: int = 0,
+        prefetch_factor: int = 2,
+        # Default platform is JAX
+    ):
+        """Create a PyTorch data loader.
+
+        Args:
+            dataset: The dataset to load.
+            local_batch_size: The local batch size for each process.
+            sharding: The sharding to use for the data loader.
+            shuffle: Whether to shuffle the data.
+            num_batches: If provided, determines the number of returned batches. If the
+                number is larger than the number of batches in the dataset, the data loader
+                will loop over the dataset. If not provided, will iterate over the dataset
+                indefinitely.
+            num_workers: The number of worker processes to use. If zero, the data loader will
+                execute in the main process.
+            prefetch_factor: Batches each worker keeps queued ahead of the main
+                process. num_workers * prefetch_factor batches of slack is what
+                absorbs the seconds-long per-batch assembly cost, so the main
+                process's next() finds a ready batch instead of blocking.
+        """
+        if jax.process_count() > 1:
+            raise NotImplementedError("Data loading with multiple processes is not supported.")
+
+        if len(dataset) < local_batch_size:
+            raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+
+        # Store sharding - None for PyTorch, JAX sharding for JAX
+        self._sharding = sharding
+        if sharding is None:
+            # Use data parallel sharding by default for JAX only.
+            self._sharding = jax.sharding.NamedSharding(
+                jax.sharding.Mesh(jax.devices(), ("B",)),
+                jax.sharding.PartitionSpec("B"),
+            )
+        self._num_batches = num_batches
+
+        mp_context = None
+        if num_workers > 0:
+            mp_context = multiprocessing.get_context("spawn")
+
+        self._data_loader = torch.utils.data.DataLoader(
+            typing.cast(torch.utils.data.IterableDataset, dataset),
+            batch_size=local_batch_size,
+            num_workers=num_workers,
+            multiprocessing_context=mp_context,
+            persistent_workers=num_workers > 0,
+            worker_init_fn=_worker_init_fn,
+            drop_last=True,
+            collate_fn=_collate_fn,
+            # Buffer depth per worker. A batch costs seconds to assemble while a
+            # train step costs well under one, so the only way next() returns in
+            # <0.1s is finding a batch already queued: this is the knob that
+            # decides whether it does. None (torch's default) means 2.
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            # in_order=False lets the main process take whichever worker's batch
+            # is ready first. With True, a single slow worker stalls the queue
+            # even when other batches are done.
+            in_order=False if num_workers > 0 else True,
+        )
+
+    @property
+    def torch_loader(self) -> torch.utils.data.DataLoader:
+        return self._data_loader
+
+    def __iter__(self):
+        num_items = 0
+        while True:
+            data_iter = iter(self._data_loader)
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                try:
+                    batch = _fetch_and_put(data_iter, self._sharding)
+                except StopIteration:
+                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                num_items += 1
+                yield batch
+
+
+def _fetch_and_put(data_iter, sharding):
+    """Fetch one batch from the worker pool and place it on the devices."""
+    batch = next(data_iter)
+    return jax.tree.map(lambda x: jax.make_array_from_process_local_data(sharding, x), batch)
 
 
 def _collate_fn(items):

@@ -77,6 +77,54 @@ def compose(transforms: Sequence[DataTransformFn]) -> DataTransformFn:
 
 
 @dataclasses.dataclass(frozen=True)
+class WDSTuple2Dict(DataTransformFn):
+    """Repacks an input dictionary into a new dictionary.
+
+    Repacking is defined using a dictionary where the keys are the new keys and the values
+    are the flattened paths to the old keys. We use '/' as the separator during flattening.
+
+    Example:
+    (   
+        sample_idx_str,
+        {
+            "cam_high": "observation.images.top",
+            "cam_low": "observation.images.bottom",
+        },
+        state,
+        actions,
+    )
+    """
+
+    # TeleAvatar_v2 Rosbag topics transforms to camera names.
+    # default_factory, not a bare dict: a mutable default is rejected by
+    # dataclasses (ValueError at class-creation time, i.e. at import).
+    topic_camera_mapping: dict = dataclasses.field(
+        default_factory=lambda: {
+            "/xr_video_topic/ffmpeg": "head_camera",
+            "/left/color/image_raw/ffmpeg": "left_color",
+            "/right/color/image_raw/ffmpeg": "right_color",
+        }
+    )
+    # The tars carry no task text (generate_tars.py writes the sample key as a
+    # running index), so it is injected here. None leaves "prompt" out.
+    prompt: str | None = None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        _, frames, state, actions = data
+        for topic, camera_name in self.topic_camera_mapping.items():
+            if topic in frames:
+                frames[camera_name] = frames.pop(topic)
+        # generate_tars.py stores state with a leading length-1 time axis
+        # ((1, state_dim)); drop it so the layout matches the (state_dim,) the
+        # LeRobot path yields and Observation.state expects.
+        state = np.asarray(state).reshape(-1)
+        item = {"observation": {"images": frames, "state": state}, "action": actions}
+        if self.prompt is not None:
+            item["prompt"] = self.prompt
+        return item
+
+
+@dataclasses.dataclass(frozen=True)
 class RepackTransform(DataTransformFn):
     """Repacks an input dictionary into a new dictionary.
 
