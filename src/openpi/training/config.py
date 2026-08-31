@@ -596,13 +596,19 @@ class WDSLingyuTeleavatarV2DataConfig(DataConfigFactory):
         # RepackTransform rebuilds the dict from scratch, so "prompt" has to be
         # listed here or it is lost and TeleavatarInputs falls back to its
         # hardcoded default for every sample. The value is the SOURCE KEY that
-        # WDSTuple2Dict wrote the task text under, not the text itself.
+        # InjectDefaultPrompt wrote the task text under, not the text itself.
         base_cfg = self.base_config or DataConfig()
         if base_cfg.wds_prompt is not None:
             repack_structure["prompt"] = "prompt"
+        # wds_v2_to_sample first: the v2 tar Dataset yields lerobot's per-frame
+        # layout (leading length-1 frame axis on images and state), which the
+        # transforms below cannot index correctly. Keeping it in the repack
+        # group rather than inside create_torch_wds_dataset means the
+        # norm-stats path gets the same adaptation for free.
         repack_transform = _transforms.Group(
             inputs=[
-                _transforms.WDSTuple2Dict(prompt=base_cfg.wds_prompt),
+                _transforms.wds_v2_to_sample,
+                _transforms.InjectDefaultPrompt(base_cfg.wds_prompt),
                 _transforms.RepackTransform(repack_structure),
             ]
         )
@@ -1131,18 +1137,19 @@ _CONFIGS = [
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=30,
         ),
-        checkpoint_base_dir="/DATA/disk0/haoran/checkpoints",
+        checkpoint_base_dir="/DATA/disk1/haoran/checkpoints",
         data=WDSLingyuTeleavatarV2DataConfig(
             repo_id="stack_the_second_layer_of_blocks",
             base_config=DataConfig(
                 action_sequence_keys=("action",),  # Use 'action' not 'actions'
-                wds_data_dir="/DATA/disk0/haoran/infra_wds",
+                wds_data_dir="/DATA/disk1/haoran/infra_wds",
                 wds_prompt="Stack the second layer of blocks.", # Fill in the prompt accurately
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         # weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
         batch_size = 64,
+        num_workers= 128,
         num_train_steps=40000,
         wandb_enabled=True,
     ),

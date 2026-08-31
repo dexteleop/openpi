@@ -76,52 +76,34 @@ def compose(transforms: Sequence[DataTransformFn]) -> DataTransformFn:
     return CompositeTransform(transforms)
 
 
-@dataclasses.dataclass(frozen=True)
-class WDSTuple2Dict(DataTransformFn):
-    """Repacks an input dictionary into a new dictionary.
+def wds_v2_to_sample(item: DataDict) -> DataDict:
+    """Adapt one TeleavatarTarDataset item to what the transforms expect.
 
-    Repacking is defined using a dictionary where the keys are the new keys and the values
-    are the flattened paths to the old keys. We use '/' as the separator during flattening.
+    Replaces the old WDSTuple2Dict, which unpacked the (key, frames, state,
+    action) tuple yielded by the v1 iterable pipeline and renamed rosbag topics
+    to camera keys. The v2 tar Dataset already returns a nested dict keyed by
+    camera name, so only the leading axis has to go.
 
-    Example:
-    (   
-        sample_idx_str,
-        {
-            "cam_high": "observation.images.top",
-            "cam_low": "observation.images.bottom",
-        },
-        state,
-        actions,
-    )
+    TeleavatarTarDataset keeps lerobot's per-frame layout: torch tensors, with
+    images at (1, C, H, W) and state at (1, state_dim) -- the leading axis is
+    the single queried frame. The transform chain works on unbatched numpy, and
+    TeleavatarInputs indexes state positionally (state[0:7]), so that frame axis
+    has to go before it reaches the transforms; leaving it in would slice the
+    frame axis instead of the joint axis, and would also defeat _parse_image's
+    `shape[0] == 3` channel-first check. Actions are already
+    (action_seq_len, state_dim) -- that leading axis is time, so it stays.
+
+    The tars carry no task text, so "prompt" is not produced here; it is
+    injected by InjectDefaultPrompt from DataConfig.wds_prompt.
     """
-
-    # TeleAvatar_v2 Rosbag topics transforms to camera names.
-    # default_factory, not a bare dict: a mutable default is rejected by
-    # dataclasses (ValueError at class-creation time, i.e. at import).
-    topic_camera_mapping: dict = dataclasses.field(
-        default_factory=lambda: {
-            "/xr_video_topic/ffmpeg": "head_camera",
-            "/left/color/image_raw/ffmpeg": "left_color",
-            "/right/color/image_raw/ffmpeg": "right_color",
-        }
-    )
-    # The tars carry no task text (generate_tars.py writes the sample key as a
-    # running index), so it is injected here. None leaves "prompt" out.
-    prompt: str | None = None
-
-    def __call__(self, data: DataDict) -> DataDict:
-        _, frames, state, actions = data
-        for topic, camera_name in self.topic_camera_mapping.items():
-            if topic in frames:
-                frames[camera_name] = frames.pop(topic)
-        # generate_tars.py stores state with a leading length-1 time axis
-        # ((1, state_dim)); drop it so the layout matches the (state_dim,) the
-        # LeRobot path yields and Observation.state expects.
-        state = np.asarray(state).reshape(-1)
-        item = {"observation": {"images": frames, "state": state}, "action": actions}
-        if self.prompt is not None:
-            item["prompt"] = self.prompt
-        return item
+    images = {k: np.asarray(v)[0] for k, v in item["observation"]["images"].items()}
+    return {
+        "observation": {
+            "images": images,
+            "state": np.asarray(item["observation"]["state"])[0],
+        },
+        "action": np.asarray(item["action"]),
+    }
 
 
 @dataclasses.dataclass(frozen=True)

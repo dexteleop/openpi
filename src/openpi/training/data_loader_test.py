@@ -102,43 +102,6 @@ def test_with_real_dataset():
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
-def test_wds_dataset_is_iterable():
-    """WDSDataset must satisfy the iterator protocol and restart per pass.
-
-    Isolates the dataset layer: no DataLoader, no transforms. `__iter__` has to
-    return an ITERATOR (not a sample), and each call must start a fresh pass so
-    epoch 2 is not empty.
-    """
-    config = _require_wds_data()
-    data_config = config.data.create(config.assets_dirs, config.model)
-
-    dataset = _data_loader.WDSDataset(
-        dataset_dir=data_config.wds_data_dir,
-        memory_ratio=data_config.wds_memory_ratio,
-        batch_size=config.batch_size,
-        num_workers=0,
-        shuffle_buffer_size=data_config.wds_shuffle_buffer_size,
-    )
-
-    iterator = iter(dataset)
-    assert hasattr(iterator, "__next__"), (
-        f"__iter__ must return an iterator, got {type(iterator).__name__}"
-    )
-
-    first_pass = [sample for _, sample in zip(range(2), dataset)]
-    assert len(first_pass) == 2
-
-    # Each sample is the decode_images tuple: (key, frames, state, action).
-    key, frames, state, action = first_pass[0]
-    assert isinstance(key, str)
-    assert len(frames) == 3
-    assert state.ndim >= 1 and action.ndim == 2
-
-    # A second pass must yield data again (a cached iterator would be empty).
-    second_pass = [sample for _, sample in zip(range(2), dataset)]
-    assert len(second_pass) == 2, "second pass is empty: the iterator was cached"
-
-
 def test_wds_data_loader_batches():
     """End-to-end: create_data_loader must yield batch_size-shaped model inputs."""
     config = _require_wds_data()
@@ -297,9 +260,11 @@ def _expected_actions(raw_action: np.ndarray) -> np.ndarray:
 def _expected_base_image(meta: dict) -> np.ndarray:
     """Decode the head-camera frame the sample's json points at, and crop+resize it."""
     topic = "/xr_video_topic/ffmpeg"
-    frame = _wds_tar.decode_single_frame(
+    # decode_frame returns (1, C, H, W) float32 in [0, 1]; drop the leading
+    # frame axis so _parse_image sees the (C, H, W) layout it rearranges.
+    frame = _wds_tar.decode_frame(
         _wds_tar.get_mp4_path(meta["dataset_path"], topic), meta[topic]
-    )
+    )[0]
     frame = _teleavatar._extract_stereo_view(
         _teleavatar._parse_image(frame), "left", rotate=False
     )

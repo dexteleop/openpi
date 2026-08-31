@@ -1,3 +1,0 @@
-[submodule "src/openpi/training/lingyu_dataloader"]
-	path = src/openpi/training/lingyu_dataloader
-	url = https://git.dexteleop.com/shihaoran/lingyu_dataloader.git

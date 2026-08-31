@@ -140,26 +140,30 @@ class WDSStateActionDataset(TorchIterableDataset):
     """Iterates the WDS .tar shards reading only .state_action.npz.
 
     compute_norm_stats needs nothing but state / action, so this bypasses the
-    whole training WDS pipeline (webdataset + decord video decode + VideoReader
-    warmup, which costs ~5s per mp4). Reading the tars sequentially with
-    tarfile is enough: no shuffling is needed since RunningStats is
-    order-independent, and every sample must be visited exactly once anyway.
+    whole training WDS pipeline (video decode of one frame per camera per
+    sample). Reading the tars sequentially with tarfile is enough: no shuffling
+    is needed since RunningStats is order-independent, and every sample must be
+    visited exactly once anyway.
 
-    Yields the same tuple layout as the training pipeline's decode_images
-    (key, frames, state, action) so the config's WDSTuple2Dict repack transform
-    applies unchanged; `frames` carries dummy images (see _DUMMY_FRAME).
+    Yields the same dict layout as TeleavatarTarDataset -- nested
+    observation/images/state, with the leading length-1 frame axis still on
+    images and state -- so the config's repack group (which starts with
+    transforms.wds_v2_to_sample) applies unchanged. Images are dummies
+    (see _DUMMY_FRAME).
     """
 
-    # 1:1 aspect so TeleavatarInputs._extract_stereo_view's `width >= 2*height`
-    # guard leaves it alone, and small so stacking it into a batch is cheap.
-    # Never read: RunningStats only touches state / actions.
-    _DUMMY_FRAME = np.zeros((4, 4, 3), dtype=np.uint8)
+    # (1, C, H, W) like a real decoded frame, so wds_v2_to_sample's [0] leaves a
+    # channel-first (3, 4, 4) that _parse_image recognises. 1:1 aspect so
+    # TeleavatarInputs._extract_stereo_view's `width >= 2*height` guard leaves it
+    # alone, and small so stacking it into a batch is cheap. Never read:
+    # RunningStats only touches state / actions.
+    _DUMMY_FRAME = np.zeros((1, 3, 4, 4), dtype=np.float32)
 
-    def __init__(self, dataset_dir: str, topics: Sequence[str]):
+    def __init__(self, dataset_dir: str, camera_keys: Sequence[str]):
         self._tars = sorted(glob.glob(os.path.join(dataset_dir, "*.tar")))
         if not self._tars:
             raise FileNotFoundError(f"No .tar files found in {dataset_dir}")
-        self._topics = list(topics)
+        self._camera_keys = list(camera_keys)
         self._num_samples: int | None = None
 
     def __iter__(self):
@@ -169,13 +173,15 @@ class WDSStateActionDataset(TorchIterableDataset):
                     if not member.name.endswith(".state_action.npz"):
                         continue
                     npz = np.load(io.BytesIO(tf.extractfile(member).read()))
-                    frames = dict.fromkeys(self._topics, self._DUMMY_FRAME)
-                    yield (
-                        member.name.split(".")[0],
-                        frames,
-                        npz["state"].astype(np.float32),
-                        npz["action"].astype(np.float32),
-                    )
+                    yield {
+                        "observation": {
+                            "images": dict.fromkeys(self._camera_keys, self._DUMMY_FRAME),
+                            # Kept at (1, state_dim) as packed; wds_v2_to_sample
+                            # drops that axis, same as in training.
+                            "state": npz["state"].astype(np.float32),
+                        },
+                        "action": npz["action"].astype(np.float32),
+                    }
 
     def __len__(self) -> int:
         # Counting member names (no payload read) over all shards; ~3s for the
@@ -203,13 +209,20 @@ def create_wds_dataloader(
     """
     assert data_config.wds_data_dir is not None, "wds_data_dir must be set for the WDS loader."
 
-    # The repack group starts with WDSTuple2Dict, whose topic_camera_mapping is
-    # the authoritative topic list; reuse it instead of hardcoding the topics.
-    topics = next(
-        (tf.topic_camera_mapping for tf in data_config.repack_transforms.inputs if isinstance(tf, transforms.WDSTuple2Dict)),
-        {},
-    )
-    dataset = WDSStateActionDataset(data_config.wds_data_dir, topics)
+    # The repack group's RepackTransform names every camera the policy transform
+    # will read; reuse that instead of hardcoding the camera set here, so a
+    # config that adds or drops a camera stays consistent with its dummy frames.
+    # Its VALUES are the source paths -- i.e. what this dataset has to supply --
+    # while the keys are the post-repack names.
+    prefix = "observation/images/"
+    camera_keys = [
+        src.removeprefix(prefix)
+        for tf in data_config.repack_transforms.inputs
+        if isinstance(tf, transforms.RepackTransform)
+        for src in transforms.flatten_dict(tf.structure).values()
+        if src.startswith(prefix)
+    ]
+    dataset = WDSStateActionDataset(data_config.wds_data_dir, camera_keys)
     num_samples = len(dataset)
 
     dataset = _data_loader.IterableTransformedDataset(
