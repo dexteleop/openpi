@@ -122,6 +122,10 @@ uv run scripts/serve_policy.py policy:checkpoint \
     --policy.dir=checkpoints/pi0_teleavatar_v2/my_experiment/20000
 ```
 
+```bash
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_teleavatar_v2_lingyu_wds --policy.dir=checkpoints/pi0_teleavatar_v2_lingyu_wds/my_experiment_2/1999
+```
+
 `--policy.config` must match the training config of the checkpoint (the two generations differ in image cropping and gripper conversion; a mismatch fails silently). `--policy.dir` must contain `assets/<dataset_name>/norm_stats.json` (packaged automatically at training time). Default port: `8000`.
 
 ### 3. Run the Robot Client (Client)
@@ -130,6 +134,10 @@ uv run scripts/serve_policy.py policy:checkpoint \
 export ROS_DOMAIN_ID=29
 python examples/teleavatar_v2/main.py --remote-host 127.0.0.1 --remote-port 8000 \
     --prompt "stack the three blocks"
+```
+```bash
+rosid
+python examples/teleavatar_v2/main.py --remote-host 127.0.0.1 --remote-port 8000 --prompt "Stack the second layer of blocks."
 ```
 
 Common flags (see `Args` in `main.py`): `--control-frequency` (control loop rate), `--open-loop-horizon` (steps executed before re-querying the policy), `--prompt` (language instruction). The client performs action chunking via `ActionChunkBroker`.

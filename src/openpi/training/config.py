@@ -1114,7 +1114,7 @@ _CONFIGS = [
             action_horizon=30
         ),
         data=LeRobotTeleavatarV2DataConfig(
-            repo_id="path-to-dataset",  # Your local dataset name
+            repo_id="MK_tower_floor2_lerobot_45fps",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
