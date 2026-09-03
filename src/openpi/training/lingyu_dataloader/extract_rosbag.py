@@ -17,9 +17,6 @@ Output layout:
 
 Usage:
     python extract_rosbag.py <bag_path> [output_dir]
-    python extract_rosbag.py /mnt/data6t/shihaoran_data/robot_20251103-J0GV_20260330-135132-828453_20260330-135359-953453 /mnt/data6t/shihaoran_data/test_lerobot3
-    python extract_rosbag.py /mnt/data6t/shihaoran_data/robot_20251103-J0GV_20260427-094752-838208_20260427-095244-401208 /mnt/data6t/shihaoran_data/test_parquetvideo
-    python extract_rosbag.py /mnt/data6t/shihaoran_data/rec_20260402_182236_7521abbe /mnt/data522g/shihaoran_data/test_rec
 
 Dependencies:
     pip install rosbags pyarrow numpy
