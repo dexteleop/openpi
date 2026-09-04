@@ -24,22 +24,16 @@ import pyarrow.parquet as pq
 # State-action time offset in seconds (originally 1e9 // 90 nanoseconds)
 SA_TIME_OFFSET_S = 1.0 / 90.0
 
-# Staleness bound for a tick's nearest observation, in units of the frame
-# interval, or None to disable.  `searchsorted` always returns the last message
-# at or before the reference instant, however old it is, so without a bound a
-# topic that stopped publishing would keep contributing its final value to every
-# later frame.
-#
-# NOTE: the online recorder has no such per-topic bound -- its _cur_state_msg
-# cache carries a stale value forward indefinitely.  Set this to None for
-# bit-exact online semantics; 1.0 additionally drops frames whose topic went
-# silent across the tick.  Measured worst case on MK_tower_floor2 (3 bags,
-# 47757 frames, 15 topics) is 0.865 frame intervals, so 1.0 drops nothing there.
-MAX_STALENESS_FRAMES = 1.0
 STATE_KEYWORDS = [
     '/left_arm/joint_states', '/left_arm/current_ee_pose', '/left_gripper/joint_states',
     '/right_arm/joint_states','/right_arm/current_ee_pose','/right_gripper/joint_states',
     '/chassis/joint_states', '/kinco/actual_velocity',
+]
+# Camera topics sample on the fps grid, not at the tick's arrival instant --
+# the recorder feeds its packets through `fps=<fps>:round=up` (convert:438),
+# which emits the latest frame at or before start + k/fps.  Indexing them like a
+# state topic picks the newer frame on ~5% of rows.
+VIDEO_KEYWORDS = [
     'ffmpeg',
 ]
 ACTION_KEYWORDS = [
@@ -48,14 +42,8 @@ ACTION_KEYWORDS = [
     '/chassis/joint_cmd', '/kinco/cmd_velocity',
 ]
 # Topics that advance the tick clock without contributing a column.
-#
-# The online recorder's `if is_recording:` block (convert:1472) sits at the same
-# level as its Joy handler, so EVERY message it reads can close a tick window --
-# including the hand-input topic it only uses for X/Y detection.  Leaving these
-# out of the arrival timeline shifts ~14% of tick reference instants, so they are
-# classified separately: they drive the clock, they never become data.
 CLOCK_KEYWORDS = [
-    'hand_inputs',
+    '/xr/left_hand_inputs',
 ]
 
 
@@ -66,6 +54,9 @@ def classify_topic(topic):
     for kw in STATE_KEYWORDS:
         if kw in topic:
             return "state"
+    for kw in VIDEO_KEYWORDS:
+        if kw in topic:
+            return "video"
     for kw in CLOCK_KEYWORDS:
         if kw in topic:
             return "clock"
@@ -125,17 +116,19 @@ def _episode_ticks(start_ts, end_ts, arrival_ts, interval_s):
         arrival_ts: sorted arrival times of every subscribed topic, in seconds.
 
     Returns:
-        (state_ref, action_ref, tick_idx) parallel arrays.  state_ref[i] is the
-        instant `_materialize_state` runs for tick tick_idx[i]; action_ref[i] is
-        the instant `add_action` runs.  Ticks whose state window stayed silent
-        are absent, exactly as the recorder skips them.
+        (state_ref, action_ref, grid_ref, tick_idx) parallel arrays.  state_ref[i]
+        is the instant `_materialize_state` runs for tick tick_idx[i];
+        action_ref[i] is the instant `add_action` runs; grid_ref[i] is the tick's
+        own grid point start + tick_idx[i]/fps, which is where the recorder's
+        ffmpeg `fps` filter samples video (convert:433-441).  Ticks whose state
+        window stayed silent are absent, exactly as the recorder skips them.
     """
     state_target = start_ts + interval_s
     action_target = state_target + SA_TIME_OFFSET_S
     k = 1
     in_adding = False
     s_ref = None
-    state_ref, action_ref, tick_idx = [], [], []
+    state_ref, action_ref, grid_ref, tick_idx = [], [], [], []
 
     lo = int(np.searchsorted(arrival_ts, state_target, side="left"))
     for t in arrival_ts[lo:]:
@@ -151,6 +144,7 @@ def _episode_ticks(start_ts, end_ts, arrival_ts, interval_s):
             # then skip whole intervals the arrival already ran past.
             state_ref.append(s_ref)
             action_ref.append(t)
+            grid_ref.append(state_target)
             tick_idx.append(k)
             skipped = int((t - action_target) // interval_s)
             state_target += (skipped + 1) * interval_s
@@ -166,6 +160,7 @@ def _episode_ticks(start_ts, end_ts, arrival_ts, interval_s):
 
     return (np.array(state_ref, dtype=np.float64),
             np.array(action_ref, dtype=np.float64),
+            np.array(grid_ref, dtype=np.float64),
             np.array(tick_idx, dtype=np.int64))
 
 
@@ -210,20 +205,21 @@ def generate_episode_snapshots(filepath, topics_role, topic_to_rg, episodes_meta
         # Restrict to arrivals the recorder would have seen while recording.
         lo = int(np.searchsorted(arrival_ts, start_ts, side="left"))
         hi = int(np.searchsorted(arrival_ts, end_ts, side="left"))
-        state_arr, action_arr, ticks = _episode_ticks(
+        state_arr, action_arr, grid_arr, ticks = _episode_ticks(
             start_ts, end_ts, arrival_ts[lo:hi], interval_s,
         )
 
         # The recorder stops at the Y press, so a tick whose action reference
         # would fall past the episode end never produces a row.
         keep = action_arr <= end_ts
-        state_arr, action_arr, ticks = state_arr[keep], action_arr[keep], ticks[keep]
+        state_arr, action_arr = state_arr[keep], action_arr[keep]
+        grid_arr, ticks = grid_arr[keep], ticks[keep]
 
         n_frames = len(state_arr)
         print(f"[episode {eidx_str}] start={start_ts:.6f}s, end={end_ts:.6f}s, "
               f"{n_frames} tick(s), last tick index={ticks[-1] if n_frames else 0}")
         episode_frames[eidx_str] = [{} for _ in range(n_frames)]
-        episode_targets[eidx_str] = (state_arr, action_arr, n_frames,
+        episode_targets[eidx_str] = (state_arr, action_arr, grid_arr, n_frames,
                                      start_ts, end_ts)
 
     print()
@@ -244,27 +240,17 @@ def generate_episode_snapshots(filepath, topics_role, topic_to_rg, episodes_meta
 
         # Inner loop: iterate over episodes (reuse the already-loaded timestamp array)
         for eidx_str in episode_targets.keys():
-            state_arr, action_arr, n_frames, start_ts, end_ts = episode_targets[eidx_str]
+            state_arr, action_arr, grid_arr, n_frames, start_ts, end_ts = \
+                episode_targets[eidx_str]
             if not n_frames or not len(ts):
                 continue
             # No episode mask here: the recorder's _cur_state_msg cache is never
             # cleared at the X press, so a message from before the episode is a
-            # legitimate source. MAX_STALENESS_FRAMES below is what bounds it.
-            targets = state_arr if role == "state" else action_arr
+            # legitimate source, however old.
+            # "video" samples on the fps grid, the other two at the tick's
+            # arrival instant -- see VIDEO_KEYWORDS.
+            targets = {"state": state_arr, "video": grid_arr}.get(role, action_arr)
             indices = _search_closest_le(ts, targets)
-
-            # Reject a match older than the staleness bound: the topic was silent
-            # across this tick, so the frame must not be built from a value
-            # carried over from long before. Dropping the topic makes the frame
-            # incomplete and the dedup pass below removes it.
-            if MAX_STALENESS_FRAMES is not None:
-                fresh = indices >= 0
-                if fresh.any():
-                    age = targets[fresh] - ts[indices[fresh]]
-                    too_old = age > MAX_STALENESS_FRAMES * interval_s
-                    if too_old.any():
-                        indices[np.flatnonzero(fresh)[too_old]] = -1
-                        print(f"  [ep {eidx_str}] {int(too_old.sum())} stale", end='')
 
             for i in range(n_frames):
                 if indices[i] >= 0:
