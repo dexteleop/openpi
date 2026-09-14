@@ -1,0 +1,3 @@
+想要测试这个文件夹中的功能函数， 测试程序写入到
+openpi/training/lingyu_dataloader_v2/test中，
+并按照这个文件夹中的格式来构建测试程序并使用pytest运行
