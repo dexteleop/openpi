@@ -4,6 +4,9 @@
 TeleAvatarV2 topics 只能对应一个 Standard topics
 一个 Standard topics 能够对应多个 TeleAvatarV2 topics
 """
+######
+# MCAP Player Config
+######
 TELEAVATAR_V2_MCAP_TOPICS_MAPPING = { # 标准 topic: MCAP topic
     ## 常用Topic
     # 三路摄像头
@@ -83,7 +86,7 @@ TELEAVATAR_V2_VIDEO_TOPICS_GOP = { # MCAP中存在的topics
 }
 
 
-USER_SELECTED_TOPICS = { # 标准topic: 该topic在训练样本中的角色 obs/state/action
+MODEL_SELECTED_TOPICS = { # 标准topic: 该topic在训练样本中的角色 obs/state/action
     '/xr_video_topic/ffmpeg': 'obs',
     '/right/color/image_raw/ffmpeg': 'obs',
     '/left/color/image_raw/ffmpeg': 'obs',
@@ -96,8 +99,30 @@ USER_SELECTED_TOPICS = { # 标准topic: 该topic在训练样本中的角色 obs/
 }
 
 
+######
+# Sample Extractor Config
+######
 EPISODE_SIGNAL = { # MCAP中存在的topics
     'topic_name': '/xr/left_hand_inputs',
     'start': 2,
     'end': 3,
+}
+
+
+######
+# ROS2 Message Filter Config
+######
+TELEAVATAR_V2_TOPICS_FIELDS = { # 标准topic: 所需消息字段 (嵌套字段用 flatten_msg 的点分路径表示)
+    # 双臂 state — sensor_msgs/JointState
+    '/left_arm/joint_states':        ('position',),
+    '/right_arm/joint_states':       ('position',),
+
+    # 双臂 action — sensor_msgs/JointState
+    '/left_arm/joint_cmd':           ('position',),
+    '/left_gripper/joint_cmd':       ('effort',),
+    '/right_arm/joint_cmd':          ('position',),
+    '/right_gripper/joint_cmd':      ('effort',),
+
+    # episode 信号 — sensor_msgs/Joy; buttons[2]=X=start, buttons[3]=Y=end
+    '/xr/left_hand_inputs':          ('buttons',),
 }

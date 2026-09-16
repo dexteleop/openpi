@@ -2,7 +2,7 @@
 
 USER_SELECTED_TOPICS 里写的是 TeleAvatarV2 的标准 topic 名, 不同机器人录出的 mcap
 里对应的 topic 名可能不同, 故统一经该机器人的 TELEAVATAV2_MCAP_TOPICS_MAPPING 映射。
-配置从 robots_config.config.load_topics_config() 读取, 本模块不关心当前是哪台机器人。
+配置从 mcap_config.config.load_topics_config() 读取, 本模块不关心当前是哪台机器人。
 
 用法::
     from openpi.training.lingyu_dataloader_v2.utils.topics_filter import filter_topics
@@ -13,7 +13,7 @@ USER_SELECTED_TOPICS 里写的是 TeleAvatarV2 的标准 topic 名, 不同机器
         ...
 """
 from __future__ import annotations
-from openpi.training.lingyu_dataloader_v2.robots_config.config import load_topics_config
+from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_topics_config
 
 
 def filter_topics() -> dict[str, str]:

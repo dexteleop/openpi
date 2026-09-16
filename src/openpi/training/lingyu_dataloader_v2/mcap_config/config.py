@@ -11,8 +11,7 @@
 """
 from __future__ import annotations
 
-from openpi.training.lingyu_dataloader_v2.robots_config import teleavatar_v2  # 换机器人只改这一行
-# TODO:导入机器人配置文件
+from openpi.training.lingyu_dataloader_v2.mcap_config import teleavatar_v2  # 换机器人只改这一行
 
 
 ROBOT = "teleavatar_v2" # TODO：选定使用的哪个机器人的mcap
@@ -25,7 +24,7 @@ ROBOT = "teleavatar_v2" # TODO：选定使用的哪个机器人的mcap
 def load_topics_config() -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
     """返回当前机器人的 (mcap topic 映射表, {用户选定的标准 topic: 角色})。"""
     if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.TELEAVATAR_V2_MCAP_TOPICS_MAPPING, teleavatar_v2.USER_SELECTED_TOPICS
+        return teleavatar_v2.TELEAVATAR_V2_MCAP_TOPICS_MAPPING, teleavatar_v2.MODEL_SELECTED_TOPICS
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(
@@ -54,6 +53,22 @@ def load_episode_signal() -> dict:
     """返回当前机器人标记 episode 起止的按键信号 {topic_name, start, end}。"""
     if ROBOT == "teleavatar_v2":
         return teleavatar_v2.EPISODE_SIGNAL
+    # TODO： elif 其他机器人的常量配置
+    else:
+        raise ValueError(
+            f"Cannot find the relevant robot configuration of {ROBOT!r} "
+            f"in lingyu_dataloader_v2/robots_config."
+        )
+
+
+#####
+# 用于 topic message 确定其中的字段
+#####
+
+def load_topics_fields() -> dict[str, tuple[str, ...]]:
+    """返回当前机器人的 {标准 topic: (所需字段, ...)}，供下游按需提取消息字段。"""
+    if ROBOT == "teleavatar_v2":
+        return teleavatar_v2.TELEAVATAR_V2_TOPICS_FIELDS
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(

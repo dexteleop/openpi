@@ -22,7 +22,7 @@ import os
 import struct
 from typing import Iterator
 from openpi.training.lingyu_dataloader_v2.utils.topics_filter import filter_topics
-from openpi.training.lingyu_dataloader_v2.robots_config.config import load_video_topics_gop
+from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_video_topics_gop
 
 # 每个message需要得到的信息
 _PER_MESSAGE_KEYS = (
@@ -36,13 +36,14 @@ _PER_MESSAGE_KEYS = (
 # mcap 二进制常量
 _MAGIC_SIZE = 8  # b"\x89MCAP0\r\n"
 _RECORD_PREFIX = 9  # opcode(1) + record_length(8)
+_MESSAGE_HEADER = 22  # channel_id(2) + sequence(4) + log_time(8) + publish_time(8)
 _OP_SCHEMA  = 0x03
 _OP_CHANNEL = 0x04
 _OP_MESSAGE = 0x05
 _OP_CHUNK   = 0x06
 
 # Chunk 记录头: message_start_time(8) + message_end_time(8) + uncompressed_size(8)
-#            + uncompressed_crc(4) + compression(4+n) + records_length(8)
+#            + uncompressed_crc(4) + compression(4+name_len) + records_length(8)
 _CHUNK_HEADER_FIXED = 8 + 8 + 8 + 4 + 4 + 8
 
 _u16 = struct.Struct("<H").unpack_from
@@ -69,7 +70,7 @@ def _play_messages(path: str) -> Iterator[dict[str, int]]:
             header = os.pread(fd, _RECORD_PREFIX, pos)
             if len(header) < _RECORD_PREFIX:
                 break
-            (record_length,) = _u64(header, 1)
+            (top_record_length,) = _u64(header, 1)
             if header[0] == _OP_CHUNK:  # 只有 Chunk 内部才有 Message 记录
                 chunk_file_offset = pos  # chunk 在文件中的绝对偏移，作为定位主键
 
@@ -80,26 +81,27 @@ def _play_messages(path: str) -> Iterator[dict[str, int]]:
                 if compression:  # 只支持未压缩 chunk
                     raise ValueError(f"不支持的 chunk 压缩方式: {compression!r}")
                 (records_length,) = _u64(chunk_head, 32 + name_len)
-                blob = os.pread(fd, records_length,
-                                pos + _RECORD_PREFIX + _CHUNK_HEADER_FIXED + name_len)
+                records_start = pos + _RECORD_PREFIX + _CHUNK_HEADER_FIXED + name_len
+                records_bytes = os.pread(fd, records_length, records_start)
 
-                offset = 0
-                while offset + _RECORD_PREFIX <= len(blob):
-                    (inner_length,) = _u64(blob, offset + 1)
-                    body_at = offset + _RECORD_PREFIX
-                    if body_at + inner_length > len(blob):  # 掉电写坏的半条记录, 到此为止
+                uncompressed_byte_offset = 0
+                while uncompressed_byte_offset + _RECORD_PREFIX <= len(records_bytes):
+                    (inner_record_length,) = _u64(records_bytes, uncompressed_byte_offset + 1)
+                    body_at = uncompressed_byte_offset + _RECORD_PREFIX
+                    # 掉电写坏的半条记录, 到此为止
+                    if body_at + inner_record_length > len(records_bytes):
                         break
-                    inner_op = blob[offset]
+                    inner_op = records_bytes[uncompressed_byte_offset]
 
                     # --- 读取 channel_id -> topic_name, schema_id 映射 ---
                     if inner_op == _OP_CHANNEL:
-                        b = blob[body_at : body_at + inner_length]
+                        b = records_bytes[body_at : body_at + inner_record_length]
                         cid, = _u16(b, 0); sid, = _u16(b, 2); tl, = _u32(b, 4)
                         channel_topics[int(cid)] = b[8 : 8 + tl].decode()
                         channel_schemas[int(cid)] = int(sid)
                     # --- 读取 schema_id -> msg_type 映射 ---
                     elif inner_op == _OP_SCHEMA:
-                        b = blob[body_at : body_at + inner_length]
+                        b = records_bytes[body_at : body_at + inner_record_length]
                         sid, = _u16(b, 0); nl, = _u32(b, 2)
                         name = b[6 : 6 + nl].decode()
                         enc_len, = _u32(b, 6 + nl)
@@ -110,16 +112,18 @@ def _play_messages(path: str) -> Iterator[dict[str, int]]:
 
                     # --- 读取 message, 产出定位信息 ---
                     elif inner_op == _OP_MESSAGE:
-                        cid = _u16(blob, body_at)[0]
+                        cid = _u16(records_bytes, body_at)[0]
                         sid = channel_schemas.get(cid, 0)
                         yield dict(zip(_PER_MESSAGE_KEYS,
-                                       (chunk_file_offset, offset, inner_length,
+                                       (chunk_file_offset,
+                                        uncompressed_byte_offset,
+                                        inner_record_length,                 # record_length
                                         channel_topics.get(cid, str(cid)),   # topic_name
                                         schema_names.get(sid, ""),           # msg_type
                                         schema_msgdefs.get(sid, ""),         # msg_def
-                                        _u64(blob, body_at + 6)[0])))        # log_time
-                    offset = body_at + inner_length
-            pos += _RECORD_PREFIX + record_length
+                                        _u64(records_bytes, body_at + 6)[0])))  # log_time
+                    uncompressed_byte_offset = body_at + inner_record_length
+            pos += _RECORD_PREFIX + top_record_length
     finally:
         os.close(fd)
 
@@ -127,24 +131,53 @@ def _play_messages(path: str) -> Iterator[dict[str, int]]:
 _NAL_START3 = b'\x00\x00\x01'
 
 
-def _iter_nal_types(data: bytes):
-    """Yield NAL unit types in annex-B HEVC data (handles 3- and 4-byte start codes)."""
+def _detect_codec(data: bytes) -> str:
+    """Detect H.264 or H.265 by scanning for codec-exclusive NAL types.
+
+    H.265 VPS/SPS/PPS have types 32/33/34 (6-bit formula: (b >> 1) & 0x3F).
+    H.264 SPS/PPS have types 7/8 (5-bit formula: b & 0x1F).
+    Falls back to 'h265' when no discriminating NAL is found.
+    """
     pos = data.find(_NAL_START3)
     n = len(data)
     while pos != -1 and pos + 3 < n:
-        yield (data[pos + 3] >> 1) & 0x3F
+        b = data[pos + 3]
+        if (b >> 1) & 0x3F in (32, 33, 34):  # H.265 VPS / SPS / PPS
+            return 'h265'
+        if b & 0x1F in (7, 8):               # H.264 SPS / PPS
+            return 'h264'
+        pos = data.find(_NAL_START3, pos + 3)
+    return 'h265'  # 默认与原有行为保持一致
+
+
+def _iter_nal_types(data: bytes, codec: str = 'h265'):
+    """Yield NAL unit types from Annex-B bitstream (handles 3- and 4-byte start codes).
+
+    H.265: nal_unit_type = (b >> 1) & 0x3F (6-bit, 2-byte header).
+    H.264: nal_unit_type = b & 0x1F        (5-bit, 1-byte header).
+    """
+    pos = data.find(_NAL_START3)
+    n = len(data)
+    while pos != -1 and pos + 3 < n:
+        b = data[pos + 3]
+        yield ((b >> 1) & 0x3F) if codec == 'h265' else (b & 0x1F)
         pos = data.find(_NAL_START3, pos + 3)
 
 
 def _has_idr(data: bytes) -> bool:
-    """Check if HEVC data contains an IDR NAL unit (type 19 or 20).
+    """Check if Annex-B data contains an IDR keyframe. Auto-detects H.264/H.265.
 
-    Stops at the first VCL NAL (type < 32): in a single access unit the first
-    VCL NAL determines the picture type, so P-frame packets bail immediately.
+    H.265: IDR types 19 (IDR_W_RADL) / 20 (IDR_N_LP); bails at first VCL (type < 32).
+    H.264: IDR type 5; bails at first VCL (type 1–5).
     """
-    for nal_type in _iter_nal_types(data):
-        if nal_type < 32:
-            return nal_type in (19, 20)
+    codec = _detect_codec(data)
+    for nal_type in _iter_nal_types(data, codec):
+        if codec == 'h265':
+            if nal_type < 32:
+                return nal_type in (19, 20)
+        else:  # h264
+            if 1 <= nal_type <= 5:
+                return nal_type == 5
     return False
 
 
@@ -170,9 +203,6 @@ class MCAP_Player:
     play_messages(), are yielded.
     """
 
-    # channel_id(2) + sequence(4) + log_time(8) + publish_time(8)
-    _MSG_HDR_SIZE = 22
-
     def __init__(self, mcap_url: str):
         self.mcap_url = mcap_url
 
@@ -181,9 +211,10 @@ class MCAP_Player:
         """Read the raw payload bytes of one message (strips the fixed 22-byte message header)."""
         chunk_head = os.pread(fd, _CHUNK_HEADER_FIXED + 64, chunk_file_offset + _RECORD_PREFIX)
         (name_len,) = _u32(chunk_head, 28)
-        blob_start = chunk_file_offset + _RECORD_PREFIX + _CHUNK_HEADER_FIXED + name_len
-        payload_offset = blob_start + uncompressed_byte_offset + _RECORD_PREFIX + self._MSG_HDR_SIZE
-        payload_len = record_length - self._MSG_HDR_SIZE
+        records_start = chunk_file_offset + _RECORD_PREFIX + _CHUNK_HEADER_FIXED + name_len
+        payload_offset = (records_start + uncompressed_byte_offset
+                          + _RECORD_PREFIX + _MESSAGE_HEADER)
+        payload_len = record_length - _MESSAGE_HEADER
         return os.pread(fd, payload_len, payload_offset)
 
     def _accumulate_frames_from_keyframe(
@@ -236,6 +267,9 @@ class MCAP_Player:
                         continue
                 else:
                     locations = [loc]
-                yield topic, msg["msg_type"], msg["msg_def"], msg["log_time"], locations
+                # 将定位整数与时间戳统一转为字符串后对外产出
+                locations_str = [(loc[0], str(loc[1]), str(loc[2]), str(loc[3]))
+                                 for loc in locations]
+                yield topic, msg["msg_type"], msg["msg_def"], str(msg["log_time"]), locations_str
         finally:
             os.close(fd)
