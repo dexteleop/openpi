@@ -17,13 +17,19 @@
 episode_offset 不存进这张原始表: 它属于 finalize 阶段, 由 build_sample_idx.py 用 DuckDB
 在最终 snapshot 上按 (source_id, source_episode_seq) 排序生成。
 
+数据按 "机器人/任务" 两级切分: catalog 名即当前机器人(mcap_config 里选定的 ROBOT),
+namespace 名由该 mcap 的 prompt(任务)派生, 故一台机器人的多个任务各占一个 namespace。
+不合成一张大表是因为 samples 的 STRUCT schema 由机器人的 topic 集合决定, 混表会逼出并集
+schema; 而跨任务的全局编号只依赖元数据列, 由 build_sample_idx.py 在索引阶段统一完成。
+
 用法::
-    table = load_episodes_table(warehouse_dir, topic_names)
+    table = load_episodes_table(warehouse_dir, topic_names, prompt)
     with IcebergEpisodeSaver(table, topic_names) as saver:
         saver.append(EpisodeRecord(source_id, source_episode_seq, samples))
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -33,11 +39,11 @@ import pyarrow as pa
 from pyiceberg.catalog import load_catalog
 from pyiceberg.table import Table
 
+from openpi.training.lingyu_dataloader_v2.mcap_config.config import ROBOT
+
 # Constants
 BATCH_EPISODES = 16          # 每多少个 episode 触发一次 append/commit
-CATALOG_NAME = "lingyu"
-NAMESPACE = "lingyu_dataloader_v2"
-EPISODES_TABLE = f"{NAMESPACE}.episodes"
+EPISODES_TABLE_NAME = "episodes"
 
 # 一条 message 的定位主键, 字段名与 MCAP_Player 产出的 location 四元组逐位对应
 LOCATION_TYPE = pa.struct([
@@ -72,20 +78,28 @@ def build_episodes_schema(topic_names: Sequence[str]) -> pa.Schema:
     ])
 
 
-def load_episodes_table(warehouse_dir: str, topic_names: Sequence[str]) -> Table:
-    """Load (creating on first use) the episodes table in a local sqlite-backed catalog."""
+def prompt_to_namespace(prompt: str) -> str:
+    """Turn a prompt into a valid Iceberg namespace, e.g. "Fold the towels" -> "fold_the_towels"."""
+    return re.sub(r"[^0-9a-z]+", "_", prompt.lower()).strip("_")
+
+
+def load_episodes_table(warehouse_dir: str, topic_names: Sequence[str], prompt: str) -> Table:
+    """Load (creating on first use) the episodes table of one prompt (task) of the current robot."""
     # catalog 由本函数而非 saver 负责, saver 只拿 Table, 与 sqlite/REST/S3 等环境解耦
     warehouse_path = Path(warehouse_dir)
     warehouse_path.mkdir(parents=True, exist_ok=True)
+    # 同一个 catalog.db 用 catalog 名区分机器人, 故换机器人不必另建 warehouse 目录
     catalog = load_catalog(
-        CATALOG_NAME,
+        ROBOT,
         **{"type": "sql",
            "uri": f"sqlite:///{warehouse_path / 'catalog.db'}",
            "warehouse": f"file://{warehouse_path}"},
     )
-    catalog.create_namespace_if_not_exists(NAMESPACE)
+    namespace = prompt_to_namespace(prompt)
+    # namespace 名规范化后不可逆, 故把原始 prompt 原文存进 namespace 属性, 训练时可取回
+    catalog.create_namespace_if_not_exists(namespace, properties={"prompt": prompt})
     return catalog.create_table_if_not_exists(
-        EPISODES_TABLE, schema=build_episodes_schema(topic_names))
+        f"{namespace}.{EPISODES_TABLE_NAME}", schema=build_episodes_schema(topic_names))
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,8 @@
     USER_SELECTED_TOPICS             {标准 topic: obs/state/action}, 键用前需经映射表换成 mcap 名
     TELEAVATAV2_VIDEO_TOPICS_GOP     mcap topic 名, 直接可用
     EPISODE_SIGNAL                   mcap topic 名, 直接可用; {topic_name, start, end}
+    TELEAVATAV2_STATE_and_ACTION_TOPICS_FIELDS
+                                     mcap topic 名, 直接可用; {mcap topic: (所需字段, ...)}
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ ROBOT = "teleavatar_v2" # TODO：选定使用的哪个机器人的mcap
 def load_topics_config() -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
     """返回当前机器人的 (mcap topic 映射表, {用户选定的标准 topic: 角色})。"""
     if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.TELEAVATAR_V2_MCAP_TOPICS_MAPPING, teleavatar_v2.MODEL_SELECTED_TOPICS
+        return teleavatar_v2.MCAP_TOPICS_MAPPING, teleavatar_v2.MODEL_SELECTED_TOPICS
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(
@@ -36,7 +38,7 @@ def load_topics_config() -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
 def load_video_topics_gop() -> dict[str, int]:
     """返回当前机器人的 {视频 topic: GOP 长度}, GOP>1 表示帧间编码, 需回溯到关键帧。"""
     if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.TELEAVATAR_V2_VIDEO_TOPICS_GOP
+        return teleavatar_v2.VIDEO_TOPICS_GOP
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(
@@ -66,9 +68,9 @@ def load_episode_signal() -> dict:
 #####
 
 def load_topics_fields() -> dict[str, tuple[str, ...]]:
-    """返回当前机器人的 {标准 topic: (所需字段, ...)}，供下游按需提取消息字段。"""
+    """返回当前机器人的 {mcap topic: (所需字段, ...)}，键已是 mcap topic 名, 无需映射。"""
     if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.TELEAVATAR_V2_TOPICS_FIELDS
+        return teleavatar_v2.STATE_and_ACTION_TOPICS_FIELDS
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(

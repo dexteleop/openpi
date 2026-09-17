@@ -16,25 +16,33 @@
 主进程持有唯一写者, 无锁竞争。
 进程间 pickle 开销: 相对于每个 mcap 13 GB 的解析时间, 传输开销比例很小。
 
+一个 prompt(任务)一张 Iceberg 表, 由 find_mcap_paths() 返回的 {mcap 路径: prompt} 决定,
+故进程池是全局共享的, 队列元素带上 prompt, 单写线程再按 prompt 分派给对应的 saver。
+
 最终编号阶段::
-    Iceberg 元数据列 -> DuckDB -> ORDER BY (source_id, source_episode_seq) + ROW_NUMBER()
-        -> episode_index.parquet: {episode_id, source_id, source_episode_seq, num_samples,
-                                   episode_offset, sample_offset}
+    各 prompt 表的元数据列 -> 拼成一张 Arrow 表 -> DuckDB
+        -> ORDER BY (prompt, source_id, source_episode_seq) + ROW_NUMBER()
+        -> episode_index.parquet: {prompt, episode_id, source_id, source_episode_seq,
+                                   num_samples, episode_offset, sample_offset}
 episode_offset 是全局连续的 episode 编号, sample_offset 是该 episode 首个 sample 的全局编号,
 故全局 sample 编号 s 属于满足 sample_offset <= s < sample_offset + num_samples 的那个 episode,
 其局部 sample_idx 为 s - sample_offset。
+编号跨全部 prompt 只产出一份索引: Iceberg 的 namespace 不参与编号, prompt 列即定位表的坐标。
 编号只读 Iceberg 的元数据列, 不碰 samples 这根巨大的列, 因此与数据量无关。
 """
 from __future__ import annotations
 
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
+from itertools import islice
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Queue
 from threading import Thread
 
 import duckdb
+import pyarrow as pa
 
 from openpi.training.lingyu_dataloader_v2.mcap_sample_extractor import MCAPSampleExtractor
 from openpi.training.lingyu_dataloader_v2.utils.pyiceberg_saver import (
@@ -55,11 +63,12 @@ _QUEUE_END = object()           # 采集全部结束的哨兵, 通知写线程�
 # 绝不用 parquet 行位置或 Iceberg commit 顺序当编号依据, 那两者都会随重跑而变。
 _GLOBAL_INDEX_SQL = """
 WITH unique_episodes AS (
-    SELECT DISTINCT ON (episode_id)
-           episode_id, source_id, source_episode_seq, num_samples
+    SELECT DISTINCT ON (prompt, episode_id)
+           prompt, episode_id, source_id, source_episode_seq, num_samples
     FROM episodes_meta
 )
-SELECT episode_id,
+SELECT prompt,
+       episode_id,
        source_id,
        source_episode_seq,
        num_samples,
@@ -67,11 +76,12 @@ SELECT episode_id,
        SUM(num_samples) OVER episode_order - num_samples   AS sample_offset
 FROM unique_episodes
 WINDOW episode_order AS (
-    ORDER BY source_id, source_episode_seq
+    ORDER BY prompt, source_id, source_episode_seq
     ROWS UNBOUNDED PRECEDING
 )
 ORDER BY episode_offset
 """
+_INDEX_META_FIELDS = ("episode_id", "source_id", "source_episode_seq", "num_samples")
 
 logger = logging.getLogger(__name__)
 
@@ -94,47 +104,56 @@ def extract_episodes_for_mcap(mcap_url: str) -> list[EpisodeRecord]:
     return episodes
 
 
-def save_episodes_from_queue(episode_queue: Queue, saver: IcebergEpisodeSaver,
+def save_episodes_from_queue(episode_queue: Queue, savers: dict[str, IcebergEpisodeSaver],
                              commit_errors: list) -> None:
-    """Drain the queue into the saver until the end sentinel arrives."""
+    """Drain the queue into the saver of each episode's prompt until the end sentinel arrives."""
     while True:
-        episode = episode_queue.get()
-        if episode is _QUEUE_END:
+        item = episode_queue.get()
+        if item is _QUEUE_END:
             return
+        prompt, episode = item
         try:
-            saver.append(episode)
+            savers[prompt].append(episode)
         except Exception as commit_error:
             # commit 失败仍要继续排空队列, 否则 feeder 线程会卡死在满队列上; 错误交主线程抛出
             commit_errors.append(commit_error)
 
 
-def build_episodes_table(mcap_urls: list[str], warehouse_dir: str = WAREHOUSE_DIR):
+def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WAREHOUSE_DIR) -> dict:
     """Extract all mcaps in parallel worker processes and write episodes to Iceberg.
 
+    mcap_prompts is find_mcap_paths()'s {mcap path: prompt}; one prompt is one table.
     Architecture: spawn process pool (breaks GIL for CPU-bound MCAP parsing) feeds
-    a bounded queue; a single writer thread drains it into IcebergEpisodeSaver so
-    the sqlite catalog is never written from two threads at once.
+    a bounded queue; a single writer thread drains it into the per-prompt
+    IcebergEpisodeSaver so the sqlite catalog is never written from two threads at once.
+    Returns {prompt: Table}.
     """
     topic_names = sorted(filter_topics())   # 排序: 同一套 topic 每次都得到同一个 schema
-    table = load_episodes_table(warehouse_dir, topic_names)
+    tables = {prompt: load_episodes_table(warehouse_dir, topic_names, prompt)
+              for prompt in dict.fromkeys(mcap_prompts.values())}
     episode_queue = Queue(maxsize=QUEUE_CAPACITY)
     commit_errors: list = []
 
-    with IcebergEpisodeSaver(table, topic_names) as saver:
+    # ExitStack 同时持有各 prompt 的 saver: 出错时它们一律不 flush, 与单 saver 时语义一致
+    with ExitStack() as saver_stack:
+        savers = {prompt: saver_stack.enter_context(IcebergEpisodeSaver(table, topic_names))
+                  for prompt, table in tables.items()}
         writer_thread = Thread(target=save_episodes_from_queue,
-                               args=(episode_queue, saver, commit_errors), daemon=True)
+                               args=(episode_queue, savers, commit_errors), daemon=True)
         writer_thread.start()
 
         mp_ctx = get_context("spawn")
         with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=mp_ctx) as pool:
             future_to_url = {pool.submit(extract_episodes_for_mcap, url): url
-                             for url in mcap_urls}
+                             for url in mcap_prompts}
             for future in as_completed(future_to_url):
+                mcap_url = future_to_url[future]
                 try:
                     for episode in future.result():
-                        episode_queue.put(episode)  # blocks if queue is full -> back-pressure
+                        # blocks if queue is full -> back-pressure
+                        episode_queue.put((mcap_prompts[mcap_url], episode))
                 except Exception as extract_error:
-                    logger.error(f"error: {future_to_url[future]}: {extract_error}")
+                    logger.error(f"error: {mcap_url}: {extract_error}")
 
         episode_queue.put(_QUEUE_END)
         writer_thread.join()        # 等写线程把队列排空, 之后 __exit__ 再 flush 尾批
@@ -142,16 +161,21 @@ def build_episodes_table(mcap_urls: list[str], warehouse_dir: str = WAREHOUSE_DI
         if commit_errors:
             raise commit_errors[0]
 
-    logger.info(f"saved {saver.num_episodes} episodes in {saver.num_commits} snapshots "
-                f"to {warehouse_dir}")
-    return table
+    logger.info(f"saved {sum(saver.num_episodes for saver in savers.values())} episodes in "
+                f"{sum(saver.num_commits for saver in savers.values())} snapshots "
+                f"to {warehouse_dir} ({len(savers)} prompts)")
+    return tables
 
 
-def build_global_index(table, warehouse_dir: str = WAREHOUSE_DIR) -> str:
-    """Number every episode/sample globally with DuckDB and write episode_index.parquet."""
-    # 只取元数据列, samples 那根巨大的列完全不读
-    episodes_meta = table.scan(selected_fields=(
-        "episode_id", "source_id", "source_episode_seq", "num_samples")).to_arrow()
+def build_global_index(tables: dict, warehouse_dir: str = WAREHOUSE_DIR) -> str:
+    """Number every episode/sample of all prompts globally and write one episode_index.parquet."""
+    # 各 prompt 表只取元数据列(samples 那根巨大的列完全不读), 补一列 prompt 后拼成一张 Arrow 表
+    prompt_metas = []
+    for prompt, table in tables.items():
+        meta = table.scan(selected_fields=_INDEX_META_FIELDS).to_arrow()
+        prompt_metas.append(
+            meta.append_column("prompt", pa.array([prompt] * meta.num_rows, pa.string())))
+    episodes_meta = pa.concat_tables(prompt_metas)
     index_path = str(Path(warehouse_dir) / GLOBAL_INDEX_NAME)
 
     with duckdb.connect() as duck_conn:
@@ -162,14 +186,16 @@ def build_global_index(table, warehouse_dir: str = WAREHOUSE_DIR) -> str:
             f"SELECT count(*), sum(num_samples) FROM ({_GLOBAL_INDEX_SQL})").fetchone()
 
     logger.info(f"global index: {total_episodes} episodes, {total_samples} samples "
-                f"-> {index_path}")
+                f"over {len(tables)} prompts -> {index_path}")
     return index_path
 
 
 def build_all(num_mcaps: int = 64, warehouse_dir: str = WAREHOUSE_DIR) -> str:
     """Extract the first num_mcaps mcaps into Iceberg, then build the global index."""
-    table = build_episodes_table(find_mcap_paths()[:num_mcaps], warehouse_dir)
-    return build_global_index(table, warehouse_dir)
+    # find_mcap_paths() 返回 {mcap 路径: prompt}, 截取时要连 prompt 一起留下
+    mcap_prompts = dict(islice(find_mcap_paths().items(), num_mcaps))
+    tables = build_episodes_table(mcap_prompts, warehouse_dir)
+    return build_global_index(tables, warehouse_dir)
 
 
 if __name__ == "__main__":
