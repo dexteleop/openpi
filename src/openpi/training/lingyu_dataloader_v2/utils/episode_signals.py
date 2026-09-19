@@ -9,10 +9,10 @@ EPISODE_SIGNAL 里写的已是 mcap 中实际存在的 topic 名, 无需经映�
     signal_topic, start_button_idx, end_button_idx = set_episode_signal()
 """
 from __future__ import annotations
-from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_episode_signal
+from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_mcap_episode_topic_signal
 
 
 def set_episode_signal() -> tuple[str, int, int]:
     """把 EPISODE_SIGNAL 拆成 (signal_topic, start_button_idx, end_button_idx)。"""
-    episode_signal = load_episode_signal()
+    episode_signal = load_mcap_episode_topic_signal()
     return episode_signal["topic_name"], episode_signal["start"], episode_signal["end"]

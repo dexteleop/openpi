@@ -21,8 +21,8 @@ from __future__ import annotations
 import os
 import struct
 from typing import Iterator
-from openpi.training.lingyu_dataloader_v2.utils.topics_filter import filter_topics
-from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_video_topics_gop
+from openpi.training.lingyu_dataloader_v2.utils.mcap_topics_filter import filter_topics
+from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_mcap_video_topics_gop
 
 # 每个message需要得到的信息
 _PER_MESSAGE_KEYS = (
@@ -248,7 +248,7 @@ class MCAP_Player:
                       这些 topic 不属于训练数据, 故不写进 USER_SELECTED_TOPICS。
         """
         selected_mcap_topics = filter_topics().keys() | set(extra_topics)
-        mcap_video_topics_gop = load_video_topics_gop()  # 键已是 mcap topic 名, 无需映射
+        mcap_video_topics_gop = load_mcap_video_topics_gop()  # 键已是 mcap topic 名, 无需映射
         ffmpeg_buffers: dict[str, list] = {}
         fd = os.open(self.mcap_url, os.O_RDONLY)
         try:

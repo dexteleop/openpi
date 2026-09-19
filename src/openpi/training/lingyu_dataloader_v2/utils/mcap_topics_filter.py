@@ -13,7 +13,7 @@ USER_SELECTED_TOPICS 里写的是 TeleAvatarV2 的标准 topic 名, 不同机器
         ...
 """
 from __future__ import annotations
-from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_topics_config
+from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_mcap_topics_config
 
 
 def filter_topics() -> dict[str, str]:
@@ -23,7 +23,7 @@ def filter_topics() -> dict[str, str]:
     一个标准 topic 可映射到多个 mcap topic, 它们共享该标准 topic 的角色;
     用户选定了映射表里没登记的标准 topic 时直接 assert, 不继续运行。
     """
-    mcap_topics_mapping, user_selected_topics = load_topics_config()
+    mcap_topics_mapping, user_selected_topics = load_mcap_topics_config()
     unregistered_topics = sorted(user_selected_topics.keys() - mcap_topics_mapping.keys())
     assert not unregistered_topics, \
         f"USER_SELECTED_TOPICS 中这些 Standard topic 未登记在映射表中: {unregistered_topics}"

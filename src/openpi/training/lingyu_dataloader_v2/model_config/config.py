@@ -5,6 +5,8 @@
 
 每个模型配置文件必须提供同名的常量:
     ACTION_CHUNK_LENGTH  一个 sample 的动作序列长度, 即 [当前动作, 后续 n-1 个动作] 的长度
+    STATE_CONCAT / ACTION_CONCAT
+                         ((mcap topic, 字段名), ...), 即 state/action 向量的拼接顺序
 """
 from __future__ import annotations
 
@@ -22,6 +24,22 @@ def load_action_chunk_length() -> int:
     """返回当前模型一个 sample 的动作序列长度(含当前动作)。"""
     if MODEL == "pi0":
         return pi0.ACTION_CHUNK_LENGTH
+    # TODO： elif 其他模型的常量配置
+    else:
+        raise ValueError(
+            f"Cannot find the relevant model configuration of {MODEL!r} "
+            f"in lingyu_dataloader_v2/model_config."
+        )
+
+
+#####
+# 加载 state / action 向量的拼接顺序
+#####
+
+def load_state_and_action_concat() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
+    """返回当前模型的 (STATE_CONCAT, ACTION_CONCAT), 元素为 (mcap topic, 字段名)。"""
+    if MODEL == "pi0":
+        return pi0.STATE_CONCAT, pi0.ACTION_CONCAT
     # TODO： elif 其他模型的常量配置
     else:
         raise ValueError(

@@ -2,10 +2,18 @@
 # Licensed under the MIT License.
 # See LICENSE file in the project root for full license information.
 
-"""把 MCAPSampleExtractor 产出的 episode 攒成批, 每批一次 Iceberg commit。
+"""把 MCAPSampleExtractor 产出的一批 episode 写成一个 Iceberg snapshot。
 
-保存链路(详见 pyiceberg_saver_readme.md)::
-    Python objects -> PyArrow Table(BATCH_EPISODES 行) -> table.append() -> 一次 snapshot
+保存链路, 两阶段, 跨进程::
+    worker 进程  EpisodeParquetWriter.write(): 一个 episode -> 一行 -> 一个 row group
+                                               攒够 roll_episodes 行就关文件, 交出路径
+    主进程      IcebergEpisodeSaver.extend(): table.add_files(路径) -> 一次 snapshot
+
+之所以拆成两阶段: Arrow 转换占了整个保存开销的 95% 且是持 GIL 的纯 Python, 多线程实测
+零加速(1.00x), 只有放进 worker 进程才真并行; add_files 只登记文件不重写数据, 主进程一次
+调用仅 0.12 s。队列里因此只需要传文件路径, 不必把 episode 数据 pickle 回主进程。
+之所以逐个 episode 增量写而不是攒一批再写: worker 的内存占用就此与文件行数无关, 恒等于
+一个 episode(实测 RSS 平稳在 +0.11 GB), 于是文件想攒多大都行, commit 次数可以压得很低。
 
 一行就是一个 episode::
     episode_id          string  = "{source_id}:{source_episode_seq:08d}", 全局稳定唯一, 供重试去重
@@ -24,25 +32,31 @@ schema; 而跨任务的全局编号只依赖元数据列, 由 build_sample_idx.p
 
 用法::
     table = load_episodes_table(warehouse_dir, topic_names, prompt)
-    with IcebergEpisodeSaver(table, topic_names) as saver:
-        saver.append(EpisodeRecord(source_id, source_episode_seq, samples))
+    # worker 进程里
+    writer = EpisodeParquetWriter(table, topic_names, roll_episodes)
+    closed = writer.write(EpisodeRecord(...))   # 写满一个文件时返回 (路径, episode 数)
+    closed = writer.close()                     # 收尾, 交出最后那个不满的文件
+    # 主进程里
+    IcebergEpisodeSaver(table).extend([path], num_episodes)
+
+一个 parquet 攒多少个 episode 由调用方决定, 见 build_sample_idx.EPISODES_PER_PARQUET。
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
 from typing import Any, Sequence
+from uuid import uuid4
 
 import pyarrow as pa
-from pyiceberg.catalog import load_catalog
+import pyarrow.parquet as pq
+from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.table import Table
 
 from openpi.training.lingyu_dataloader_v2.mcap_config.config import ROBOT
 
 # Constants
-BATCH_EPISODES = 16          # 每多少个 episode 触发一次 append/commit
 EPISODES_TABLE_NAME = "episodes"
 
 # 一条 message 的定位主键, 字段名与 MCAP_Player 产出的 location 四元组逐位对应
@@ -83,18 +97,23 @@ def prompt_to_namespace(prompt: str) -> str:
     return re.sub(r"[^0-9a-z]+", "_", prompt.lower()).strip("_")
 
 
-def load_episodes_table(warehouse_dir: str, topic_names: Sequence[str], prompt: str) -> Table:
-    """Load (creating on first use) the episodes table of one prompt (task) of the current robot."""
+def load_episodes_catalog(warehouse_dir: str) -> Catalog:
+    """Open (creating the warehouse dir on first use) the current robot's sqlite-backed catalog."""
     # catalog 由本函数而非 saver 负责, saver 只拿 Table, 与 sqlite/REST/S3 等环境解耦
     warehouse_path = Path(warehouse_dir)
     warehouse_path.mkdir(parents=True, exist_ok=True)
     # 同一个 catalog.db 用 catalog 名区分机器人, 故换机器人不必另建 warehouse 目录
-    catalog = load_catalog(
+    return load_catalog(
         ROBOT,
         **{"type": "sql",
            "uri": f"sqlite:///{warehouse_path / 'catalog.db'}",
            "warehouse": f"file://{warehouse_path}"},
     )
+
+
+def load_episodes_table(warehouse_dir: str, topic_names: Sequence[str], prompt: str) -> Table:
+    """Load (creating on first use) the episodes table of one prompt (task) of the current robot."""
+    catalog = load_episodes_catalog(warehouse_dir)
     namespace = prompt_to_namespace(prompt)
     # namespace 名规范化后不可逆, 故把原始 prompt 原文存进 namespace 属性, 训练时可取回
     catalog.create_namespace_if_not_exists(namespace, properties={"prompt": prompt})
@@ -148,56 +167,71 @@ def _episode_to_row(episode: EpisodeRecord, topic_names: Sequence[str]) -> dict[
     }
 
 
-class IcebergEpisodeSaver:
-    """Buffer episodes in memory and commit them to Iceberg BATCH_EPISODES at a time."""
+class EpisodeParquetWriter:
+    """Append episodes to one parquet file, rolling to a new file every roll_episodes.
 
-    def __init__(self, table: Table, topic_names: Sequence[str],
-                 batch_episodes: int = BATCH_EPISODES):
-        assert batch_episodes > 0, f"batch_episodes 必须为正: {batch_episodes}"
+    Meant to run inside the worker process: from_pylist is pure Python and holds the
+    GIL, so it only goes parallel across processes, never across threads.
+    One episode is one row, written as its own row group, so the worker only ever holds
+    a single episode in memory no matter how many rows the file ends up with.
+    A file is not part of the table until the parent registers it via add_files().
+    """
+
+    def __init__(self, table: Table, topic_names: Sequence[str], roll_episodes: int):
+        assert roll_episodes > 0, f"roll_episodes 必须为正: {roll_episodes}"
         self._table = table
         self._topic_names = tuple(topic_names)
-        self._batch_episodes = batch_episodes
+        self._roll_episodes = roll_episodes
         self._arrow_schema = build_episodes_schema(self._topic_names)
 
-        self._buffer: list[EpisodeRecord] = []
-        self._lock = Lock()         # 只保护内存 buffer; 耗时的 commit 在锁外做
-        self.num_episodes = 0       # 已 commit 的 episode 总数
+        self._writer: pq.ParquetWriter | None = None
+        self._output_stream = None
+        self._path = ""
+        self._num_episodes = 0      # 当前文件里已写入的 episode 数
+
+    def write(self, episode: EpisodeRecord) -> tuple[str, int] | None:
+        """Write one episode; return (path, episode count) when the file just rolled."""
+        if self._writer is None:
+            # uuid 文件名: 几十个 worker 同时写同一个 data 目录, 靠它保证互不覆盖
+            self._path = f"{self._table.location().rstrip('/')}/data/{uuid4()}.parquet"
+            self._output_stream = self._table.io.new_output(self._path).create(overwrite=False)
+            self._writer = pq.ParquetWriter(self._output_stream, self._arrow_schema,
+                                            compression="zstd")
+        # 一行一个 row group: 训练时按 episode 取数, 读一个 row group 就够, 无读放大
+        self._writer.write_table(pa.Table.from_pylist(
+            [_episode_to_row(episode, self._topic_names)], schema=self._arrow_schema))
+        self._num_episodes += 1
+        return self.close() if self._num_episodes >= self._roll_episodes else None
+
+    def close(self) -> tuple[str, int] | None:
+        """Finish the current file (if any) and return (path, episode count)."""
+        if self._writer is None:
+            return None
+        self._writer.close()
+        self._output_stream.close()
+        self._writer, self._output_stream = None, None
+        # 先取走再归零: 下一个 episode 会开一个新文件
+        closed = (self._path, self._num_episodes)
+        self._num_episodes = 0
+        return closed
+
+
+class IcebergEpisodeSaver:
+    """Register worker-written parquet files into the table, one snapshot per call."""
+
+    def __init__(self, table: Table):
+        self._table = table
+        self.num_episodes = 0       # 已注册的 episode 总数
         self.num_commits = 0        # 已产生的 snapshot 数
 
-    def append(self, episode: EpisodeRecord) -> None:
-        """Add one episode, committing a batch once the buffer is full."""
-        with self._lock:
-            self._buffer.append(episode)
-            batch = None
-            if len(self._buffer) >= self._batch_episodes:
-                batch, self._buffer = self._buffer, []
-        if batch:
-            self._commit_batch(batch)
-
-    def flush(self) -> None:
-        """Commit the remaining episodes that did not fill a whole batch."""
-        with self._lock:
-            batch, self._buffer = self._buffer, []
-        if batch:
-            self._commit_batch(batch)
-
-    def _commit_batch(self, episodes: Sequence[EpisodeRecord]) -> None:
-        """Write one batch as a single Arrow table -> one Iceberg snapshot."""
-        arrow_table = pa.Table.from_pylist(
-            [_episode_to_row(episode, self._topic_names) for episode in episodes],
-            schema=self._arrow_schema,
+    def extend(self, parquet_paths: Sequence[str], num_episodes: int) -> None:
+        """Register already-written parquet files as one Iceberg snapshot."""
+        # add_files 只登记文件不重写数据; 路径带 uuid 不可能重复, 故关掉那次全表扫描
+        self._table.add_files(
+            file_paths=list(parquet_paths),
+            snapshot_properties={"writer": "lingyu-episode-saver",
+                                 "episode-count": str(num_episodes)},
+            check_duplicate_files=False,
         )
-        self._table.append(arrow_table, snapshot_properties={
-            "writer": "lingyu-episode-saver",
-            "episode-count": str(len(episodes)),
-        })
-        self.num_episodes += len(episodes)
+        self.num_episodes += num_episodes
         self.num_commits += 1
-
-    def __enter__(self) -> "IcebergEpisodeSaver":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        # 出错时不 flush: 半截 batch 留在内存里作废, 避免把不完整的采集结果写成 snapshot
-        if exc_type is None:
-            self.flush()

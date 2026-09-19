@@ -20,10 +20,10 @@ ROBOT = "teleavatar_v2" # TODO：选定使用的哪个机器人的mcap
 
 
 #####
-# 用于 MCAP_Player 播放 topic 的索引
+# 用于 MCAP_Player 播放 mcap topic 的索引
 #####
 
-def load_topics_config() -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
+def load_mcap_topics_config() -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
     """返回当前机器人的 (mcap topic 映射表, {用户选定的标准 topic: 角色})。"""
     if ROBOT == "teleavatar_v2":
         return teleavatar_v2.MCAP_TOPICS_MAPPING, teleavatar_v2.MODEL_SELECTED_TOPICS
@@ -35,10 +35,10 @@ def load_topics_config() -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
         )
 
 
-def load_video_topics_gop() -> dict[str, int]:
+def load_mcap_video_topics_gop() -> dict[str, int]:
     """返回当前机器人的 {视频 topic: GOP 长度}, GOP>1 表示帧间编码, 需回溯到关键帧。"""
     if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.VIDEO_TOPICS_GOP
+        return teleavatar_v2.MCAP_VIDEO_TOPICS_GOP
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(
@@ -51,10 +51,10 @@ def load_video_topics_gop() -> dict[str, int]:
 # 用于 episode 确定起始和结束
 #####
 
-def load_episode_signal() -> dict:
+def load_mcap_episode_topic_signal() -> dict:
     """返回当前机器人标记 episode 起止的按键信号 {topic_name, start, end}。"""
     if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.EPISODE_SIGNAL
+        return teleavatar_v2.MCAP_EPISODE_TOPIC_SIGNAL
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(
@@ -64,13 +64,13 @@ def load_episode_signal() -> dict:
 
 
 #####
-# 用于 topic message 确定其中的字段
+# 用于 state and action topic message 确定其中的字段
 #####
 
-def load_topics_fields() -> dict[str, tuple[str, ...]]:
+def load_mcap_state_and_action_topics_fields() -> dict[str, tuple[str, ...]]:
     """返回当前机器人的 {mcap topic: (所需字段, ...)}，键已是 mcap topic 名, 无需映射。"""
     if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.STATE_and_ACTION_TOPICS_FIELDS
+        return teleavatar_v2.MCAP_STATE_and_ACTION_TOPICS_FIELDS
     # TODO： elif 其他机器人的常量配置
     else:
         raise ValueError(

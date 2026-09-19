@@ -98,7 +98,7 @@ MODEL_SELECTED_TOPICS = { # 标准topic: 该topic在训练样本中的角色 obs
 ######
 
 # Video Decoder Config
-VIDEO_TOPICS_GOP = { # MCAP topics
+MCAP_VIDEO_TOPICS_GOP = { # MCAP topics
     '/xr_video_topic/ffmpeg': 45,
     '/right/color/image_raw/ffmpeg': 45,
     '/left/color/image_raw/ffmpeg': 45,
@@ -106,7 +106,7 @@ VIDEO_TOPICS_GOP = { # MCAP topics
 
 
 # Sample Extractor Config
-EPISODE_SIGNAL = { # MCAP topic
+MCAP_EPISODE_TOPIC_SIGNAL = { # MCAP topic
     'topic_name': '/xr/left_hand_inputs',
     'start': 2,   # 数组idx为2的数是否出现变化沿
     'end': 3,     # 数组idx为3的数是否出现变化沿
@@ -114,7 +114,7 @@ EPISODE_SIGNAL = { # MCAP topic
 
 
 # State and Action Message Filter Config
-STATE_and_ACTION_TOPICS_FIELDS = { # MCAP topic: 所需消息字段 (嵌套字段用 flatten_msg 的点分路径表示)
+MCAP_STATE_and_ACTION_TOPICS_FIELDS = { # MCAP topic: 所需消息字段 (嵌套字段用 flatten_msg 的点分路径表示)
     # 双臂 state — sensor_msgs/JointState
     '/left_arm/joint_states':        ('position',),
     '/right_arm/joint_states':       ('position',),

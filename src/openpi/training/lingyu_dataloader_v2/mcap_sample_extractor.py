@@ -41,7 +41,7 @@ import traceback
 
 from openpi.training.lingyu_dataloader_v2.utils.mcap_player import MCAP_Player
 from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import MCAP_Message_Fetcher
-from openpi.training.lingyu_dataloader_v2.utils.topics_filter import filter_topics
+from openpi.training.lingyu_dataloader_v2.utils.mcap_topics_filter import filter_topics
 from openpi.training.lingyu_dataloader_v2.utils.episode_signals import set_episode_signal
 from openpi.training.lingyu_dataloader_v2.model_config.config import load_action_chunk_length
 

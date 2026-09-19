@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_topics_fields
+from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_mcap_state_and_action_topics_fields
 
 
 def ros2_message_filter(mcap_topic_name: str, ros2_message) -> dict[str, np.ndarray]:
@@ -25,7 +25,7 @@ def ros2_message_filter(mcap_topic_name: str, ros2_message) -> dict[str, np.ndar
     topic 未登记在配置中时直接 assert, 不静默返回空数据。
     """
     # 1. 查配置: 这个 topic 的 message 要取哪几个字段
-    state_and_action_fields = load_topics_fields()
+    state_and_action_fields = load_mcap_state_and_action_topics_fields()
     assert mcap_topic_name in state_and_action_fields, \
         f"{mcap_topic_name} 未登记在 STATE_and_ACTION_TOPICS_FIELDS 中, 无法确定取哪个字段"
     selected_fields = state_and_action_fields[mcap_topic_name]
