@@ -18,7 +18,7 @@ Arrow 转换放 worker 而非主进程: 它占保存开销的 95% 且是持 GIL 
 零加速(1.00x), 只有跨进程才真并行; 顺带队列里也不必再 pickle episode 数据。
 主进程只做 add_files: 登记文件不重写数据, 单次 0.12 s, 不会成为瓶颈。
 
-一个 prompt(任务)一张 Iceberg 表, 由 find_mcap_paths() 返回的 {mcap 路径: prompt} 决定,
+一个 prompt(任务)一张 Iceberg 表, 由 find_mcap_urls() 返回的 {mcap url: prompt} 决定,
 故进程池是全局共享的, 队列元素带上 prompt, 单写线程再按 prompt 分派给对应的 saver。
 
 最终编号阶段::
@@ -51,7 +51,7 @@ import pyarrow as pa
 from openpi.training.lingyu_dataloader_v2.mcap_sample_extractor import MCAPSampleExtractor
 from openpi.training.lingyu_dataloader_v2.utils.pyiceberg_saver import (
     EpisodeParquetWriter, EpisodeRecord, IcebergEpisodeSaver, load_episodes_table)
-from openpi.training.lingyu_dataloader_v2.utils.search_mcap_paths import find_mcap_paths
+from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import find_mcap_url_and_prompt_pairs
 from openpi.training.lingyu_dataloader_v2.utils.mcap_topics_filter import filter_topics
 
 # Constants
@@ -159,7 +159,7 @@ def register_parquets_from_queue(parquet_queue, savers: dict[str, IcebergEpisode
 def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WAREHOUSE_DIR) -> dict:
     """Extract all mcaps in parallel worker processes and write episodes to Iceberg.
 
-    mcap_prompts is find_mcap_paths()'s {mcap path: prompt}; one prompt is one table.
+    mcap_prompts is find_mcap_urls()'s {mcap url: prompt}; one prompt is one table.
     Architecture: resident spawn worker processes parse mcaps and write parquet files
     (both steps are GIL-bound, so they only parallelise across processes); the parent
     is the single consumer and only registers those files, one snapshot per file.
@@ -227,8 +227,8 @@ def build_global_index(tables: dict, warehouse_dir: str = WAREHOUSE_DIR) -> str:
 
 def build_all() -> str:
     """Extract the first num_mcaps mcaps into Iceberg, then build the global index."""
-    # find_mcap_paths() 返回 {mcap 路径: prompt}, 截取时要连 prompt 一起留下
-    mcap_prompts = dict(islice(find_mcap_paths().items(), MAX_MCAP_WORKERS))
+    # find_mcap_urls() 返回 {mcap url: prompt}, 截取时要连 prompt 一起留下
+    mcap_prompts = dict(islice(find_mcap_url_and_prompt_pairs().items(), MAX_MCAP_WORKERS))
     tables = build_episodes_table(mcap_prompts, WAREHOUSE_DIR)
     return build_global_index(tables, WAREHOUSE_DIR)
 
