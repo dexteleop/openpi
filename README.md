@@ -95,7 +95,7 @@ Once uv is installed, run the following to set up the environment:
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-GIT_LFS_SKIP_SMUDGE=1 uv pip install boto3 mcap rosbags duckdb pyiceberg "pyiceberg[sql-sqlite]"
+GIT_LFS_SKIP_SMUDGE=1 uv pip install boto3 mcap rosbags duckdb pyiceberg "pyiceberg[sql-sqlite]" openai
 GIT_LFS_SKIP_SMUDGE=1 uv pip install webdataset
 ```
 
