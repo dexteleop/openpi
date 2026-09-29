@@ -1,11 +1,19 @@
 from __future__ import annotations
 from functools import lru_cache
+import logging
 import struct
+import threading
+import time
 from typing import Any
+
+from botocore.awsrequest import AWSHTTPConnection, AWSHTTPSConnection
+from botocore.config import Config
 
 from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import (
     BUCKET_NAME, make_client
 )
+
+logger = logging.getLogger(__name__)
 
 
 ##########
@@ -80,17 +88,100 @@ u64 = struct.Struct("<Q").unpack_from # 8 bytes -> int
 ##########
 # 对象存储读取函数
 ##########
+# 单进程连接池上限: 超过该数的并发请求仍会新建连接, 但用完即关闭, 无法复用
+S3_MAX_POOL_CONNECTIONS = 200
+
+# 当前线程最近一次新建 TCP 连接的耗时(ms); None 表示本次请求复用了池内空闲连接
+_tcp_connect_local = threading.local()
+# http / https 连接都继承 urllib3 的同一个 _new_conn(DNS 解析 + TCP 三次握手)
+_new_conn_original = AWSHTTPConnection._new_conn
+assert AWSHTTPSConnection._new_conn is _new_conn_original, "botocore 连接类结构已变化"
+
+
+def _new_conn_timed(self):
+    """包装 urllib3 建连, 把真实建连耗时写入当前线程; get_object 在调用线程内同步建连, 多线程互不干扰"""
+    connect_start = time.perf_counter()
+    sock = _new_conn_original(self)
+    _tcp_connect_local.connect_ms = (time.perf_counter() - connect_start) * 1000
+    return sock
+
+
+# 只替换 botocore 自己的连接子类, 不影响进程内其他 urllib3 用户
+AWSHTTPConnection._new_conn = _new_conn_timed
+AWSHTTPSConnection._new_conn = _new_conn_timed
+
+
 @lru_cache(maxsize=1)
 def s3_client():
     """boto3 client 内部带连接池, 全进程复用一个即可"""
-    return make_client()
+    return make_client(Config(max_pool_connections=S3_MAX_POOL_CONNECTIONS))
+
+
+def pool_stats() -> list[dict[str, Any]]:
+    """读取 s3_client() 各连接池(每个 host:port 一个)的实时状态
+
+    idle: 池内空闲连接数; in_use: 被取走的池位数(上限 maxsize, 溢出的临时连接不计入)
+    created / requests: 累计新建连接数 / 累计请求数
+    依赖 botocore / urllib3 私有属性, 升级后结构变化时由 assert 直接报错
+    """
+    http_session = getattr(getattr(s3_client(), "_endpoint", None), "http_session", None)
+    manager = getattr(http_session, "_manager", None)
+    assert manager is not None and hasattr(manager, "pools"), "botocore 内部结构已变化, 无法读取连接池"
+
+    stats = []
+    for pool_key in manager.pools.keys():
+        conn_pool = manager.pools.get(pool_key)
+        if conn_pool is None or conn_pool.pool is None:  # 池已被淘汰或已关闭
+            continue
+        # 持队列锁取快照, 避免与其他线程的取/还连接交错; 锁内不能再调 qsize()(同一把非重入锁)
+        with conn_pool.pool.mutex:
+            idle_count = sum(conn is not None for conn in conn_pool.pool.queue)
+            in_use_count = conn_pool.pool.maxsize - len(conn_pool.pool.queue)
+        stats.append({
+            "host":     f"{conn_pool.host}:{conn_pool.port}",
+            "maxsize":  conn_pool.pool.maxsize,
+            "idle":     idle_count,
+            "in_use":   in_use_count,
+            "created":  conn_pool.num_connections,
+            "requests": conn_pool.num_requests,
+        })
+    return stats
+
+
+def _log_fetch_timing(mcap_url: str, offset: int, data_size: int,
+                      request_start: float, header_received: float, read_end: float) -> None:
+    """DEBUG 输出单次 range 读取的建连 / 首字节 / 传输耗时、吞吐与连接池状态"""
+    connect_ms = getattr(_tcp_connect_local, "connect_ms", None)
+    transfer_sec = read_end - header_received
+    throughput_mbps = data_size / (1024 * 1024) / transfer_sec if transfer_sec > 0 else 0.0
+    logger.debug(
+        "fetch key=%s offset=%d bytes=%d tcp=%s ttfb=%.3fms transfer=%.3fms "
+        "total=%.3fms throughput=%.2fMB/s pool=%s",
+        mcap_url, offset, data_size,
+        f"{connect_ms:.3f}ms(新建)" if connect_ms is not None else "复用",
+        (header_received - request_start) * 1000, transfer_sec * 1000,
+        (read_end - request_start) * 1000, throughput_mbps, pool_stats())
 
 
 def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
-    """按 byte range 读取桶内字节流"""
+    """按 byte range 读取桶内字节流; logger 开启 DEBUG 时记录本次读取的计时与连接池状态
+
+    ttfb 从发请求到响应头返回(含可能的建连、签名与服务端处理), transfer 为读取响应体耗时。
+    读到文件尾时 S3 会截断 range, 返回字节数可能小于 length(_play_messages 依赖此行为)
+    """
+    # length<=0 会拼出非法 Range, S3 可能直接返回整个对象
+    assert length > 0 and offset >= 0, f"非法读取范围: length={length}, offset={offset}"
     byte_range = f"bytes={offset}-{offset + length - 1}"
-    return s3_client().get_object(
-        Bucket=BUCKET_NAME, Key=mcap_url, Range=byte_range)["Body"].read()
+    _tcp_connect_local.connect_ms = None  # 清空本线程上一次请求的建连记录
+    request_start = time.perf_counter()
+    response = s3_client().get_object(Bucket=BUCKET_NAME, Key=mcap_url, Range=byte_range)
+    header_received = time.perf_counter()
+    data_bytes = response["Body"].read()
+    read_end = time.perf_counter()
+    if logger.isEnabledFor(logging.DEBUG):
+        _log_fetch_timing(mcap_url, offset, len(data_bytes),
+                          request_start, header_received, read_end)
+    return data_bytes
 
 
 ##########

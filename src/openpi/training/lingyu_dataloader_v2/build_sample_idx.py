@@ -22,25 +22,30 @@ Arrow 转换放 worker 而非主进程: 它占保存开销的 95% 且是持 GIL 
 故进程池是全局共享的, 队列元素带上 prompt, 单写线程再按 prompt 分派给对应的 saver。
 
 最终编号阶段::
-    各 prompt 表的元数据列 -> 拼成一张 Arrow 表 -> DuckDB
+    各 prompt 表当前 snapshot 的数据文件 -> 逐文件只读元数据列, 并记下每行所在 (data_file, row_group)
+        -> 拼成一张 Arrow 表 -> DuckDB
         -> ORDER BY (prompt, source_id, source_episode_seq) + ROW_NUMBER()
         -> episode_index.parquet: {prompt, episode_id, source_id, source_episode_seq,
-                                   num_samples, episode_offset, sample_offset}
+                                   num_samples, data_file, row_group, episode_offset, sample_offset}
 episode_offset 是全局连续的 episode 编号, sample_offset 是该 episode 首个 sample 的全局编号,
 故全局 sample 编号 s 属于满足 sample_offset <= s < sample_offset + num_samples 的那个 episode,
 其局部 sample_idx 为 s - sample_offset。
+(data_file, row_group) 是该 episode 的物理位置: 写入端一个 episode 一行一个 row group, 故行号
+即 row group 号。取样时凭它直接 read_row_group, 不再经 Iceberg scan 逐个 manifest/footer 去找。
 编号跨全部 prompt 只产出一份索引: Iceberg 的 namespace 不参与编号, prompt 列即定位表的坐标。
-编号只读 Iceberg 的元数据列, 不碰 samples 这根巨大的列, 因此与数据量无关。
+编号只读元数据列, 不碰 samples 这根巨大的列, 因此与数据量无关。
 
 示例命令：
     cd ~/openpi/src/openpi/training/lingyu_dataloader_v2
-    python build_sample_idx.py
+    python build_sample_idx.py                # 采集 + 编号
+    python build_sample_idx.py --index-only   # 数据已在 Iceberg 里, 只重跑编号阶段
 
 按进程实时查看网卡 enp6s18 上的流量
     sudo nethogs -v 4 enp6s18   # 直接以 MB/s 显示
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import resource
 from multiprocessing import get_context
@@ -49,10 +54,12 @@ from queue import Empty
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from openpi.training.lingyu_dataloader_v2.mcap_sample_extractor import MCAPSampleExtractor
 from openpi.training.lingyu_dataloader_v2.utils.pyiceberg_saver import (
-    EpisodeParquetWriter, EpisodeRecord, IcebergEpisodeSaver, load_episodes_table)
+    EPISODES_TABLE_NAME, EpisodeParquetWriter, EpisodeRecord, IcebergEpisodeSaver,
+    load_episodes_catalog, load_episodes_table)
 from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import find_mcap_url_and_prompt_pairs
 from openpi.training.lingyu_dataloader_v2.utils.mcap_topics_filter import filter_topics
 
@@ -73,13 +80,16 @@ _WORKER_DONE = "__worker_done__"    # worker 领到 None 收工时送出, 主进
 # 主进程等 episode 的超时: 超时就查一次 worker 存活, 免得 worker 被 OOM killer 杀掉(送不出
 # _WORKER_DONE)时主进程永远挂在 get() 上
 QUEUE_POLL_SEC = 60
+# 编号阶段从数据文件里读的元数据列, samples 那根巨大的列不读
+EPISODE_META_COLUMNS = ["episode_id", "source_id", "source_episode_seq", "num_samples"]
 
-# 全局编号: 先按 episode_id 去重(commit 重试可能写重), 再按 source 稳定排序连续编号。
-# 绝不用 parquet 行位置或 Iceberg commit 顺序当编号依据, 那两者都会随重跑而变。
+# 全局编号: 先按 episode_id 去重(commit 重试可能写重, 任取一份的位置即可), 再按 source 稳定排序连续编号。
+# 绝不用 parquet 行位置或 Iceberg commit 顺序当编号依据, 那两者都会随重跑而变;
+# (data_file, row_group) 只是随编号一起存下的物理位置, 不参与排序。
 _GLOBAL_INDEX_SQL = """
 WITH unique_episodes AS (
     SELECT DISTINCT ON (prompt, episode_id)
-           prompt, episode_id, source_id, source_episode_seq, num_samples
+           prompt, episode_id, source_id, source_episode_seq, num_samples, data_file, row_group
     FROM episodes_meta
 )
 SELECT prompt,
@@ -87,6 +97,8 @@ SELECT prompt,
        source_id,
        source_episode_seq,
        num_samples,
+       data_file,
+       row_group,
        ROW_NUMBER() OVER episode_order - 1                 AS episode_offset,
        -- SUM(BIGINT) 在 DuckDB 里是 HUGEINT, 落 parquet 会变成 DOUBLE, 故显式收回 BIGINT
        CAST(SUM(num_samples) OVER episode_order - num_samples AS BIGINT) AS sample_offset
@@ -225,14 +237,9 @@ def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WARE
 
 def build_global_index(tables: dict, warehouse_dir: str = WAREHOUSE_DIR) -> str:
     """Number every episode/sample of all prompts globally and write one episode_index.parquet."""
-    # 各 prompt 表只取元数据列(samples 那根巨大的列完全不读), 补一列 prompt 后拼成一张 Arrow 表
-    prompt_metas = []
-    for prompt, table in tables.items():
-        meta = table.scan(selected_fields=(
-            "episode_id", "source_id", "source_episode_seq", "num_samples")).to_arrow()
-        prompt_metas.append(
-            meta.append_column("prompt", pa.array([prompt] * meta.num_rows, pa.string())))
-    episodes_meta = pa.concat_tables(prompt_metas)
+    # 各 prompt 表只取元数据列与物理位置(samples 那根巨大的列完全不读), 拼成一张 Arrow 表
+    episodes_meta = pa.concat_tables(
+        [load_episodes_meta(prompt, table) for prompt, table in tables.items()])
     index_path = str(Path(warehouse_dir) / GLOBAL_INDEX_NAME)
 
     with duckdb.connect() as duck_conn:
@@ -249,6 +256,39 @@ def build_global_index(tables: dict, warehouse_dir: str = WAREHOUSE_DIR) -> str:
     return index_path
 
 
+def load_episodes_meta(prompt: str, table) -> pa.Table:
+    """Read one prompt table's metadata columns file by file, plus where each episode lives.
+
+    Returns columns EPISODE_META_COLUMNS + [data_file, row_group, prompt], one row per episode.
+    """
+    file_metas = []
+    # plan_files 给出当前 snapshot 的全部数据文件; add_files 写入的表没有 delete 文件, 逐文件读即全表
+    for scan_task in table.scan().plan_files():
+        data_file = scan_task.file.file_path
+        parquet_file = pq.ParquetFile(data_file)
+        # 写入端一个 episode 一行一个 row group, 行号才等于 row group 号
+        assert parquet_file.num_row_groups == parquet_file.metadata.num_rows, \
+            f"{data_file} 不是一行一个 row group, 行号不能当 row group 号"
+        file_meta = parquet_file.read(columns=EPISODE_META_COLUMNS)
+        file_metas.append(file_meta
+                          .append_column("data_file", pa.array([data_file] * file_meta.num_rows, pa.string()))
+                          .append_column("row_group", pa.array(range(file_meta.num_rows), pa.int64())))
+    assert file_metas, f"{prompt!r} 的表里没有任何数据文件"
+    meta = pa.concat_tables(file_metas)
+    return meta.append_column("prompt", pa.array([prompt] * meta.num_rows, pa.string()))
+
+
+def load_existing_tables(warehouse_dir: str = WAREHOUSE_DIR) -> dict:
+    """Load every prompt's episodes table already in the catalog, as {prompt: Table}."""
+    catalog = load_episodes_catalog(warehouse_dir)
+    # 建表时 namespace 属性里存了 prompt 原文(namespace 名规范化后不可逆), 据此取回对应关系
+    tables = {catalog.load_namespace_properties(namespace)["prompt"]:
+              catalog.load_table((*namespace, EPISODES_TABLE_NAME))
+              for namespace in catalog.list_namespaces()}
+    assert tables, f"{warehouse_dir} 的 catalog 里没有任何表, 请先不带 --index-only 跑一次采集"
+    return tables
+
+
 def build_all() -> str:
     """Extract all mcaps into Iceberg, then build the global index."""
     # 全部 mcap 入队, 由 MAX_MCAP_WORKERS 个常驻 worker 轮流领取, 进程数不随 mcap 数增长
@@ -257,8 +297,16 @@ def build_all() -> str:
 
 
 if __name__ == "__main__":
+    arg_parser = argparse.ArgumentParser(description="并行抽取 mcap 存进 Iceberg, 再生成全局索引")
+    arg_parser.add_argument("--index-only", action="store_true",
+                            help="跳过采集, 只用 catalog 里已有的表重建 episode_index.parquet")
+    cli_args = arg_parser.parse_args()
     # 先删旧日志再以追加方式打开: 各进程都用 O_APPEND 才不会互相覆盖, "w" 模式会从 0 偏移覆写 worker 的内容
     Path(LOG_PATH).unlink(missing_ok=True)
     logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, filename=LOG_PATH, filemode="a",
                         encoding="utf-8")
-    build_all()
+    if cli_args.index_only:
+        # 不再采集: 重跑采集会把同一批数据再 add_files 一遍, 表里每个 episode 存两份
+        build_global_index(load_existing_tables())
+    else:
+        build_all()

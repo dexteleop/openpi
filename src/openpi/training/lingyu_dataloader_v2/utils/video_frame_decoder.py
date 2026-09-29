@@ -1,4 +1,7 @@
-"""把 locations 指向的一段 FFMPEGPackets(IDR 关键帧 → 当前帧) 解码成当前帧图像。
+"""把一段已取回的 FFMPEGPackets(IDR 关键帧 → 当前帧) 解码成当前帧图像。
+
+只解码不读取: packets 由调用方用 MCAP_Message_Fetcher 取回, 调用方因此可以把一个 sample 的
+全部 location 一起并行读取。
 
 CPU解码器：PyAV(libavcodec)
 GPU解码器：NVDEC
@@ -8,12 +11,8 @@ from __future__ import annotations
 import av
 import numpy as np
 
-from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import MCAP_Message_Fetcher
-
 # FFMPEGPacket.encoding 可能带像素格式后缀(如 'hevc;nv12')或用别名, 只取编码名并归一化
 _CODEC_ALIASES = {"h265": "hevc", "avc": "h264"}
-
-_fetcher = MCAP_Message_Fetcher()
 
 
 def _codec_name(encoding: str) -> str:
@@ -22,16 +21,15 @@ def _codec_name(encoding: str) -> str:
     return _CODEC_ALIASES.get(codec, codec) or "hevc"
 
 
-def cpu_decode_current_frame(msg_type: str, msg_def: str, locations: list[tuple],
-                             pixel_format: str = "rgb24") -> np.ndarray:
-    """解码 locations 覆盖的 [I,P,P,...], 返回其中最后一帧(即当前帧)的像素数组。
+def cpu_decode_current_frame(packets: list, pixel_format: str = "rgb24") -> np.ndarray:
+    """解码 [I,P,P,...] 这段 FFMPEGPacket, 返回其中最后一帧(即当前帧)的像素数组。
 
-    locations 首元素肯定是 IDR (MCAP_Player 已保证)
+    packets 按 locations 顺序排列, 首元素肯定是 IDR (MCAP_Player 已保证)
 
     Returns:
         ndarray, shape (height, width, 3) for rgb24
     """
-    packets = _fetcher.fetch_message(msg_type, msg_def, locations)
+    assert packets, "没有任何 FFMPEGPacket 可解码"
     codec_ctx = av.CodecContext.create(_codec_name(packets[0].encoding), "r")
     frames = []
     for packet in packets:
