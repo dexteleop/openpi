@@ -18,9 +18,7 @@ chunk_file_offset 是该 Chunk 记录在文件中的绝对字节位置。
               message["log_time"])
 """
 from __future__ import annotations
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Iterator
+from typing import Generator
 from openpi.training.lingyu_dataloader_v2.utils.mcap_topics_filter import (
     filter_topics
 )
@@ -28,22 +26,17 @@ from openpi.training.lingyu_dataloader_v2.mcap_config.config import (
     load_mcap_video_topics_gop
 )
 from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import (
-    fetch_data_bytes
+    MCAP_Message_Fetcher, remember_chunk_records
 )
 from openpi.training.lingyu_dataloader_v2.utils._mcap_utils import (
     # MCAP Record 类型
-    OP_CHANNEL, OP_MESSAGE, OP_CHUNK, OP_SCHEMA, OP_MESSAGE_IDX, OP_CHUNK_IDX,
+    OP_CHANNEL, OP_MESSAGE, OP_CHUNK, OP_SCHEMA,
     # MCAP常见结构长度
     MAGIC_SIZE, OPCODE_PREFIX, RECORD_PREFIX, CHUNK_HEADER_FIXED,
     # 字节流转整数
     u16, u32, u64,
     # MCAP功能函数
-    fetch_mcap_bytes, fetch_mcap_length, decompress_chunk_record,
-    fetch_SummaryRecords,
-    parse_SchemaRecord_in_SummarySection,
-    parse_ChannelRecord_in_SummarySection,
-    parse_ChunkIndexRecord_in_SummarySection,
-    parse_MessageIdx_from_ChunkIndexRecord,
+    fetch_mcap_bytes, fetch_mcap_length, decompress_chunk_record
 )
 
 # 每个message需要得到的信息
@@ -55,149 +48,35 @@ _PER_MESSAGE_KEYS = (
     "log_time",    # timestamp_ns
 )
 
-# chunk 级预读并发度: 每个 chunk 读一次 MessageIdx
-_CHUNK_PREFETCH = 4
-# message 级预读并发度: 每条 message 读一次 record_length(8 字节), 靠并行掩盖往返延迟
-_MESSAGE_PREFETCH = 256
+# 顺序播放的预读字节数: _fetch_buffered 缓冲未命中时, 在请求长度之外额外多读这么多字节。
+# 为什么需要: 文件布局为 | Chunk | MessageIndex × C | Chunk | ..., 每个 channel 一条 MessageIndex,
+#   它们是与 Chunk 同级的顶层记录。主循环不用其内容, 但仍须逐条读 9 字节 prefix 拿到长度才能跳过;
+#   无缓冲时每个 chunk 后会有约 50 次只取 9 字节的 S3 往返。
+# 作用: 把本 chunk 后的全部 MessageIndex 与下一个 chunk 的 prefix + head 一并取回, 之后只需对
+#   下一个 chunk 的 records 再发一次请求。不压缩的 chunk 读 records 时顺带预读; 压缩的 chunk 由
+#   decompress_chunk_record 单独读取, 预读由其后第一条 MessageIndex 的 prefix 未命中触发。
+# 取值依据: MessageIndex 总大小 ≈ 15×channel 数 + 16×消息数, 实测 20~30KB, 64KB 约留 2 倍余量。
+#   超出时只会每 64KB 多一次请求, 解析结果不变。
+_SEQUENTIAL_READAHEAD = 64 * 1024
 
 
-def _read_chunk_msg_idx(
-    mcap_path: str,
-    chunk: dict[str, Any],
-    channel_info: dict[int, tuple[str, str, str]],
-) -> list[tuple[int, int, int, int]]:
-    """读一个 chunk 的 MessageIdx, 滤掉未选中 channel 后按 log_time 升序返回。
+def _fetch_buffered(mcap_path: str, buffer: tuple[int, bytes], length: int,
+                   offset: int) -> tuple[bytes, tuple[int, bytes]]:
+    """Read [offset, offset+length) from buffer=(start, bytes), refilling it with readahead on a miss.
 
-    返回 [(chunk_start_offset, log_time, uncompressed_byte_offset, channel_id), ...]
+    Returns (data, buffer). Like fetch_mcap_bytes, data is shorter than length at end of file.
     """
-    msg_idxes = parse_MessageIdx_from_ChunkIndexRecord(mcap_path, chunk)
-
-    # 汇总选中 channel 的 MessageIdx, 再按 log_time 升序排成播放顺序
-    msg_idx_all = []   # [(log_time, uncompressed_byte_offset, channel_id), ...]
-    for channel_id, msg_idx_ls in msg_idxes.items():
-        if channel_id not in channel_info:   # 该 channel 的 topic 未被选中
-            continue
-        for log_time, ub_offset in msg_idx_ls:
-            msg_idx_all.append((log_time, ub_offset, channel_id))
-    msg_idx_all.sort()
-
-    return [(chunk["chunk_start_offset"], log_time, ub_offset, channel_id)
-            for log_time, ub_offset, channel_id in msg_idx_all]
-
-
-def _iter_chunks_msg_idx(
-    mcap_path: str,
-    chunks: list[dict],
-    channel_info: dict[int, tuple[str, str, str]],
-) -> Iterator[tuple[int, int, int, int]]:
-    """按 chunk 时间顺序产出 MessageIdx; 各 chunk 并行预读, 产出顺序仍与 chunks 一致"""
-    read_msg_idx = lambda chunk: _read_chunk_msg_idx(mcap_path, chunk, channel_info)
-    with ThreadPoolExecutor(max_workers=_CHUNK_PREFETCH) as pool:
-        pending = deque()
-        for chunk in chunks:
-            pending.append(pool.submit(read_msg_idx, chunk))
-            if len(pending) >= _CHUNK_PREFETCH:
-                yield from pending.popleft().result()
-        while pending:
-            yield from pending.popleft().result()
-
-
-def _iter_chunks_messages(
-    mcap_path: str,
-    chunks: list[dict],
-    channel_info: dict[int, tuple[str, str, str]],
-) -> Iterator[dict]:
-    """按 chunk 先后 + chunk 内 log_time 升序逐条产出 message。
-
-    record_length 须在各消息偏移处读它自身 record header 里的 8 字节, 这些单点读
-    以 _MESSAGE_PREFETCH 条为窗口并行预读; 按提交顺序取结果, 故产出顺序不变。
-    调用方已确保 chunk 未压缩, 故 uncompressed_byte_offset 可直接换算成文件偏移。
-    """
-    msg_idx_iter = _iter_chunks_msg_idx(mcap_path, chunks, channel_info)
-    with ThreadPoolExecutor(max_workers=_MESSAGE_PREFETCH) as pool:
-        pending = deque()   # [(msg_idx, record_length 所在 8 字节的 future), ...]
-        while True:
-            # 先把预读窗口填满, MessageIdx 取尽时 next() 返回 None
-            while len(pending) < _MESSAGE_PREFETCH:
-                msg_idx = next(msg_idx_iter, None)
-                if msg_idx is None:
-                    break
-                chunk_start_offset, log_time, ub_offset, channel_id = msg_idx
-                # record_length 紧随 message record 的 opcode, 只取这 8 字节
-                record_length_offset = (chunk_start_offset + RECORD_PREFIX
-                                        + CHUNK_HEADER_FIXED + ub_offset + OPCODE_PREFIX)
-                pending.append((msg_idx, pool.submit(fetch_mcap_bytes, mcap_path,
-                                                     RECORD_PREFIX - OPCODE_PREFIX,
-                                                     record_length_offset)))
-            if not pending:
-                break
-            # 按提交顺序取结果, 故产出顺序与 MessageIdx 顺序一致
-            msg_idx, record_length_bytes = pending.popleft()
-            chunk_start_offset, log_time, ub_offset, channel_id = msg_idx
-            record_length, = u64(record_length_bytes.result(), 0)
-            yield dict(zip(_PER_MESSAGE_KEYS,
-                           (chunk_start_offset,
-                            ub_offset,
-                            record_length,
-                            *channel_info[channel_id],  # topic_name, msg_type, msg_def
-                            log_time)))
-
-
-def _play_messages_via_metadata(mcap_path: str,
-                                extra_topics: tuple[str, ...] = ()) -> Iterator[dict]:
-    """
-    借 Summary 中的索引产出 message, 避免逐块扫描未选中 topic 的 chunk 数据。
-    输出： 一个 message 对应 _PER_MESSAGE_KEYS 中的全部数据,
-          只产出 filter_topics() 选中的 topic 与 extra_topics,
-          按 chunk 先后 + chunk 内 log_time 升序排列
-
-    MessageIndex 与 ChunkIndex 都不在 Summary 中时抛 ValueError, 交由 _play_messages 接手。
-
-    ！！ 由于获取每个 message 的 record_length 需要频繁的网络访问，导致时间消耗多于顺序读取，放弃
-    """
-    selected_mcap_topics = filter_topics().keys() | set(extra_topics)
-    summary_records_loca = fetch_SummaryRecords(mcap_path)
-
-    # 索引来源为ChunkIndex, 没有则交回调用方
-    if bytes([OP_CHUNK_IDX]) not in summary_records_loca:
-        raise ValueError("Summary 中无 ChunkIndex")
-
-    # 使用 Chunk Index Record 找到所有的 MessageIdx
-    # --- 1. 全部 chunk 信息, chunk_start_offset 已具有时间先后顺序 ---
-    chunks = parse_ChunkIndexRecord_in_SummarySection(
-        mcap_path, *summary_records_loca[bytes([OP_CHUNK_IDX])])
-    if not chunks:
-        raise ValueError("Summary 中 Chunk Index Record 为空")
-    # 同一文件允许逐 chunk 采用不同压缩方式, 故须全量校验
-    if any(chunk["compression"] for chunk in chunks):
-        raise ValueError("该 MCAP 中包含压缩 Chunk")
-
-    # --- 2. Schema / Channel: Summary 缺失时从首个 chunk 的 records 区解析 ---
-    schema_loca  = summary_records_loca.get(bytes([OP_SCHEMA]))
-    channel_loca = summary_records_loca.get(bytes([OP_CHANNEL]))
-    if schema_loca is None or channel_loca is None:
-        records_loca = (
-            chunks[0]["chunk_start_offset"] + RECORD_PREFIX + CHUNK_HEADER_FIXED,
-            chunks[0]["compressed_size"]
-        )
-        schema_loca  = schema_loca  or records_loca
-        channel_loca = channel_loca or records_loca
-    schemas  = parse_SchemaRecord_in_SummarySection(mcap_path, *schema_loca)
-    channels = parse_ChannelRecord_in_SummarySection(mcap_path, *channel_loca)
-
-    # --- 3. 只为选中 topic 建 channel_id -> (topic_name, msg_type, msg_def) ---
-    schema_by_id = {schema["schema_id"]: schema for schema in schemas}
-    channel_info = {
-        channel["channel_id"]: (channel["topic"],
-                                schema_by_id.get(channel["schema_id"], {}).get("name", ""),
-                                schema_by_id.get(channel["schema_id"], {}).get("msgdef", ""))
-        for channel in channels if channel["topic"] in selected_mcap_topics
-    }
-    return _iter_chunks_messages(mcap_path, chunks, channel_info)
+    buffer_start, buffer_bytes = buffer
+    if not buffer_start <= offset <= offset + length <= buffer_start + len(buffer_bytes):
+        buffer_start = offset
+        buffer_bytes = fetch_mcap_bytes(mcap_path, length + _SEQUENTIAL_READAHEAD, offset)
+    relative_offset = offset - buffer_start
+    return (buffer_bytes[relative_offset:relative_offset + length],
+            (buffer_start, buffer_bytes))
 
 
 def _play_messages(mcap_path: str,
-                   extra_topics: tuple[str, ...] = ()) -> Iterator[dict]:
+                   extra_topics: tuple[str, ...] = ()) -> Generator[dict, None, None]:
     """
     按MCAP中消息保存顺序逐条产出 message 的定位信息、解析格式、筛选信息
     输入： rosbag 挂载的文件路径
@@ -211,29 +90,30 @@ def _play_messages(mcap_path: str,
     schema_names: dict[int, str] = {}      # schema_id  -> msg_type string
     schema_msgdefs: dict[int, str] = {}    # schema_id  -> msg definition string
     pos = MAGIC_SIZE    # pos指向第一个Record
+    read_buffer: tuple[int, bytes] = (0, b"")   # (缓冲区起始偏移, 字节), 顺序读取的预读缓冲
     while pos + RECORD_PREFIX <= file_size:
         # --- 获取 Record Prefix ---
-        header = fetch_mcap_bytes(mcap_path, RECORD_PREFIX, pos)
+        header, read_buffer = _fetch_buffered(mcap_path, read_buffer, RECORD_PREFIX, pos)
         if len(header) < RECORD_PREFIX:
             break
-        (top_record_length,) = u64(header, OPCODE_PREFIX) # 获取当前Record长度，每个Record可能还包括Record
+        top_record_length, = u64(header, OPCODE_PREFIX) # 获取当前Record长度，每个Record可能还包括Record
 
         # --- 只有 Chunk Record 内部才有 Message Record，因此只读取 Chunk Record ---
         if header[0] == OP_CHUNK:
             chunk_file_offset = pos  # chunk 在文件中的绝对偏移，作为定位主键
 
             # --- 解析 chunk header, 定位 records 起始位置 ---
-            chunk_head = fetch_mcap_bytes(
-                mcap_path,
+            chunk_head, read_buffer = _fetch_buffered(
+                mcap_path, read_buffer,
                 CHUNK_HEADER_FIXED + 4, # max(name_len)=4
                 pos + RECORD_PREFIX
             )
             # name_len=0,不压缩; name_len=3,lz4; name_len=4,zstd
-            (name_len,) = u32(chunk_head, 28)
+            name_len, = u32(chunk_head, 28)
             # 读取压缩算法，空字符串,'lz4','zstd'
             compression = chunk_head[32 : 32 + name_len].decode() # '' or 'lz4' or 'zstd'
             # 读取 Chunk Header records_length
-            (records_length,) = u64(chunk_head, 32 + name_len)
+            records_length, = u64(chunk_head, 32 + name_len)
             # 从第一个record开始
             records_start = pos + RECORD_PREFIX + CHUNK_HEADER_FIXED + name_len
             # 读取整个 Chunk Record
@@ -243,7 +123,11 @@ def _play_messages(mcap_path: str,
                     u64(chunk_head, 16)[0],  # uncompressed_size, zstd 解压上界
                 )
             else:
-                records_bytes = fetch_mcap_bytes(mcap_path, records_length, records_start)
+                # 顺带预读其后的 MessageIndex 与下一个 chunk 头, 本 chunk 通常只需这一次请求
+                records_bytes, read_buffer = _fetch_buffered(
+                    mcap_path, read_buffer, records_length, records_start)
+            # 交给 fetch_data_bytes 复用: 下游按条取本 chunk 的 message 时直接切片, 不再回头请求 S3
+            remember_chunk_records(mcap_path, chunk_file_offset, records_bytes)
 
             uncompressed_byte_offset, records_length = 0, len(records_bytes)
             while uncompressed_byte_offset + RECORD_PREFIX <= records_length:
@@ -364,19 +248,22 @@ class MCAP_Player:
         locations = [(mcap_url, chunk_file_offset, uncompressed_byte_offset, record_length)]
         — single-element list.
 
-    Topic filtering happens inside _play_messages() / _play_messages_via_metadata():
-    they only produce topics resolved by topics_filter.filter_topics()
-    (USER_SELECTED_TOPICS mapped through TELEAVATAV2_MCAP_TOPICS_MAPPING), plus the
+    Topic filtering happens inside _play_messages(): it only produces topics resolved by
+    topics_filter.filter_topics() (USER_SELECTED_TOPICS mapped through TELEAVATAV2_MCAP_TOPICS_MAPPING), plus the
     extra_topics forwarded from play_messages(); this class does not filter again.
     """
 
     def __init__(self, mcap_url: str):
         self.mcap_url = mcap_url
+        # 关键帧判断需反序列化出 FFMPEGPacket.data, fetcher 自带 typestore 与自定义类型注册
+        self._fetcher = MCAP_Message_Fetcher()
 
-    @staticmethod
     def _accumulate_frames_from_keyframe(
+        self,
         ffmpeg_buffers: dict,
         topic_name: str,
+        msg_type: str,
+        msg_def: str,
         loc: tuple,
     ) -> list:
         """
@@ -386,7 +273,9 @@ class MCAP_Player:
         Returns [I P ...] when an IDR (keyframe) is detected.
         Returns [] if no IDR has been seen yet for this message.
         """
-        payload = fetch_data_bytes(*loc)
+        # 只检测 data 字段的码流: header/encoding 等字段的字节可能凑出 00 00 01 伪起始码,
+        # 使 IDR 漏检, GOP 列表无限增长(OOM); data 在消息内偏移随字符串长度变化, 故须反序列化
+        payload = bytes(self._fetcher.fetch_message(msg_type, msg_def, [loc])[0].data)
         if _has_idr(payload):
             ffmpeg_buffers[topic_name] = [loc]
         elif topic_name not in ffmpeg_buffers:
@@ -405,15 +294,9 @@ class MCAP_Player:
         mcap_video_topics_gop = load_mcap_video_topics_gop()  # 键已是 mcap topic 名, 无需映射
         ffmpeg_buffers: dict[str, list] = {}
 
-        # 暂时不使用元数据读取方式，
-        # 使用ChunkIndexRecord会在寻找 record_length 上花费更长时间
-        # try:
-        #     msg_iter = _play_messages_via_metadata(self.mcap_url, extra_topics)
-        # except ValueError:
-        #     msg_iter = _play_messages(self.mcap_url, extra_topics)
-
-        # 直接使用顺序播放形式
+        # 顺序播放一个 mcap 中的 message
         msg_iter = _play_messages(self.mcap_url, extra_topics)
+
         for msg in msg_iter:
             topic = msg["topic_name"]
             loc = (self.mcap_url,
@@ -422,7 +305,7 @@ class MCAP_Player:
                    msg["record_length"])
             if mcap_video_topics_gop.get(topic,1) > 1:  # GOP>1: 帧间编码, 需回溯到关键帧
                 locations = self._accumulate_frames_from_keyframe(
-                    ffmpeg_buffers, topic, loc)
+                    ffmpeg_buffers, topic, msg["msg_type"], msg["msg_def"], loc)
                 if not locations:  # 无关键帧可依托, 跳过该帧
                     continue
             else:

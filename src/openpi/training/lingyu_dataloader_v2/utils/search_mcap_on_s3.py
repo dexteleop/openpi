@@ -10,8 +10,10 @@
     export BUCKET_NAME="xxx"
 """
 import glob
+import logging
 import os
 import boto3
+from botocore.config import Config
 
 from openpi.training.lingyu_dataloader_v2.utils._prompt_translator import translate_prompts
 from openpi.training.lingyu_dataloader_v2.utils._read_csv_columns import read_rosbag_dirs_from_csv
@@ -20,15 +22,20 @@ from openpi.training.lingyu_dataloader_v2.utils._read_csv_columns import read_ro
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
 BUCKET_NAME = os.environ["BUCKET_NAME"]
 
+logger = logging.getLogger(__name__)
 
-def make_client():
-    """按环境变量建立 S3 客户端; 缺少变量时 os.environ[] 直接抛 KeyError"""
+
+def make_client(config: Config | None = None):
+    """按环境变量建立 S3 客户端; 缺少变量时 os.environ[] 直接抛 KeyError
+    config: 可选 botocore Config(如连接池大小), None 时使用 botocore 默认值
+    """
     return boto3.client(
         "s3",
         endpoint_url=os.environ["S3_ENDPOINT"],
         region_name=os.environ["REGION_NAME"],
         aws_access_key_id=os.environ["ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["SECRET_ACCESS_KEY"],
+        config=config,
     )
 
 
@@ -47,7 +54,7 @@ def find_mcap_url_and_prompt_pairs() -> dict[str, str]:
     assert len(csv_files) == 1, f"项目根目录应有且仅有一个 csv, 实际: {csv_files}"
 
     rosbag_dirs = read_rosbag_dirs_from_csv(csv_files[0])
-    print(f"csv 中 rosbag 目录数: {len(rosbag_dirs)}")
+    logger.info(f"csv 中 rosbag 目录数: {len(rosbag_dirs)}")
 
     client = make_client()
     mcap_urls = {}
@@ -57,7 +64,7 @@ def find_mcap_url_and_prompt_pairs() -> dict[str, str]:
         found = sorted(obj["Key"] for obj in response.get("Contents", ())
                        if obj["Key"].endswith(".mcap"))
         if not found:
-            print(f"[无 mcap] {rosbag_dir}")
+            logger.warning(f"[无 mcap] {rosbag_dir}")  # 缺数据用 WARNING, 调高级别时仍可见
             continue
 
         # 将 {mcap_url, prompt} 放到 mcap_urls 中

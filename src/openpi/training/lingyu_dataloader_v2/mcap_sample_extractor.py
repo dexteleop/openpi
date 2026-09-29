@@ -53,6 +53,8 @@ MCAP_SIGNAL_TOPIC, X_BUTTON, Y_BUTTON = set_episode_signal()
 # 一个 sample 的动作序列长度: [当前动作, 后续 ACTION_CHUNK_LENGTH-1 个动作]
 ACTION_CHUNK_LENGTH = load_action_chunk_length()
 
+logger = logging.getLogger(__name__)
+
 
 class MCAPSampleExtractor:
     """Replay one mcap and record which message each sample selects per topic."""
@@ -64,10 +66,6 @@ class MCAPSampleExtractor:
         self.source_id = Path(mcap_path).stem
         self.fps = fps
         self.frame_duration = 1.0 / self.fps
-
-        if not logging.getLogger().handlers:
-            logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
 
         # User Selected Topics: {mcap topic: 角色 obs/state/action}
         mcap_topics_role = filter_topics()
@@ -87,7 +85,7 @@ class MCAPSampleExtractor:
         # 当前 episode 已攒下的 sample, 按 Y 键正常收尾才整段产出; 重录或未收尾则整段丢弃
         self._episode_samples = {}
 
-        self.logger.info(f"\n=== Processing {self.mcap_name} ===")
+        logger.info(f"\n=== Processing {self.mcap_name} ===")
 
         # 播放器已完成 topic 筛选与视频 GOP 累积, 文件在首次迭代 play_messages() 时才打开
         self.player = MCAP_Player(mcap_path)
@@ -168,7 +166,7 @@ class MCAPSampleExtractor:
                             if (previous_buttons[X_BUTTON] == 0 and buttons[X_BUTTON] == 1 and not is_recording):
                                 is_recording = True
                                 start_time = timestamp
-                                self.logger.info(f"🔴 Start #Episode: {self.num_xy_pairs}")
+                                logger.info(f"🔴 Start #Episode: {self.num_xy_pairs}")
 
                                 episode_state_target_t = start_time + self.frame_duration
                                 episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
@@ -181,7 +179,7 @@ class MCAPSampleExtractor:
                             elif (previous_buttons[X_BUTTON] == 0 and buttons[X_BUTTON] == 1 and is_recording):
                                 is_recording = True
                                 start_time = timestamp
-                                self.logger.info(f"🔴 Re-record #Episode: {self.num_xy_pairs}")
+                                logger.info(f"🔴 Re-record #Episode: {self.num_xy_pairs}")
 
                                 episode_state_target_t = start_time + self.frame_duration
                                 episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
@@ -195,12 +193,12 @@ class MCAPSampleExtractor:
                                 is_recording = False
                                 end_time = timestamp
                                 duration = end_time - start_time
-                                self.logger.info(
+                                logger.info(
                                     f"⏹️ Stop TimeRange: {start_time:.3f} to {end_time:.3f} seconds. Duration: {duration:.3f} seconds")
 
                                 if sample_idx < MIN_EPISODE_LENGTH:
                                     # 样本数不足, 整段丢弃
-                                    self.logger.info(
+                                    logger.info(
                                         f"⏹️ Discard #Episode {self.num_xy_pairs}: "
                                         f"only {sample_idx} samples (< {MIN_EPISODE_LENGTH})")
                                     self._episode_samples = {}
@@ -219,7 +217,7 @@ class MCAPSampleExtractor:
                     error_msg = f"Error processing Joy message: {e}\n"
                     error_msg += f"Traceback (most recent call last):\n"
                     error_msg += traceback.format_exc()
-                    self.logger.error(error_msg)
+                    logger.error(error_msg)
 
                 # 在 try 外 yield: 别让本类的 Joy 异常处理吞掉消费者抛出的异常
                 if finished_episode is not None:
@@ -262,6 +260,6 @@ class MCAPSampleExtractor:
 
         # 末尾未按 Y 的 episode 可能不完整, 整段丢弃
         if is_recording:
-            self.logger.info(f"⏹️ Discard #Episode {self.num_xy_pairs}: "
-                             f"{sample_idx} samples, no end button")
+            logger.info(f"⏹️ Discard #Episode {self.num_xy_pairs}: "
+                        f"{sample_idx} samples, no end button")
             self._episode_samples = {}

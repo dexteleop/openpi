@@ -34,13 +34,15 @@ episode_offset 是全局连续的 episode 编号, sample_offset 是该 episode �
 
 示例命令：
     cd ~/openpi/src/openpi/training/lingyu_dataloader_v2
-    python build_sample_idx.py > build_sample_idx.log 2>&1 &
-    tail -f build_sample_idx.log
+    python build_sample_idx.py
+
+按进程实时查看网卡 enp6s18 上的流量
+    sudo nethogs -v 4 enp6s18   # 直接以 MB/s 显示
 """
 from __future__ import annotations
 
 import logging
-from itertools import islice
+import resource
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Empty
@@ -61,6 +63,11 @@ MAX_MCAP_WORKERS = 128          # 最多 MCAP 并行抽取数量
 EPISODES_PER_PARQUET = 100
 WAREHOUSE_DIR = str(Path(__file__).parent / "iceberg_warehouse")
 GLOBAL_INDEX_NAME = "episode_index.parquet"
+# 主进程与 spawn worker 共用同一个日志文件与级别: spawn 子进程不继承主进程的 logging 配置
+LOG_PATH = str(Path(__file__).with_suffix(".log"))
+LOG_LEVEL = logging.INFO
+# 带时间与进程号: 128 个 worker 写同一文件, 靠 pid 把 start/episode/done 串成一条时间线
+LOG_FORMAT = "%(asctime)s %(processName)s[%(process)d] %(levelname)s %(name)s: %(message)s"
 # 哨兵要跨进程传, 必须用 pickle 后仍可按值比较的对象, 不能用 object() —— 它 pickle 后身份就变了
 _WORKER_DONE = "__worker_done__"    # worker 领到 None 收工时送出, 主进程据此计数
 # 主进程等 episode 的超时: 超时就查一次 worker 存活, 免得 worker 被 OOM killer 杀掉(送不出
@@ -101,7 +108,11 @@ def extract_episodes_to_parquet(mcap_queue, parquet_queue, warehouse_dir: str,
     Top-level (not nested) so the spawn worker process can import it.
     Runs until it draws the None sentinel; one bad mcap only loses that mcap.
     """
-    child_logger = logging.getLogger(__name__)
+    # spawn worker 是独立的执行入口, 须自行配置日志; 追加写入主进程已清空的同一文件
+    logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, filename=LOG_PATH, filemode="a",
+                        encoding="utf-8")
+    # 只保留 WARNING 及以上，屏蔽 extractor 里的 Start/Stop INFO
+    logging.getLogger("openpi.training.lingyu_dataloader_v2.mcap_sample_extractor").setLevel(logging.WARNING)
     # prompt -> writer, 一个 prompt 一个在写的文件; 跨 mcap 续写, 故文件总能攒满
     writers: dict[str, EpisodeParquetWriter] = {}
     while True:
@@ -112,20 +123,30 @@ def extract_episodes_to_parquet(mcap_queue, parquet_queue, warehouse_dir: str,
             parquet_queue.put(_WORKER_DONE)
             return
         mcap_url, prompt = task
-        if prompt not in writers:
-            table = load_episodes_table(warehouse_dir, topic_names, prompt)
-            writers[prompt] = EpisodeParquetWriter(table, topic_names, EPISODES_PER_PARQUET)
+        # 被 OOM killer 杀掉的进程来不及写任何日志, 只能靠 "有 start 无 done" 反查是哪个 mcap
+        logger.info(f"start: {mcap_url}")
         try:
+            # 建表/建 writer 也放进 try: 否则其异常只进 stderr, 日志文件里看不到
+            if prompt not in writers:
+                table = load_episodes_table(warehouse_dir, topic_names, prompt)
+                writers[prompt] = EpisodeParquetWriter(table, topic_names, EPISODES_PER_PARQUET)
             extractor = MCAPSampleExtractor(mcap_url)
             for source_episode_seq, samples in extractor.iter_episodes():
                 # 写一行就落一个 row group, 本进程内存恒等于一个 episode
-                _report_closed_file(parquet_queue, prompt, writers[prompt].write(
-                    EpisodeRecord(extractor.source_id, source_episode_seq, samples)))
-            # log inside the child; the parent's logger will see it via StreamHandler
-            child_logger.info(f"done: {mcap_url} ({extractor.num_episodes} episodes, "
-                              f"{extractor.total_samples} samples)")
-        except Exception as extract_error:
-            child_logger.error(f"error: {mcap_url}: {extract_error}")
+                record = EpisodeRecord(extractor.source_id, source_episode_seq, samples)
+                _report_closed_file(parquet_queue, prompt, writers[prompt].write(record))
+                # 每个 episode 一行心跳: 证明进程还活着, 并暴露内存是否在持续增长
+                logger.info(f"episode {record.episode_id} ({len(samples)} samples), "
+                            f"peak_rss={_peak_rss_gb():.2f}GB")
+            logger.info(f"done: {mcap_url} ({extractor.num_episodes} episodes, "
+                        f"{extractor.total_samples} samples), peak_rss={_peak_rss_gb():.2f}GB")
+        except Exception:
+            logger.exception(f"error: {mcap_url}")      # exception() 附带完整 traceback
+
+
+def _peak_rss_gb() -> float:
+    """Peak resident memory of the current process in GB (Linux ru_maxrss is in KB)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
 
 
 def _report_closed_file(parquet_queue, prompt: str, closed_file: tuple | None) -> None:
@@ -190,10 +211,11 @@ def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WARE
 
     for worker in workers:
         worker.join()
-    killed_exitcodes = [worker.exitcode for worker in workers if worker.exitcode]
+    # pid -> exitcode: 用 pid 到日志里找该 worker 最后一条 start, 即是出事的 mcap
+    killed_exitcodes = {worker.pid: worker.exitcode for worker in workers if worker.exitcode}
     if killed_exitcodes:
         logger.error(f"{len(killed_exitcodes)} 个 worker 非正常退出, "
-                     f"exitcode={killed_exitcodes} (-9 即被 OOM killer 杀掉)")
+                     f"{{pid: exitcode}}={killed_exitcodes} (-9 即被 OOM killer 杀掉)")
 
     logger.info(f"saved {sum(saver.num_episodes for saver in savers.values())} episodes in "
                 f"{sum(saver.num_commits for saver in savers.values())} snapshots "
@@ -217,8 +239,10 @@ def build_global_index(tables: dict, warehouse_dir: str = WAREHOUSE_DIR) -> str:
         duck_conn.register("episodes_meta", episodes_meta)
         duck_conn.execute(
             f"COPY ({_GLOBAL_INDEX_SQL}) TO '{index_path}' (FORMAT PARQUET)")
-        total_episodes, total_samples = duck_conn.execute(
+        row = duck_conn.execute(
             f"SELECT count(*), sum(num_samples) FROM ({_GLOBAL_INDEX_SQL})").fetchone()
+        assert row is not None, "global index query returned no rows"
+        total_episodes, total_samples = row
 
     logger.info(f"global index: {total_episodes} episodes, {total_samples} samples "
                 f"over {len(tables)} prompts -> {index_path}")
@@ -226,13 +250,15 @@ def build_global_index(tables: dict, warehouse_dir: str = WAREHOUSE_DIR) -> str:
 
 
 def build_all() -> str:
-    """Extract the first num_mcaps mcaps into Iceberg, then build the global index."""
-    # find_mcap_urls() 返回 {mcap url: prompt}, 截取时要连 prompt 一起留下
-    mcap_prompts = dict(islice(find_mcap_url_and_prompt_pairs().items(), MAX_MCAP_WORKERS))
-    tables = build_episodes_table(mcap_prompts, WAREHOUSE_DIR)
+    """Extract all mcaps into Iceberg, then build the global index."""
+    # 全部 mcap 入队, 由 MAX_MCAP_WORKERS 个常驻 worker 轮流领取, 进程数不随 mcap 数增长
+    tables = build_episodes_table(find_mcap_url_and_prompt_pairs(), WAREHOUSE_DIR)
     return build_global_index(tables, WAREHOUSE_DIR)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    # 先删旧日志再以追加方式打开: 各进程都用 O_APPEND 才不会互相覆盖, "w" 模式会从 0 偏移覆写 worker 的内容
+    Path(LOG_PATH).unlink(missing_ok=True)
+    logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, filename=LOG_PATH, filemode="a",
+                        encoding="utf-8")
     build_all()
