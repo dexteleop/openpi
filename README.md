@@ -95,24 +95,11 @@ Once uv is installed, run the following to set up the environment:
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+GIT_LFS_SKIP_SMUDGE=1 uv pip install boto3 mcap rosbags duckdb pyiceberg "pyiceberg[sql-sqlite]"
 GIT_LFS_SKIP_SMUDGE=1 uv pip install webdataset
 ```
 
 Note: `GIT_LFS_SKIP_SMUDGE=1` is required to pull LeRobot as a dependency.
-
-The WebDataset training path (`pi0_lingyu_wds`) decodes video on the GPU, which
-needs decord built from source with CUDA — the PyPI wheel is CPU-only:
-
-```bash
-git clone --recursive https://github.com/dmlc/decord
-cd decord
-mkdir build && cd build
-cmake .. -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-make
-cd .. && cd python
-~/openpi/.venv/bin/python setup.py install
-~/openpi/.venv/bin/python -c "import decord._C; print('GPU decord ready')"
-```
 
 ### Client Environment (conda + ROS2)
 
