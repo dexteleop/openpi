@@ -8,10 +8,12 @@
     export ACCESS_KEY_ID="xxx"
     export SECRET_ACCESS_KEY="xxx"
     export BUCKET_NAME="xxx"
+    export KEY_PREFIX="shihaoran"  # 可选: 桶与 csv 路径之间的前缀, 不设则为空
 """
 import glob
 import logging
 import os
+import posixpath
 import boto3
 from botocore.config import Config
 
@@ -21,6 +23,8 @@ from openpi.training.lingyu_dataloader_v2.utils._read_csv_columns import read_ro
 # 项目根目录 (openpi/), 数据平台导出的 csv 放在这里
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
 BUCKET_NAME = os.environ["BUCKET_NAME"]
+# 桶内 key = KEY_PREFIX/csv 中的 rosbag 路径; 列举结果已含前缀, 下游 get_object 无需再拼
+KEY_PREFIX = os.environ.get("KEY_PREFIX", "").strip("/")
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +64,9 @@ def find_mcap_url_and_prompt_pairs() -> dict[str, str]:
     mcap_urls = {}
     for rosbag_dir, prompt in rosbag_dirs.items():
         # key 前缀必须以 / 结尾, 否则会匹配到同名前缀的兄弟目录
-        response = client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=rosbag_dir.rstrip("/") + "/")
+        # KEY_PREFIX 为空时 posixpath.join 退化为原路径
+        key_prefix = posixpath.join(KEY_PREFIX, rosbag_dir.strip("/")) + "/"
+        response = client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=key_prefix)
         found = sorted(obj["Key"] for obj in response.get("Contents", ())
                        if obj["Key"].endswith(".mcap"))
         if not found:
