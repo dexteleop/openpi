@@ -106,6 +106,9 @@ class DataConfig:
     # The prompt only used for WebDataset loader. If None, will use the default prompt defined in the model config.
     wds_prompt: str | None = None
 
+    # Lingyu Dataset V2
+    iceberg_dir : str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -641,6 +644,70 @@ class WDSLingyuTeleavatarV2DataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LingyuTeleavatarV2DataConfig(DataConfigFactory):
+    """
+    Config for training on the Teleavatar v2 dual-arm robot dataset.
+    """
+    use_delta_joint_actions: bool = False
+    # Whether the head camera should be rotated 180° before the left-eye crop.
+    # Property of the source dataset orientation; forwarded to TeleavatarInputs.
+    rotate_head_camera: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform to match dataset keys to inference keys.
+        repack_structure = {
+            # 源 key 用 "/" 分隔: RepackTransform 按 "/" 展平 LingyuDatasetV2 输出的嵌套 dict
+            "observation/images/left_color": "observation/images/left_color",
+            "observation/images/right_color": "observation/images/right_color",
+            "observation/images/head_camera": "observation/images/head_camera",
+            "observation/state": "observation/state",
+            "action": "action",  # Keep action as action
+        }
+        # When prompt_from_task is on, PromptFromLeRobotTask injects a top-level
+        # "prompt" string from meta.tasks[task_index]. RepackTransform rebuilds
+        # the dict from scratch, so the key has to be listed here or it's lost
+        # and TeleavatarInputs falls back to its hardcoded default for every
+        # sample. Only request the key when it will actually be present;
+        # otherwise the flat_item lookup would KeyError.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(repack_structure)
+            ]
+        )
+
+        # Delta is handled inside TeleavatarInputs/Outputs (see there for why).
+        data_transforms = _transforms.Group(
+            inputs=[
+                teleavatar_v2_policy.TeleavatarInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                    state_action_selected=True,
+                )
+            ],
+            outputs=[
+                teleavatar_v2_policy.TeleavatarOutputs(
+                    use_delta_joint_actions=self.use_delta_joint_actions,
+                )
+            ],
+        )
+
+        # Model transforms
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -1150,6 +1217,26 @@ _CONFIGS = [
         # weight_loader=weight_loaders.CheckpointWeightLoader("/home/zyz/shihaoran/intel_test/openpi/checkpoints/pi0_base/params"),
         batch_size = 64,
         num_workers= 128,
+        num_train_steps=40000,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_teleavatar_v2_lingyu",
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
+            action_horizon=30,
+        ),
+        checkpoint_base_dir="/DATA/disk1/haoran/checkpoints",
+        data=LingyuTeleavatarV2DataConfig(
+            base_config=DataConfig(
+                action_sequence_keys=("action",),  # Use 'action' not 'actions'
+                prompt_from_task=True,
+                iceberg_dir="/home/ubuntu/openpi/src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        batch_size = 64,
+        num_workers= 256,
         num_train_steps=40000,
         wandb_enabled=True,
     ),

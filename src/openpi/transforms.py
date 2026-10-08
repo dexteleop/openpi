@@ -97,13 +97,17 @@ def wds_v2_to_sample(item: DataDict) -> DataDict:
     injected by InjectDefaultPrompt from DataConfig.wds_prompt.
     """
     images = {k: np.asarray(v)[0] for k, v in item["observation"]["images"].items()}
-    return {
+    sample = {
         "observation": {
             "images": images,
             "state": np.asarray(item["observation"]["state"])[0],
         },
         "action": np.asarray(item["action"]),
     }
+    # LingyuDatasetV2 自带每个 sample 的 prompt, 原样透传; 没有时再由 InjectDefaultPrompt 补上
+    if "prompt" in item:
+        sample["prompt"] = item["prompt"]
+    return sample
 
 
 @dataclasses.dataclass(frozen=True)

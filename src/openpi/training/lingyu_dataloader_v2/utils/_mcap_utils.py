@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import lru_cache
 import logging
+import random
 import struct
 import threading
 import time
@@ -8,6 +9,7 @@ from typing import Any
 
 from botocore.awsrequest import AWSHTTPConnection, AWSHTTPSConnection
 from botocore.config import Config
+from botocore.exceptions import ClientError, IncompleteReadError, ReadTimeoutError, ResponseStreamingError
 
 from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import (
     BUCKET_NAME, make_client
@@ -90,6 +92,17 @@ u64 = struct.Struct("<Q").unpack_from # 8 bytes -> int
 ##########
 # 单进程连接池上限: 超过该数的并发请求仍会新建连接, 但用完即关闭, 无法复用
 S3_MAX_POOL_CONNECTIONS = 200
+# 读响应体超时/断流, 或 botocore 自身重试耗尽后仍被限流时, 整次请求的最多尝试次数;
+# 实测 OSS 网关会对个别对象区域连续卡住十几分钟, 配合 S3_READ_TIMEOUT 与最长 30s 的退避, 可容忍约 45 分钟的连续失败
+S3_READ_ATTEMPTS = 60
+# 单次读取的 socket 超时(秒); botocore 默认 60s, 卡住的连接极少自行恢复, 缩短后能更快换连接重试
+S3_READ_TIMEOUT = 20
+# 实测网关对冷数据的大 range 读取会持续卡住十几分钟, 而同一位置不超过 16KiB 的小读取能立即返回;
+# 故同一 range 读超时达到 S3_SPLIT_AFTER_ATTEMPTS 次后, 改为按 S3_SPLIT_BYTES 分片依次读取再拼接
+S3_SPLIT_AFTER_ATTEMPTS = 2
+S3_SPLIT_BYTES = 16 * 1024
+# 视为限流/服务端暂时不可用、值得退避后重试的 HTTP 状态码
+S3_THROTTLE_STATUS = {429, 500, 503}
 
 # 当前线程最近一次新建 TCP 连接的耗时(ms); None 表示本次请求复用了池内空闲连接
 _tcp_connect_local = threading.local()
@@ -114,7 +127,8 @@ AWSHTTPSConnection._new_conn = _new_conn_timed
 @lru_cache(maxsize=1)
 def s3_client():
     """boto3 client 内部带连接池, 全进程复用一个即可"""
-    return make_client(Config(max_pool_connections=S3_MAX_POOL_CONNECTIONS))
+    return make_client(Config(max_pool_connections=S3_MAX_POOL_CONNECTIONS, read_timeout=S3_READ_TIMEOUT,
+                              retries={"mode": "legacy", "max_attempts": 10}))  # OSS 限流返回 429 TooManyRequests, 只有 legacy 模式会重试
 
 
 def pool_stats() -> list[dict[str, Any]]:
@@ -172,16 +186,47 @@ def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
     # length<=0 会拼出非法 Range, S3 可能直接返回整个对象
     assert length > 0 and offset >= 0, f"非法读取范围: length={length}, offset={offset}"
     byte_range = f"bytes={offset}-{offset + length - 1}"
-    _tcp_connect_local.connect_ms = None  # 清空本线程上一次请求的建连记录
-    request_start = time.perf_counter()
-    response = s3_client().get_object(Bucket=BUCKET_NAME, Key=mcap_url, Range=byte_range)
-    header_received = time.perf_counter()
-    data_bytes = response["Body"].read()
+    for attempt_idx in range(S3_READ_ATTEMPTS):
+        _tcp_connect_local.connect_ms = None  # 清空本线程上一次请求的建连记录
+        request_start = time.perf_counter()
+        try:
+            response = s3_client().get_object(Bucket=BUCKET_NAME, Key=mcap_url, Range=byte_range)
+            header_received = time.perf_counter()
+            data_bytes = response["Body"].read()
+            break
+        except (ReadTimeoutError, ResponseStreamingError, IncompleteReadError, ClientError) as error:
+            # ClientError 只重试限流类(如 TooManyRequests), NoSuchKey 等其它错误照常抛出
+            is_throttled = (not isinstance(error, ClientError)
+                            or error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") in S3_THROTTLE_STATUS)
+            if not is_throttled or attempt_idx == S3_READ_ATTEMPTS - 1:
+                raise
+            if (not isinstance(error, ClientError) and length > S3_SPLIT_BYTES
+                    and attempt_idx + 1 >= S3_SPLIT_AFTER_ATTEMPTS):
+                logger.warning(f"读取 {mcap_url} {byte_range} 已连续失败 {attempt_idx + 1} 次, "
+                               f"改为按 {S3_SPLIT_BYTES} 字节分片读取")
+                return _fetch_mcap_bytes_in_pieces(mcap_url, length, offset)
+            # 指数退避 + 随机抖动, 避免大量 worker 同时重试再次形成请求洪峰
+            backoff_seconds = min(2 ** attempt_idx, 30) * random.uniform(0.5, 1.5)
+            logger.warning(f"读取 {mcap_url} {byte_range} 失败({type(error).__name__}), "
+                           f"{backoff_seconds:.1f}s 后第 {attempt_idx + 2} 次尝试")
+            time.sleep(backoff_seconds)
     read_end = time.perf_counter()
     if logger.isEnabledFor(logging.DEBUG):
         _log_fetch_timing(mcap_url, offset, len(data_bytes),
                           request_start, header_received, read_end)
     return data_bytes
+
+
+def _fetch_mcap_bytes_in_pieces(mcap_url: str, length: int, offset: int) -> bytes:
+    """把一次大 range 读取拆成若干个不超过 S3_SPLIT_BYTES 的小读取, 依次读取后拼接; 读到文件尾即停止"""
+    pieces = []
+    for piece_offset in range(offset, offset + length, S3_SPLIT_BYTES):
+        piece_length = min(S3_SPLIT_BYTES, offset + length - piece_offset)
+        piece = fetch_mcap_bytes(mcap_url, piece_length, piece_offset)  # 小于 S3_SPLIT_BYTES, 不会再次分片
+        pieces.append(piece)
+        if len(piece) < piece_length:
+            break
+    return b"".join(pieces)
 
 
 ##########

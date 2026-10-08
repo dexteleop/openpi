@@ -10,20 +10,20 @@
       -> (该 episode 所在的 data_file, row_group, 该 episode 内的 sample_idx)
       -> 直接 read_row_group 读出那一行的 samples 列, 只把 samples[sample_idx] 转成 Python 对象
       -> {topic: {msg_type, msg_def, log_time, locations}}
-      -> 全部 topic 的全部 location 按 record_length 从大到小提交线程池, 并行从 S3 读取并反序列化,
-         再按 topic 归组
+      -> 全部 topic 的全部 location 按所在 chunk 分组, 组内间隔不超过 MERGE_GAP 的并成一段,
+         一段一次 S3 range 请求, 按段提交线程池并行读取、切片、反序列化, 再按 topic 归组
       -> 视频 topic 并行解码出当前帧; state/action topic 按 model_config 的拼接顺序拼成向量
 
-__getitem__ 的输出与 lingyu_dataloader/webdataset_load_tar.py 对齐(只多一个 prompt)::
-    {"observation": {"images": {"left_color": (1, C, H, W) float32 [0,1], ...},
-                     "state":  (1, state_dim) float32},
+__getitem__ 的输出为单帧、不带前导帧维度的样本(可直接进 RepackTransform)::
+    {"observation": {"images": {"left_color": (C, H, W) float32 [0,1], ...},
+                     "state":  (state_dim,) float32},
      "action": (ACTION_CHUNK_LENGTH, action_dim) float32,
      "prompt": str}
 图像为 channel-first、缩放到 [0,1]; state/action 原样拼接, 不做归一化与单位换算。
 
 不经 Iceberg scan: 它每次都要遍历全部 manifest 与候选文件的 footer 才能找到这一行, 且会把整个
 episode 的上千个 sample 都转成 Python 对象; 索引里已记下物理位置, 直接读那个 row group 即可。
-fetcher 是模块级的: DataLoader 以 spawn 起多进程时每个 worker 各建一份, 不会有任何句柄跨进程传递。
+fetcher 是模块级的: DataLoader 以 forkserver 起 worker 时每个 worker 各持一份 fork 出的副本, 不会有任何句柄跨进程传递。
 线程池则每次取样现建现关: 不留常驻线程, DataLoader 以 fork 起 worker 时也不会继承到失效的线程池。
 
 用法::
@@ -50,11 +50,10 @@ from openpi.training.lingyu_dataloader_v2.mcap_config.config import (
 from openpi.training.lingyu_dataloader_v2.model_config.config import (
     load_state_and_action_concat)
 from openpi.training.lingyu_dataloader_v2.utils._mcap_utils import (
+    RECORD_PREFIX,
     S3_MAX_POOL_CONNECTIONS)
 from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import (
     MCAP_Message_Fetcher)
-from openpi.training.lingyu_dataloader_v2.utils.pyiceberg_saver import (
-    LOCATION_TYPE)
 from openpi.training.lingyu_dataloader_v2.utils.ros2_message_filter import (
     ros2_message_filter)
 from openpi.training.lingyu_dataloader_v2.utils.video_frame_decoder import (
@@ -68,9 +67,12 @@ VIDEO_TOPIC_TO_KEY = {
     '/right/color/image_raw/ffmpeg': 'right_color',
     '/xr_video_topic/ffmpeg': 'head_camera',
 }
-# 一个 sample 内并行读 message 的线程数。一个 sample 约 180 个 location、每个 2 次 S3 请求;
-# 实测每次请求 boto3 要占约 1.1ms 持 GIL 的 CPU, 8 线程后墙钟时间不再下降, 再多只会多建连接
-SAMPLE_FETCH_WORKERS = 8
+# 一个 sample 内并行读 message 的线程数。全部 worker 同时在途的请求数 = num_workers x 本值;
+# 256 worker x 8 线程(2048 并发)会压垮 OSS 网关, 持续出现读超时与 TooManyRequests, 故降为 2(512 并发)
+SAMPLE_FETCH_WORKERS = 2
+# 同一 chunk 内相邻 message 的间隔不超过它就并成一次 range 读取。一个 sample 的 state/action
+# 约 122 个 location 落在 6 个 chunk 里, 合并后约 20 次请求(原为 244 次)、约 1.1MiB; 越大请求越少、多下载的无用字节越多
+MERGE_GAP = 64 * 1024
 # 全局索引里取样只需要这几列
 INDEX_COLUMNS = ("prompt", "episode_id", "num_samples", "data_file", "row_group", "sample_offset")
 
@@ -102,39 +104,70 @@ def load_sample_topics(data_file: str, row_group: int, sample_idx: int) -> dict[
     return episode_samples[sample_idx].as_py()
 
 
-def locations_to_tuples(locations: list[dict]) -> list[tuple]:
-    """Iceberg 里的 location STRUCT -> fetcher/解码器要的四元组, 顺序由 LOCATION_TYPE 决定。"""
-    return [tuple(location[field_name] for field_name in LOCATION_TYPE.names)
-            for location in locations]
+def group_location_spans(flat_locations: list[tuple[str, dict]]) -> list[tuple[str, int, list[tuple[int, dict]]]]:
+    """把展平的 (topic, location) 按所在 chunk 分组, 组内按偏移排序, 间隔不超过 MERGE_GAP 的并成一段。
+
+    返回 [(mcap_url, chunk_file_offset, [(flat_idx, location), ...]), ...], 一段对应一次 S3 range 请求;
+    flat_idx 为该 location 在 flat_locations 中的下标。
+    """
+    chunk_locations = dict()
+    for flat_idx, (_, location) in enumerate(flat_locations):
+        chunk_key = (location["mcap_url"], location["chunk_file_offset"])
+        chunk_locations.setdefault(chunk_key, []).append((flat_idx, location))
+
+    location_spans = []
+    for (mcap_url, chunk_file_offset), chunk_items in chunk_locations.items():
+        chunk_items.sort(key=lambda item: item[1]["uncompressed_byte_offset"])
+        span_end = 0
+        for item_idx, (flat_idx, location) in enumerate(chunk_items):
+            location_start = location["uncompressed_byte_offset"]
+            location_end = location_start + RECORD_PREFIX + location["record_length"]
+            # 本 chunk 的第一条, 或与上一段末尾相隔超过 MERGE_GAP: 另起一段
+            if item_idx == 0 or location_start - span_end > MERGE_GAP:
+                location_spans.append((mcap_url, chunk_file_offset, []))
+                span_end = location_end
+            location_spans[-1][2].append((flat_idx, location))
+            span_end = max(span_end, location_end)
+    return location_spans
 
 
 def fetch_sample_messages(sample_topics: dict[str, dict],
                           thread_pool: ThreadPoolExecutor) -> dict[str, list]:
-    """把一个 sample 全部 topic 的全部 location 一起提交线程池, 并行读取并反序列化。
+    """把一个 sample 全部 topic 的全部 location 按 chunk 合并成若干段, 一段一个任务提交线程池并行读取并反序列化。
 
     返回 {topic: [ros2 message, ...]}, 每个 topic 内的顺序与其 locations 顺序一致。
     """
-    # 展平成 (topic, location), 一个 location 一个任务
     flat_locations = [(topic, location) for topic, message in sample_topics.items()
                       for location in message["locations"]]
-    # 按 record_length 从大到小提交: 传输久的大包先开始, 不会排到最后拖长整体耗时
-    submit_order = sorted(range(len(flat_locations)),
-                          key=lambda flat_idx: flat_locations[flat_idx][1]["record_length"], reverse=True)
-    location_futures = dict()
-    for flat_idx in submit_order:
-        topic, location = flat_locations[flat_idx]
-        message = sample_topics[topic]
-        location_futures[flat_idx] = thread_pool.submit(
-            fetcher.fetch_message, message["msg_type"], message["msg_def"], locations_to_tuples([location]))
+    location_spans = group_location_spans(flat_locations)
+    # 按段内 message 总字节从大到小提交: 传输久的大段先开始, 不会排到最后拖长整体耗时
+    location_spans.sort(key=lambda span: sum(location["record_length"] for _, location in span[2]), reverse=True)
+    logger.debug(f"{len(flat_locations)} 个 location 合并为 {len(location_spans)} 次 S3 请求")
 
-    # 按展平前的原顺序取结果, 故各 topic 内的 message 顺序与 locations 一致
+    span_futures = []
+    for mcap_url, chunk_file_offset, span_items in location_spans:
+        span_messages = [(sample_topics[flat_locations[flat_idx][0]]["msg_type"],
+                          sample_topics[flat_locations[flat_idx][0]]["msg_def"],
+                          location["uncompressed_byte_offset"], location["record_length"])
+                         for flat_idx, location in span_items]
+        span_futures.append(([flat_idx for flat_idx, _ in span_items], thread_pool.submit(
+            fetcher.fetch_span_messages, mcap_url, chunk_file_offset, span_messages)))
+
+    # 各段结果先按 flat_idx 放回展平前的位置, 故各 topic 内的 message 顺序与 locations 一致
+    flat_messages = [None] * len(flat_locations)
+    for flat_idxs, span_future in span_futures:
+        for flat_idx, ros2_message in zip(flat_idxs, span_future.result(), strict=True):
+            flat_messages[flat_idx] = ros2_message
+    assert all(ros2_message is not None for ros2_message in flat_messages), "有 location 未被任何一段读取"
+
     topic_messages = {topic: [] for topic in sample_topics}
-    for flat_idx, (topic, _) in enumerate(flat_locations):
-        topic_messages[topic].append(location_futures[flat_idx].result()[0])
+    for (topic, _), ros2_message in zip(flat_locations, flat_messages):
+        topic_messages[topic].append(ros2_message)
     return topic_messages
 
 
-def filter_sample_messages(sample_topics: dict[str, dict]) -> dict[str, np.ndarray | list[dict]]:
+def filter_sample_messages(sample_topics: dict[str, dict],
+                           load_images: bool = True) -> dict[str, np.ndarray | list[dict]]:
     """
     输入一个 sample 的 {topic: {msg_type, msg_def, log_time, locations}},
     输出 {视频 topic: 当前帧数组, state/action topic: [{字段名: 一维数组}, ...]}。
@@ -143,8 +176,9 @@ def filter_sample_messages(sample_topics: dict[str, dict]) -> dict[str, np.ndarr
     state/action topic 的每个 location 各是一条独立 message, 反序列化后按配置取字段,
     故 state 得到长度 1 的列表, action 得到长度 ACTION_CHUNK_LENGTH 的列表(下标即未来第几步)。
     全部 location 先并行读完, 各路视频再并行解码, 最后汇成一个 dict。
+    load_images=False 时视频 topic 既不从 S3 读也不解码(compute_norm_stats 只需要 state/action)。
     """
-    video_topics_gop = load_mcap_video_topics_gop()
+    video_topics_gop = load_mcap_video_topics_gop() if load_images else {}
     state_and_action_fields = load_mcap_state_and_action_topics_fields()
     # None 是 schema 为对齐所有行补出的空位; 配置里没用到的 topic 不读
     used_topics = {topic: message for topic, message in sample_topics.items()
@@ -169,8 +203,8 @@ def concat_vector(topic_data: dict, concat_config: tuple, step_idx: int) -> np.n
 
 
 def to_image_tensor(frame: np.ndarray) -> torch.Tensor:
-    """解码出的 (H, W, 3) uint8 帧 -> (1, C, H, W) float32 [0,1]。"""
-    return torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 255.0
+    """解码出的 (H, W, 3) uint8 帧 -> (C, H, W) float32 [0,1]。"""
+    return torch.from_numpy(frame).permute(2, 0, 1).to(torch.float32) / 255.0
 
 
 class LingyuDatasetV2(torch.utils.data.Dataset):
@@ -180,8 +214,10 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
     DataLoader 的 worker 进程; 数据文件每次取样现开现读, 解压缓存在首次取样时于各自进程内建立。
     """
 
-    def __init__(self, warehouse_dir: str = WAREHOUSE_DIR):
+    def __init__(self, warehouse_dir: str = WAREHOUSE_DIR, load_images: bool = True):
         self.warehouse_dir = warehouse_dir
+        # False: 只取 state/action, 输出的 images 为空 dict
+        self.load_images = load_images
         self.episodes = load_episode_index(warehouse_dir)
         # 升序的 episode 起点, 供 bisect 由全局 sample 编号反查 episode
         self.sample_offsets = [episode["sample_offset"] for episode in self.episodes]
@@ -189,7 +225,8 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
         self.state_concat, self.action_concat = load_state_and_action_concat()
 
         logger.info(f"{self.num_samples} samples in {len(self.episodes)} episodes "
-                    f"({len(set(e['prompt'] for e in self.episodes))} prompts) from {warehouse_dir}")
+                    f"({len(set(e['prompt'] for e in self.episodes))} prompts) from {warehouse_dir}, "
+                    f"load_images={load_images}")
 
     def __len__(self):
         """全部 prompt 的 sample 总数, 直接取自全局索引。"""
@@ -211,7 +248,7 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
         episode = self.locate_episode(index)
         prompt = episode["prompt"]
         topic_data = filter_sample_messages(load_sample_topics(
-            episode["data_file"], episode["row_group"], index - episode["sample_offset"]))
+            episode["data_file"], episode["row_group"], index - episode["sample_offset"]), self.load_images)
 
         # action 的步数由数据本身决定(即 locations 条数), 与 ACTION_CHUNK_LENGTH 一致
         action_steps = len(topic_data[self.action_concat[0][0]])
@@ -223,7 +260,7 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
             "observation": {
                 "images": {key: to_image_tensor(topic_data[topic])
                            for topic, key in VIDEO_TOPIC_TO_KEY.items() if topic in topic_data},
-                "state": torch.from_numpy(state[None]),
+                "state": torch.from_numpy(state),
             },
             "action": torch.from_numpy(action),
             "prompt": prompt,

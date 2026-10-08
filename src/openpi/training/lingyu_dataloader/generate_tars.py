@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from .generate_episode import generate_episodes_idxs
 except :
-    from openpi.training.lingyu_dataloader.generate_episode import generate_episodes_idxs
+    from openpi.training.data_loader_lingyu.generate_episode import generate_episodes_idxs
 
 SAMPLES_PER_SHARD = 100
 VIDEO_TOPICS = {

@@ -15,9 +15,7 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 from openpi.training.lingyu_dataloader.webdataset_load_tar import TeleavatarTarDataset
-from openpi.training.lingyu_dataloader.webdataset_load_tar import find_video_index
-from openpi.training.lingyu_dataloader.webdataset_load_tar import preload_decoders
-from openpi.training.lingyu_dataloader.webdataset_load_tar import worker_init_preload
+from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import LingyuDatasetV2
 import openpi.transforms as _transforms
 
 # torch.utils.data.DataLoader picks map-style vs iterable-style with an
@@ -166,12 +164,16 @@ def create_torch_wds_dataset(
     action_horizon: int,
     model_config: _model.BaseModelConfig,
 ) -> Dataset:
-    if data_config.wds_data_dir is None:
-        raise ValueError("wds_data_dir is not set. Cannot create WDS dataset.")
     if data_config.repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
     return TeleavatarTarDataset(data_config.wds_data_dir, preload=False)
+
+
+def create_lingyu_dataset_v2(
+    data_config: _config.DataConfig,
+) -> Dataset:
+    return LingyuDatasetV2(data_config.iceberg_dir)
 
 
 def create_rlds_dataset(
@@ -323,7 +325,8 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     # dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = create_torch_wds_dataset(data_config, action_horizon, model_config)
+    # dataset = create_torch_wds_dataset(data_config, action_horizon, model_config)
+    dataset = create_lingyu_dataset_v2(data_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
@@ -452,12 +455,6 @@ class TorchDataLoader:
         mp_context = None
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
-        else:
-            # No worker process to preload in, so build the video decoders here
-            # instead -- _worker_init_fn never runs when num_workers == 0.
-            video_index = find_video_index(dataset)
-            if video_index:
-                preload_decoders(video_index)
 
         generator = torch.Generator()
         generator.manual_seed(seed)
@@ -610,13 +607,6 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-
-    # Build this worker's video decoders up front. Without it each worker builds
-    # them lazily during its first batches, so the ~1.2s of container-build work
-    # lands as scattered per-sample stalls (up to 0.43s each on this corpus)
-    # instead of once at startup. Harmless for datasets that carry no video
-    # index -- it is a no-op then.
-    worker_init_preload(worker_id)
 
 
 class RLDSDataLoader:

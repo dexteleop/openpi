@@ -14,7 +14,7 @@ from openpi.policies import teleavatar_v2_policy as _teleavatar
 from openpi.shared import image_tools
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
-from openpi.training.lingyu_dataloader import webdataset_load_tar as _wds_tar
+from openpi.training.data_loader_lingyu import webdataset_load_tar as _wds_tar
 
 def _require_wds_data() -> _config.TrainConfig:
     """Return the WDS train config, skipping if its .tar shards are missing."""

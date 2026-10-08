@@ -12,7 +12,7 @@ from openpi.training.lingyu_dataloader_v2.utils._mcap_utils import (
     # MCAP Record 类型
     OP_MESSAGE,
     # MCAP常见结构长度
-    RECORD_PREFIX, MESSAGE_HEADER, CHUNK_HEADER_FIXED,
+    OPCODE_PREFIX, RECORD_PREFIX, MESSAGE_HEADER, CHUNK_HEADER_FIXED,
     # 字节流转整数
     u32, u64,
     # MCAP功能函数
@@ -95,6 +95,22 @@ def _message_cdr(msg_record: bytes, chunk_file_offset: int, uncompressed_byte_of
     return msg_record[RECORD_PREFIX+MESSAGE_HEADER:]
 
 
+def slice_span_cdr(span_bytes: bytes, span_start: int,
+                   uncompressed_byte_offset: int, msg_record_length: int) -> bytes | None:
+    """从按未压缩 chunk 读出的 records 区字节段里切出一条 message 的 CDR。
+
+    span_bytes 是 records 区内从 span_start 起的一段; 切出的记录 opcode 与长度字段都须与索引一致,
+    否则返回 None(如 chunk 实际被压缩, 文件内偏移与解压流内偏移不同), 由调用方退回 fetch_data_bytes。
+    """
+    record_pos = uncompressed_byte_offset - span_start
+    assert record_pos >= 0, f"message 偏移 {uncompressed_byte_offset} 在读取段起点 {span_start} 之前"
+    msg_record = span_bytes[record_pos: record_pos + RECORD_PREFIX + msg_record_length]
+    if (len(msg_record) != RECORD_PREFIX + msg_record_length
+            or msg_record[0] != OP_MESSAGE or u64(msg_record, OPCODE_PREFIX)[0] != msg_record_length):
+        return None
+    return msg_record[RECORD_PREFIX + MESSAGE_HEADER:]
+
+
 class MCAP_Message_Fetcher:
     """
     按 locations 随机读取并反序列化 mcap 中的 message。
@@ -138,3 +154,26 @@ class MCAP_Message_Fetcher:
                 self._typestore.deserialize_cdr(data_bytes, msg_type)
             )
         return message
+
+    def fetch_span_messages(self, mcap_url: str, chunk_file_offset: int, span_messages: list[tuple]) -> list:
+        """一次 range 读取同一 chunk 内一段相邻的 message, 再逐条切片、反序列化。
+
+        span_messages 为 [(msg_type, msg_def, uncompressed_byte_offset, record_length), ...], 可跨 topic;
+        按未压缩 chunk 直接算出 records 区起点, 省去读 chunk header 的那次请求。
+        切片校验不通过的 message(压缩 chunk)退回 fetch_data_bytes 逐条读取。返回顺序与 span_messages 一致。
+        """
+        assert span_messages, "span_messages 不能为空"
+        span_start = min(span_message[2] for span_message in span_messages)
+        span_end = max(span_message[2] + RECORD_PREFIX + span_message[3] for span_message in span_messages)
+        # 未压缩 chunk 的 header 中 compression 为空串(name_len=0), records 区紧跟其后
+        records_start = chunk_file_offset + RECORD_PREFIX + CHUNK_HEADER_FIXED
+        span_bytes = fetch_mcap_bytes(mcap_url, span_end - span_start, records_start + span_start)
+
+        messages = []
+        for msg_type, msg_def, uncompressed_byte_offset, msg_record_length in span_messages:
+            cdr_bytes = slice_span_cdr(span_bytes, span_start, uncompressed_byte_offset, msg_record_length)
+            if cdr_bytes is None:
+                cdr_bytes = fetch_data_bytes(mcap_url, chunk_file_offset, uncompressed_byte_offset, msg_record_length)
+            self._ensure_type_registered(msg_type, msg_def)
+            messages.append(self._typestore.deserialize_cdr(cdr_bytes, msg_type))
+        return messages

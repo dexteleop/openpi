@@ -1,13 +1,13 @@
 import dataclasses
-import functools
+import functools  # noqa: F401  (used by the disabled train step below)
 import gc
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
 import flax.nnx as nnx
-from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
 import jax.experimental
@@ -21,12 +21,17 @@ import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
-import openpi.training.config as _config
-import openpi.training.data_loader as _data_loader
+import openpi.training.config_lingyu as _config
+import openpi.training.data_loader_lingyu as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+# Data-loader benchmarking mode: the model init and the train step (loss/grad/update) are
+# disabled below, and each step just sleeps for this long to stand in for the compute.
+# 设为 0: 不模拟计算, 主循环全速取 batch, 测出的 samples_per_s 即 loader 的最大吞吐
+COMPUTE_SLEEP_S = 0.0
 
 
 def init_logging():
@@ -46,6 +51,10 @@ def init_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
+    # 同时写入 scripts/train.log; forkserver 起的 worker 不继承这里的配置, 其异常经 torch 传回主进程再记录
+    file_handler = logging.FileHandler(__file__.removesuffix(".py") + ".log", mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
@@ -208,7 +217,7 @@ def main(config: _config.TrainConfig):
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
-    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    # replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
@@ -224,7 +233,10 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
+    # 首个 batch 含 worker 启动与单个 worker 串行取满一个 batch, 单独记录, 不计入稳态吞吐
+    first_batch_start = time.perf_counter()
     batch = next(data_iter)
+    logging.info(f"First batch took {time.perf_counter() - first_batch_start:.1f}s (worker startup included)")
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -234,21 +246,22 @@ def main(config: _config.TrainConfig):
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    # --- Model init / weight loading disabled: we only benchmark the data loader. ---
+    # train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    # jax.block_until_ready(train_state)
+    # logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    #
+    # if resuming:
+    #     train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+    #
+    # ptrain_step = jax.jit(
+    #     functools.partial(train_step, config),
+    #     in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+    #     out_shardings=(train_state_sharding, replicated_sharding),
+    #     donate_argnums=(1,),
+    # )
 
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
-
-    start_step = int(train_state.step)
+    start_step = 0
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -257,24 +270,38 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    interval_start = time.perf_counter()  # 本日志间隔的起点, 用于算 samples_per_s
     for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
+        # --- Loss / grad / optimizer update disabled: stand in with a fixed sleep. ---
+        # with sharding.set_mesh(mesh):
+        #     train_state, info = ptrain_step(train_rng, train_state, batch)
+        time.sleep(COMPUTE_SLEEP_S)
+
+        # Time how long the loader takes to hand us the next batch. If this is close to
+        # zero the loader is keeping up with the (simulated) compute; if it is large the
+        # loader is the bottleneck.
+        data_start = time.perf_counter()
+        batch = next(data_iter)
+        data_time = time.perf_counter() - data_start
+
+        infos.append({"data_time": data_time})
         if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            reduced_info = {k: float(np.mean([i[k] for i in infos])) for k in infos[0]}
+            reduced_info["data_time_max"] = max(i["data_time"] for i in infos)
+            # 本间隔消费的样本数 / 墙钟耗时(含 COMPUTE_SLEEP_S)
+            reduced_info["samples_per_s"] = len(infos) * config.batch_size / (time.perf_counter() - interval_start)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            logging.info(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
+            interval_start = time.perf_counter()
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        # --- Checkpointing disabled: there is no train state to save. ---
+        # if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        #     _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
-    logging.info("Waiting for checkpoint manager to finish")
-    checkpoint_manager.wait_until_finished()
+    # logging.info("Waiting for checkpoint manager to finish")
+    # checkpoint_manager.wait_until_finished()
 
     # Shut the data loader down here rather than leaving it to the garbage
     # collector: otherwise DataLoader.__del__ joins its worker processes during

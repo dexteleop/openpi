@@ -14,42 +14,9 @@ def make_teleavatar_example() -> dict:
     """Creates a random input example for the Teleavatar policy (v2 robot formats)."""
     return {
         "observation/state": np.random.rand(62),
-        "observation/images/left_color": np.random.randint(256, size=(800, 2560, 3), dtype=np.uint8),
-        "observation/images/right_color": np.random.randint(256, size=(800, 2560, 3), dtype=np.uint8),
-        "observation/images/head_camera": np.random.randint(256, size=(1920, 3840, 3), dtype=np.uint8),
         "actions": np.random.rand(62),
         "prompt": "pick a cube and place it on another cube",
     }
-
-
-def _parse_image(image) -> np.ndarray:
-    """Parse image to uint8 (H,W,C) format following LeRobot conventions."""
-    image = np.asarray(image)
-    if np.issubdtype(image.dtype, np.floating):
-        image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
-        image = einops.rearrange(image, "c h w -> h w c")
-    return image
-
-
-def _extract_stereo_view(image: np.ndarray, side: str, *, rotate: bool = False) -> np.ndarray:
-    """Crop one eye from a side-by-side stereo frame, optionally rotating 180°
-    first (rotation applies to the full stereo frame, before the crop).
-
-    The crop is gated on ``width >= 2 * height`` so an already-cropped frame
-    (e.g. an inference path that pre-crops) is left untouched: raw stereo
-    frames are at least 2:1 (v2 head 3840×1920 → 2:1, v2 left/right
-    2560×800 → 3.2:1) while cropped eyes fall below it (1:1 and 1.6:1
-    respectively). The v1 robot's mono 848×480 left/right images (~1.77:1)
-    also pass through unchanged.
-    """
-    height, width = image.shape[:2]
-    if width >= 2 * height:
-        if rotate:
-            image = np.rot90(image, k=2)
-        half = width // 2
-        image = image[:, :half, :] if side == "left" else image[:, half:, :]
-    return image
 
 
 # v2 platform gripper force control: the controller takes a float32 trigger
@@ -95,11 +62,6 @@ class TeleavatarInputs(transforms.DataTransformFn):
     We extract: [left_arm_pos(7), right_arm_pos(7)]
     - Indices 0-6: Left arm positions (from input[0:7])
     - Indices 7-13: Right arm positions (from input[8:15])
-
-    **Cameras (v2 robot):** all three streams are side-by-side stereo; one eye
-    is cropped out per camera (see __call__). On the v1 robot only the head
-    camera is stereo — the left/right images are mono and the shape guard in
-    _extract_stereo_view leaves them untouched.
     """
     model_type: _model.ModelType
     # Whether to rotate 180° before cropping the head frame. Property of the
@@ -120,24 +82,6 @@ class TeleavatarInputs(transforms.DataTransformFn):
     state_action_selected: bool = False
 
     def __call__(self, data: dict) -> dict:
-        # Parse images to uint8 (H,W,C) format
-        # LeRobot stores as float32 (C,H,W) during training, but runtime sends uint8 (H,W,C)
-        left_color = _parse_image(data["observation/images/left_color"])
-        right_color = _parse_image(data["observation/images/right_color"])
-        head_color = _parse_image(data["observation/images/head_camera"])
-        # Crop one eye from each side-by-side stereo frame. The head keeps its
-        # left eye (rotated 180° first iff the configured source orientation
-        # says so). The left/right cameras keep their INNER eye — right eye of
-        # the left camera, left eye of the right camera — so both look at the
-        # middle of the desktop workspace. The width guard inside
-        # _extract_stereo_view makes all three no-ops when frames already
-        # arrive cropped (by ros2_interface) or mono (v1 robot left/right).
-        head_color = _extract_stereo_view(
-            head_color, "left", rotate=self.rotate_head_camera
-        )
-        left_color = _extract_stereo_view(left_color, "right")
-        right_color = _extract_stereo_view(right_color, "left")
-
         # Extract 14-dim state from the observation vector (62-dim on v2,
         # 48-dim on v1 — position indices are identical in both layouts).
         # Input layout: [positions(0-15), velocities(16-31), efforts(32-47), (v2) ee_pose(48-61)]
@@ -155,16 +99,6 @@ class TeleavatarInputs(transforms.DataTransformFn):
         # Map teleavatar cameras to the expected model inputs.
         inputs = {
             "state": state_14d,
-            "image": {
-                "base_0_rgb": head_color,       
-                "left_wrist_0_rgb": left_color,  
-                "right_wrist_0_rgb": right_color,  
-            },
-            "image_mask": {
-                "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_,
-            },
         }
 
         # Extract 16-dim actions from the dataset action vector during training

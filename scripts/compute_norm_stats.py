@@ -106,11 +106,13 @@ def create_torch_dataloader(
     skip_video: bool = False,
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
-        raise ValueError("Data config must have a repo_id")
+        # raise ValueError("Data config must have a repo_id")
+        pass
     if skip_video:
         dataset = _create_torch_dataset_skip_video(data_config, action_horizon, model_config)
     else:
-        dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+        # dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+        dataset = _data_loader.create_lingyu_dataset_v2(data_config)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -279,7 +281,7 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None, skip_video: bool = True):
+def main(config_name: str, max_frames: int | None = None, skip_video: bool = False):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -304,7 +306,8 @@ def main(config_name: str, max_frames: int | None = None, skip_video: bool = Tru
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # repo_id 为 None 时直接写到 assets_dirs 下
+    output_path = config.assets_dirs if data_config.repo_id is None else config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
