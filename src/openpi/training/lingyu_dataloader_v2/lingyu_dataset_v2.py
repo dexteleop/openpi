@@ -15,11 +15,12 @@
       -> 视频 topic 并行解码出当前帧; state/action topic 按 model_config 的拼接顺序拼成向量
 
 __getitem__ 的输出为单帧、不带前导帧维度的样本(可直接进 RepackTransform)::
-    {"observation": {"images": {"left_color": (C, H, W) float32 [0,1], ...},
+    {"observation": {"images": {"left_color": (H, W, 3) uint8, ...},
                      "state":  (state_dim,) float32},
      "action": (ACTION_CHUNK_LENGTH, action_dim) float32,
      "prompt": str}
-图像为 channel-first、缩放到 [0,1]; state/action 原样拼接, 不做归一化与单位换算。
+图像保持解码器输出的 uint8 HWC, 不转 float: 下游 _parse_image/ResizeImages 本就按 uint8 HWC 处理,
+转成 float32 再转回只会多出数倍大小的临时数组; state/action 原样拼接, 不做归一化与单位换算。
 
 不经 Iceberg scan: 它每次都要遍历全部 manifest 与候选文件的 footer 才能找到这一行, 且会把整个
 episode 的上千个 sample 都转成 Python 对象; 索引里已记下物理位置, 直接读那个 row group 即可。
@@ -202,11 +203,6 @@ def concat_vector(topic_data: dict, concat_config: tuple, step_idx: int) -> np.n
                            for topic, field_name in concat_config]).astype(np.float32)
 
 
-def to_image_tensor(frame: np.ndarray) -> torch.Tensor:
-    """解码出的 (H, W, 3) uint8 帧 -> (C, H, W) float32 [0,1]。"""
-    return torch.from_numpy(frame).permute(2, 0, 1).to(torch.float32) / 255.0
-
-
 class LingyuDatasetV2(torch.utils.data.Dataset):
     """以全局 sample 编号随机取样: 索引来自 episode_index.parquet, 数据来自 Iceberg 数据文件 + mcap。
 
@@ -258,7 +254,7 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
 
         return {
             "observation": {
-                "images": {key: to_image_tensor(topic_data[topic])
+                "images": {key: topic_data[topic]
                            for topic, key in VIDEO_TOPIC_TO_KEY.items() if topic in topic_data},
                 "state": torch.from_numpy(state),
             },

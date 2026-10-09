@@ -7,7 +7,7 @@
     1. len(dataset) == episode_index.parquet 里 num_samples 之和
     2. locate_sample 与 DuckDB 直接反查的 (prompt, episode_id, sample_idx) 完全一致
     3. 随机 5 个样本都能取出, 且为不带前导帧维度的单帧结构:
-       images 为 (C, H, W) float32 [0,1], state 为 (state_dim,), action 为 (chunk, action_dim)
+       images 为 (H, W, 3) uint8, state 为 (state_dim,), action 为 (chunk, action_dim)
     4. state/action 的维度 == 各自拼接配置里字段长度之和, 即拼接顺序真的被用上了
     5. 同一 episode 内相邻的两个样本各不相同(取到的不是同一帧/同一条 message)
 每个随机样本存到 lingyu_dataset_v2_output/sample_<全局编号>/: 各 camera 存为 png, state/action 存为 json
@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import duckdb
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -100,10 +101,9 @@ def test():
         state, action = sample["observation"]["state"], sample["action"]
         assert images, "没有解码出任何图像"
         for camera_key, frame in images.items():
-            assert frame.ndim == 3 and frame.shape[0] == 3, \
-                f"{camera_key} 不是 (C, H, W): {tuple(frame.shape)}"
-            assert frame.dtype == torch.float32 and 0.0 <= frame.min() and frame.max() <= 1.0, \
-                f"{camera_key} 未缩放到 [0,1] float32"
+            assert frame.ndim == 3 and frame.shape[2] == 3, \
+                f"{camera_key} 不是 (H, W, 3): {tuple(frame.shape)}"
+            assert frame.dtype == np.uint8, f"{camera_key} 不是 uint8: {frame.dtype}"
         assert state.ndim == 1 and state.dtype == torch.float32, \
             f"state 不是 (state_dim,) float32: {tuple(state.shape)}"
         assert action.shape[0] == load_action_chunk_length(), \
@@ -270,9 +270,7 @@ def _save_sample(sample: dict, global_sample_idx: int, located: tuple):
     sample_dir = _OUTPUT_DIR / f"sample_{global_sample_idx}"
     sample_dir.mkdir(parents=True, exist_ok=True)
     for camera_key, frame in sample["observation"]["images"].items():
-        # (C, H, W) float [0,1] -> (H, W, C) uint8, 即 to_image_tensor 的逆变换
-        frame_rgb = (frame.permute(1, 2, 0) * 255.0).round().to(torch.uint8).numpy()
-        Image.fromarray(frame_rgb).save(sample_dir / f"{camera_key}.png")
+        Image.fromarray(frame).save(sample_dir / f"{camera_key}.png")  # 已是 (H, W, 3) uint8
 
     prompt, episode_id, sample_idx = located
     json_path = sample_dir / "state_action.json"
