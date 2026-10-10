@@ -12,15 +12,18 @@
       -> {topic: {msg_type, msg_def, log_time, locations}}
       -> 全部 topic 的全部 location 按所在 chunk 分组, 组内间隔不超过 MERGE_GAP 的并成一段,
          一段一次 S3 range 请求, 按段提交线程池并行读取、切片、反序列化, 再按 topic 归组
-      -> 视频 topic 并行解码出当前帧; state/action topic 按 model_config 的拼接顺序拼成向量
+      -> 视频 topic 发给 GPU 解码进程, 解码、裁出单目、缩放都在 GPU 上完成;
+         state/action topic 按 model_config 的拼接顺序拼成向量
 
 __getitem__ 的输出为单帧、不带前导帧维度的样本(可直接进 RepackTransform)::
-    {"observation": {"images": {"left_color": (H, W, 3) uint8, ...},
+    {"observation": {"images": {"left_color": (140, 224, 3) uint8, "head_camera": (224, 224, 3) uint8, ...},
                      "state":  (state_dim,) float32},
      "action": (ACTION_CHUNK_LENGTH, action_dim) float32,
      "prompt": str}
-图像保持解码器输出的 uint8 HWC, 不转 float: 下游 _parse_image/ResizeImages 本就按 uint8 HWC 处理,
-转成 float32 再转回只会多出数倍大小的临时数组; state/action 原样拼接, 不做归一化与单位换算。
+图像已按 openpi 的变换在 GPU 上裁好单目(TeleavatarInputs)并不变形缩放(ResizeImages 的 resize_with_pad),
+下游这两步遇到这样的图分别原样通过、只补黑边, 故 openpi 配置不变; worker 里不再有整幅 4K 帧的解码与缩放。
+裁剪与缩放参数不另行配置, 由 load_video_decode_config() 从 openpi 的 DataConfig 里取。
+uint8 HWC 不转 float; state/action 原样拼接, 不做归一化与单位换算。
 
 不经 Iceberg scan: 它每次都要遍历全部 manifest 与候选文件的 footer 才能找到这一行, 且会把整个
 episode 的上千个 sample 都转成 Python 对象; 索引里已记下物理位置, 直接读那个 row group 即可。
@@ -28,7 +31,9 @@ fetcher 是模块级的: DataLoader 以 forkserver 起 worker 时每个 worker �
 线程池则每次取样现建现关: 不留常驻线程, DataLoader 以 fork 起 worker 时也不会继承到失效的线程池。
 
 用法::
-    dataset = LingyuDatasetV2()
+    video_key_to_crop, image_resolution = load_video_decode_config(data_config)
+    dataset = LingyuDatasetV2(data_config.iceberg_dir, video_key_to_crop=video_key_to_crop,
+                              image_resolution=image_resolution)
 """
 from __future__ import annotations
 
@@ -42,6 +47,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
+from openpi.policies import teleavatar_v2_policy
 from openpi.training.lingyu_dataloader_v2.build_sample_idx import (
     GLOBAL_INDEX_NAME,
     WAREHOUSE_DIR)
@@ -58,7 +64,9 @@ from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import (
 from openpi.training.lingyu_dataloader_v2.utils.ros2_message_filter import (
     ros2_message_filter)
 from openpi.training.lingyu_dataloader_v2.utils.video_frame_decoder import (
-    cpu_decode_current_frame)
+    gpu_decode_current_frames,
+    start_gpu_decoders)
+import openpi.transforms as _transforms
 
 
 # Constants
@@ -80,6 +88,21 @@ INDEX_COLUMNS = ("prompt", "episode_id", "num_samples", "data_file", "row_group"
 logger = logging.getLogger(__name__)
 
 fetcher = MCAP_Message_Fetcher()
+
+
+def load_video_decode_config(data_config) -> tuple[dict[str, tuple[str, bool]], tuple[int, int]]:
+    """从 openpi 的 DataConfig 取出 GPU 解码要复刻的图像变换参数, 返回 ({相机名: (保留哪只眼, 是否先转 180°)}, (高, 宽))。
+
+    取眼规则来自 teleavatar_v2_policy.STEREO_EYES, 旋转来自 TeleavatarInputs.rotate_head_camera(与它一样只转头部相机),
+    (高, 宽) 来自 model_transforms 里的 ResizeImages; 改这些配置, GPU 解码随之改变, 不会与 openpi 的变换不一致。
+    """
+    teleavatar_inputs = next(transform for transform in data_config.data_transforms.inputs
+                             if isinstance(transform, teleavatar_v2_policy.TeleavatarInputs))
+    resize_images = next(transform for transform in data_config.model_transforms.inputs
+                         if isinstance(transform, _transforms.ResizeImages))
+    video_key_to_crop = {key: (eye, key == "head_camera" and teleavatar_inputs.rotate_head_camera)
+                         for key, eye in teleavatar_v2_policy.STEREO_EYES.items()}
+    return video_key_to_crop, (resize_images.height, resize_images.width)
 
 
 def load_episode_index(warehouse_dir: str) -> list[dict]:
@@ -167,19 +190,21 @@ def fetch_sample_messages(sample_topics: dict[str, dict],
     return topic_messages
 
 
-def filter_sample_messages(sample_topics: dict[str, dict],
-                           load_images: bool = True) -> dict[str, np.ndarray | list[dict]]:
+def filter_sample_messages(sample_topics: dict[str, dict], gpu_decoder_address: str | None = None,
+                           video_key_to_crop: dict[str, tuple[str, bool]] | None = None,
+                           image_resolution: tuple[int, int] | None = None) -> dict[str, np.ndarray | list[dict]]:
     """
     输入一个 sample 的 {topic: {msg_type, msg_def, log_time, locations}},
     输出 {视频 topic: 当前帧数组, state/action topic: [{字段名: 一维数组}, ...]}。
 
-    视频 topic 的 locations 是一整段 GOP, 解码后只留最后一帧(即当前帧);
+    视频 topic 的 locations 是一整段 GOP, 交给 gpu_decoder_address 处的 GPU 解码进程, 只取回最后一帧(即当前帧),
+    按 video_key_to_crop 裁单目(及旋转)、按 image_resolution 缩放, 二者取自 load_video_decode_config();
     state/action topic 的每个 location 各是一条独立 message, 反序列化后按配置取字段,
     故 state 得到长度 1 的列表, action 得到长度 ACTION_CHUNK_LENGTH 的列表(下标即未来第几步)。
-    全部 location 先并行读完, 各路视频再并行解码, 最后汇成一个 dict。
-    load_images=False 时视频 topic 既不从 S3 读也不解码(compute_norm_stats 只需要 state/action)。
+    全部 location 先并行读完, 各路视频再一次发给解码进程并行解码, 最后汇成一个 dict。
+    gpu_decoder_address 为 None 时视频 topic 既不从 S3 读也不解码(compute_norm_stats 只需要 state/action)。
     """
-    video_topics_gop = load_mcap_video_topics_gop() if load_images else {}
+    video_topics_gop = load_mcap_video_topics_gop() if gpu_decoder_address else {}
     state_and_action_fields = load_mcap_state_and_action_topics_fields()
     # None 是 schema 为对齐所有行补出的空位; 配置里没用到的 topic 不读
     used_topics = {topic: message for topic, message in sample_topics.items()
@@ -187,13 +212,16 @@ def filter_sample_messages(sample_topics: dict[str, dict],
 
     with ThreadPoolExecutor(max_workers=SAMPLE_FETCH_WORKERS) as thread_pool:
         topic_messages = fetch_sample_messages(used_topics, thread_pool)
-        # 各路视频互不依赖, PyAV 解码时释放 GIL, 故同样放进线程池并行
-        frame_futures = {topic: thread_pool.submit(cpu_decode_current_frame, packets)
-                         for topic, packets in topic_messages.items() if topic in video_topics_gop}
-        topic_data = {topic: [ros2_message_filter(topic, ros2_message) for ros2_message in ros2_messages]
-                      for topic, ros2_messages in topic_messages.items() if topic in state_and_action_fields}
-        topic_data.update({topic: future.result() for topic, future in frame_futures.items()})
+    topic_data = {topic: [ros2_message_filter(topic, ros2_message) for ros2_message in ros2_messages]
+                  for topic, ros2_messages in topic_messages.items() if topic in state_and_action_fields}
 
+    # 一个 sample 的各路视频合成一次请求, 解码进程里各路并行解
+    video_topics = [topic for topic in topic_messages if topic in video_topics_gop]
+    video_requests = [(topic, topic_messages[topic][0].encoding, *video_key_to_crop[VIDEO_TOPIC_TO_KEY[topic]],
+                       image_resolution, [bytes(packet.data) for packet in topic_messages[topic]])
+                      for topic in video_topics]
+    if video_requests:
+        topic_data.update(zip(video_topics, gpu_decode_current_frames(gpu_decoder_address, video_requests)))
     return topic_data
 
 
@@ -210,15 +238,24 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
     DataLoader 的 worker 进程; 数据文件每次取样现开现读, 解压缓存在首次取样时于各自进程内建立。
     """
 
-    def __init__(self, warehouse_dir: str = WAREHOUSE_DIR, load_images: bool = True):
+    def __init__(self, warehouse_dir: str = WAREHOUSE_DIR, load_images: bool = True,
+                 video_key_to_crop: dict[str, tuple[str, bool]] | None = None,
+                 image_resolution: tuple[int, int] | None = None):
         self.warehouse_dir = warehouse_dir
         # False: 只取 state/action, 输出的 images 为空 dict
         self.load_images = load_images
+        # 读图像时必须给出 GPU 裁剪/缩放参数, 统一由 load_video_decode_config(data_config) 从 openpi 配置里取
+        assert not load_images or (video_key_to_crop and image_resolution), \
+            "load_images=True 时须传入 load_video_decode_config(data_config) 返回的 video_key_to_crop 与 image_resolution"
+        self.video_key_to_crop = video_key_to_crop
+        self.image_resolution = image_resolution
         self.episodes = load_episode_index(warehouse_dir)
         # 升序的 episode 起点, 供 bisect 由全局 sample 编号反查 episode
         self.sample_offsets = [episode["sample_offset"] for episode in self.episodes]
         self.num_samples = self.sample_offsets[-1] + self.episodes[-1]["num_samples"]
         self.state_concat, self.action_concat = load_state_and_action_concat()
+        # 主进程里先起好各 GPU 的解码进程, 对象只存其地址字符串, 照常可 pickle 进 worker
+        self.gpu_decoder_addresses = start_gpu_decoders() if load_images else []
 
         logger.info(f"{self.num_samples} samples in {len(self.episodes)} episodes "
                     f"({len(set(e['prompt'] for e in self.episodes))} prompts) from {warehouse_dir}, "
@@ -243,8 +280,13 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
         """取出一个 sample: 反查 episode 物理位置 -> 解码/反序列化 -> 拼成模型需要的 state/action。"""
         episode = self.locate_episode(index)
         prompt = episode["prompt"]
-        topic_data = filter_sample_messages(load_sample_topics(
-            episode["data_file"], episode["row_group"], index - episode["sample_offset"]), self.load_images)
+        # 各 worker 按编号轮流分到各 GPU 的解码进程; 主进程里取样(num_workers=0)时用第一个
+        worker_info = torch.utils.data.get_worker_info()
+        gpu_decoder_address = self.gpu_decoder_addresses[
+            (worker_info.id if worker_info else 0) % len(self.gpu_decoder_addresses)] if self.load_images else None
+        topic_data = filter_sample_messages(
+            load_sample_topics(episode["data_file"], episode["row_group"], index - episode["sample_offset"]),
+            gpu_decoder_address, self.video_key_to_crop, self.image_resolution)
 
         # action 的步数由数据本身决定(即 locations 条数), 与 ACTION_CHUNK_LENGTH 一致
         action_steps = len(topic_data[self.action_concat[0][0]])

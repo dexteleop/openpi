@@ -310,6 +310,8 @@ class LingyuTeleavatarV2DataConfig(DataConfigFactory):
     """
     Config for training on the Teleavatar v2 dual-arm robot dataset.
     """
+    # 灵御数据集不来自 LeRobot, 用不到 repo_id; 给默认值后 tyro 不再要求命令行必须传 --data.repo-id
+    repo_id: str | None = None
     use_delta_joint_actions: bool = False
     # Whether the head camera should be rotated 180° before the left-eye crop.
     # Property of the source dataset orientation; forwarded to TeleavatarInputs.
@@ -372,8 +374,16 @@ class LingyuTeleavatarV2DataConfig(DataConfigFactory):
         # Model transforms
         model_transforms = ModelTransformFactory()(model_config)
 
+        base_data_config = self.create_base_config(assets_dirs, model_config)
+        if base_data_config.asset_id is None:
+            # 没有 repo_id 时 compute_norm_stats_lingyu.py 把 norm stats 直接写在 assets_dirs 下: 以其目录名作 asset_id
+            # 从那里读; checkpoint 保存与推理加载 norm stats 也都按 asset_id 找, 不能留空
+            base_data_config = dataclasses.replace(
+                base_data_config, asset_id=assets_dirs.name,
+                norm_stats=self._load_norm_stats(epath.Path(assets_dirs).parent, assets_dirs.name))
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_data_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -509,18 +519,19 @@ _CONFIGS = [
             action_dim=32,  # Keep 32 to match pi0_base pretrained weights
             action_horizon=30,
         ),
-        checkpoint_base_dir="/DATA/disk1/haoran/checkpoints",
+        checkpoint_base_dir="./checkpoints",
         data=LingyuTeleavatarV2DataConfig(
             base_config=DataConfig(
                 action_sequence_keys=("action",),  # Use 'action' not 'actions'
                 prompt_from_task=True,
-                iceberg_dir="/home/ubuntu/openpi/src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse",
+                iceberg_dir="/mnt/dex/a800/home/shihaoran/openpi/src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/data/base_model/pi0_base/params"),
         batch_size=64,
         num_workers=256,
-        num_train_steps=200, # 200_000
+        num_train_steps=200_000,
         wandb_enabled=True,
     ),
 ]

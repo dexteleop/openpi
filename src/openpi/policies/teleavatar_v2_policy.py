@@ -32,6 +32,10 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+# 各路相机从左右拼接的双目帧里保留哪只眼(键为 openpi 图像名的末段); LingyuDatasetV2 的 GPU 解码按同一规则裁剪
+STEREO_EYES = {"head_camera": "left", "left_color": "right", "right_color": "left"}
+
+
 def _extract_stereo_view(image: np.ndarray, side: str, *, rotate: bool = False) -> np.ndarray:
     """Crop one eye from a side-by-side stereo frame, optionally rotating 180°
     first (rotation applies to the full stereo frame, before the crop).
@@ -133,10 +137,10 @@ class TeleavatarInputs(transforms.DataTransformFn):
         # _extract_stereo_view makes all three no-ops when frames already
         # arrive cropped (by ros2_interface) or mono (v1 robot left/right).
         head_color = _extract_stereo_view(
-            head_color, "left", rotate=self.rotate_head_camera
+            head_color, STEREO_EYES["head_camera"], rotate=self.rotate_head_camera
         )
-        left_color = _extract_stereo_view(left_color, "right")
-        right_color = _extract_stereo_view(right_color, "left")
+        left_color = _extract_stereo_view(left_color, STEREO_EYES["left_color"])
+        right_color = _extract_stereo_view(right_color, STEREO_EYES["right_color"])
 
         # Extract 14-dim state from the observation vector (62-dim on v2,
         # 48-dim on v1 — position indices are identical in both layouts).

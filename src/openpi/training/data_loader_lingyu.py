@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import time
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -13,12 +14,20 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import LingyuDatasetV2
+from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import load_video_decode_config
 import openpi.transforms as _transforms
 
 # torch.utils.data.DataLoader picks map-style vs iterable-style with an
 # isinstance() check, so a dataset handed to it must really subclass this one.
 
 T_co = TypeVar("T_co", covariant=True)
+# scripts/train.py 的全部顶层 import(按包名): forkserver 预加载它们, worker 重新执行 train.py 时就都已在 sys.modules 里
+_TRAIN_SCRIPT_IMPORTS = [
+    "etils.epath", "flax.nnx", "flax.training.common_utils", "flax.traverse_util", "jax", "optax",
+    "tqdm_loggable.auto", "wandb", "openpi.models.model", "openpi.shared.array_typing", "openpi.shared.nnx_utils",
+    "openpi.training.checkpoints", "openpi.training.optimizer", "openpi.training.sharding", "openpi.training.utils",
+    "openpi.training.weight_loaders",
+]
 
 
 class Dataset(Protocol[T_co]):
@@ -61,7 +70,10 @@ def create_lingyu_dataset_v2(
     logging.info(f"action_dim: {model_config.action_dim}")
     logging.info(f"action_horizon: {model_config.action_horizon}")
     logging.info(f"max_token_len: {model_config.max_token_len}")
-    return LingyuDatasetV2(data_config.iceberg_dir)
+    # GPU 解码的裁剪与缩放参数取自本 data_config 的 openpi 图像变换, 不另行配置
+    video_key_to_crop, image_resolution = load_video_decode_config(data_config)
+    return LingyuDatasetV2(data_config.iceberg_dir, video_key_to_crop=video_key_to_crop,
+                           image_resolution=image_resolution)
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
@@ -243,9 +255,11 @@ class TorchDataLoader:
         if num_workers > 0:
             # forkserver: 重型模块只在 server 进程里 import 一次, worker 从 server fork 出来;
             # spawn 下每个 worker 都要重跑主模块的 import(~5s), 且因 dataset pickle 超过管道缓冲而逐个串行启动。
-            # Python 3.11 默认的 ['__main__'] 预加载不生效, 须显式列出模块名
+            # Python 3.11 默认的 ['__main__'] 预加载不生效, 须显式列出模块名; 且 forkserver 不设置 sys_path,
+            # 只能 import site-packages/src 下的包。worker 仍会重新执行主模块(train.py), 其顶层依赖若没预加载,
+            # 每个 worker 要现 import 约 1170 个模块(~3.5s), 又因上面的管道阻塞逐个串行, 故按包名全部预加载
             mp_context = multiprocessing.get_context("forkserver")
-            mp_context.set_forkserver_preload([__name__, "openpi.training.config_lingyu"])
+            mp_context.set_forkserver_preload([__name__, "openpi.training.config_lingyu", *_TRAIN_SCRIPT_IMPORTS])
 
         generator = torch.Generator()
         generator.manual_seed(seed)
@@ -283,9 +297,36 @@ class TorchDataLoader:
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                    device_batch = jax.tree.map(
+                        lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                    device_batch = jax.tree.map(torch.as_tensor, batch)
+                try:
+                    yield device_batch
+                except GeneratorExit:
+                    # 使用方提前关掉了迭代器(train.py 结束时 data_iter.close()), 手上的 batch 已无用
+                    _terminate_workers(data_iter)
+                    raise
+
+
+def _terminate_workers(torch_iter) -> None:
+    """直接 terminate 全部 worker 再收尾, 不走 torch 默认的逐个 join。
+
+    torch 的 _shutdown_workers 对每个 worker 依次 join(timeout=5s), 而 worker 要取完手上整个 batch
+    才响应退出, 关闭时 worker 几乎都在取样, 256 个 worker 最多要等约 21 分钟。
+    """
+    workers = getattr(torch_iter, "_workers", None)
+    if workers is None:  # num_workers=0, 没有 worker 进程
+        return
+    # 先摘掉 SIGCHLD 监视, 否则 torch 会把被 terminate 的 worker 当成异常退出, 在主进程里报错
+    if torch_iter._worker_pids_set:
+        torch.utils.data._utils.signal_handling._remove_worker_pids(id(torch_iter))
+        torch_iter._worker_pids_set = False
+    terminate_start = time.perf_counter()
+    for worker in workers:
+        worker.terminate()
+    torch_iter._shutdown_workers()  # 此时 join 的都是已退出的进程, 只剩关队列等收尾
+    logging.info(f"Terminated {len(workers)} data loader workers in {time.perf_counter() - terminate_start:.1f}s")
 
 
 def _fetch_and_put(data_iter, sharding):

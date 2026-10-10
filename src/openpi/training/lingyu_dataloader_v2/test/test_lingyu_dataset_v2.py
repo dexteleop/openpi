@@ -32,10 +32,11 @@ import pytest
 import torch
 from PIL import Image
 
+import openpi.training.config_lingyu as _config
 from openpi.training.lingyu_dataloader_v2 import lingyu_dataset_v2
 from openpi.training.lingyu_dataloader_v2.build_sample_idx import GLOBAL_INDEX_NAME, WAREHOUSE_DIR
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import (
-    LingyuDatasetV2, filter_sample_messages, load_sample_topics)
+    LingyuDatasetV2, filter_sample_messages, load_sample_topics, load_video_decode_config)
 from openpi.training.lingyu_dataloader_v2.mcap_config.config import (
     load_mcap_state_and_action_topics_fields, load_mcap_video_topics_gop)
 from openpi.training.lingyu_dataloader_v2.model_config.config import load_action_chunk_length
@@ -48,6 +49,7 @@ _NUM_RANDOM_SAMPLES = 5  # 随机抽查的样本数
 _NUM_MEMORY_SAMPLES = 3  # test_span_fetch_memory 统计内存的样本数(另加 1 个预热样本); 深调用栈快照很慢, 每个样本约 7 分钟
 _TRACE_FRAMES = 64  # tracemalloc 每个内存块记录的调用栈深度
 _OUTPUT_DIR = Path(__file__).resolve().parent / "lingyu_dataset_v2_output"
+_CONFIG_NAME = "pi0_teleavatar_v2_lingyu"  # GPU 裁剪/缩放参数取自这个训练配置
 
 # 被计时包装的原函数; 取样期间替换成下方 _timed_* 版本, 耗时累加进 _elapsed_seconds
 _ORIGINAL_FETCH_SAMPLE_MESSAGES = lingyu_dataset_v2.fetch_sample_messages
@@ -65,7 +67,11 @@ def test():
     if not index_path.exists():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
-    dataset = LingyuDatasetV2()
+    # 与训练一样, GPU 裁剪/缩放参数取自 openpi 训练配置
+    train_config = _config.get_config(_CONFIG_NAME)
+    video_key_to_crop, image_resolution = load_video_decode_config(
+        train_config.data.create(train_config.assets_dirs, train_config.model))
+    dataset = LingyuDatasetV2(video_key_to_crop=video_key_to_crop, image_resolution=image_resolution)
     logger.info(f"len(dataset) = {len(dataset)}, {len(dataset.episodes)} 个 episode")
 
     # --- 1. 总数与索引一致 ---
@@ -137,7 +143,7 @@ def test_span_fetch():
     if not index_path.exists():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
-    dataset = LingyuDatasetV2()
+    dataset = LingyuDatasetV2(load_images=False)  # 只用它反查 sample 的物理位置, 不读图像
     used_topic_names = set(load_mcap_video_topics_gop()) | set(load_mcap_state_and_action_topics_fields())
     request_totals = {"span": [0, 0], "single": [0, 0]}
     for global_sample_idx in sorted(random.sample(range(len(dataset)), _NUM_RANDOM_SAMPLES)):
@@ -193,7 +199,7 @@ def test_span_fetch_memory():
     if not index_path.exists():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
-    dataset = LingyuDatasetV2()
+    dataset = LingyuDatasetV2(load_images=False)  # 只用它反查 sample 的物理位置, 不读图像
     state_and_action_topics = set(load_mcap_state_and_action_topics_fields())
     sample_idxs = random.sample(range(len(dataset)), _NUM_MEMORY_SAMPLES + 1)
     tracemalloc.start(_TRACE_FRAMES)  # 记录足够深的调用栈, 才能认出经由 fetch_mcap_bytes 分配的内存块

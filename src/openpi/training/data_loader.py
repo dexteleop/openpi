@@ -16,6 +16,7 @@ import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 from openpi.training.lingyu_dataloader.webdataset_load_tar import TeleavatarTarDataset
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import LingyuDatasetV2
+from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import load_video_decode_config
 import openpi.transforms as _transforms
 
 # torch.utils.data.DataLoader picks map-style vs iterable-style with an
@@ -173,7 +174,10 @@ def create_torch_wds_dataset(
 def create_lingyu_dataset_v2(
     data_config: _config.DataConfig,
 ) -> Dataset:
-    return LingyuDatasetV2(data_config.iceberg_dir)
+    # GPU 解码的裁剪与缩放参数取自本 data_config 的 openpi 图像变换, 不另行配置
+    video_key_to_crop, image_resolution = load_video_decode_config(data_config)
+    return LingyuDatasetV2(data_config.iceberg_dir, video_key_to_crop=video_key_to_crop,
+                           image_resolution=image_resolution)
 
 
 def create_rlds_dataset(
