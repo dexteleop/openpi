@@ -37,9 +37,11 @@ from openpi.training.lingyu_dataloader_v2 import lingyu_dataset_v2
 from openpi.training.lingyu_dataloader_v2.build_sample_idx import GLOBAL_INDEX_NAME, WAREHOUSE_DIR
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import (
     LingyuDatasetV2, filter_sample_messages, load_sample_topics, load_video_decode_config)
+from openpi.training.lingyu_dataloader_v2.utils.pyiceberg_saver import mcap_key_from_index
 from openpi.training.lingyu_dataloader_v2.mcap_config.config import (
-    load_mcap_state_and_action_topics_fields, load_mcap_video_topics_gop)
+    load_mcap_video_topics_gop)
 from openpi.training.lingyu_dataloader_v2.model_config.config import load_action_chunk_length
+from openpi.training.lingyu_dataloader_v2.model_config.config import load_state_and_action_concat
 from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
 from openpi.training.lingyu_dataloader_v2.utils import _mcap_utils, mcap_message_fetcher
 
@@ -144,7 +146,8 @@ def test_span_fetch():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
     dataset = LingyuDatasetV2(load_images=False)  # 只用它反查 sample 的物理位置, 不读图像
-    used_topic_names = set(load_mcap_video_topics_gop()) | set(load_mcap_state_and_action_topics_fields())
+    state_concat, action_concat = load_state_and_action_concat()
+    used_topic_names = set(load_mcap_video_topics_gop()) | {topic for topic, _ in state_concat + action_concat}
     request_totals = {"span": [0, 0], "single": [0, 0]}
     for global_sample_idx in sorted(random.sample(range(len(dataset)), _NUM_RANDOM_SAMPLES)):
         episode = dataset.locate_episode(global_sample_idx)
@@ -152,17 +155,18 @@ def test_span_fetch():
             episode["data_file"], episode["row_group"], global_sample_idx - episode["sample_offset"])
         used_topics = {topic: message for topic, message in sample_topics.items()
                        if message is not None and topic in used_topic_names}
+        mcap_key = mcap_key_from_index(episode["data_file"])
 
         _fetch_stats.update(requests=0, bytes=0)
         with _count_fetch_bytes(), ThreadPoolExecutor(max_workers=lingyu_dataset_v2.SAMPLE_FETCH_WORKERS) as pool:
-            span_messages = lingyu_dataset_v2.fetch_sample_messages(used_topics, pool)
+            span_messages = lingyu_dataset_v2.fetch_sample_messages(used_topics, pool, mcap_key)
         span_stats = (_fetch_stats["requests"], _fetch_stats["bytes"])
 
         # 对照组: 改动前的逐条读取, 每个 location 单独 fetch_message
         _fetch_stats.update(requests=0, bytes=0)
         with _count_fetch_bytes():
             single_messages = {topic: [lingyu_dataset_v2.fetcher.fetch_message(
-                message["msg_type"], message["msg_def"], [tuple(location.values())])[0]
+                message["msg_type"], message["msg_def"], [(mcap_key, *location.values())])[0]
                 for location in message["locations"]] for topic, message in used_topics.items()}
         single_stats = (_fetch_stats["requests"], _fetch_stats["bytes"])
 
@@ -200,7 +204,8 @@ def test_span_fetch_memory():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
     dataset = LingyuDatasetV2(load_images=False)  # 只用它反查 sample 的物理位置, 不读图像
-    state_and_action_topics = set(load_mcap_state_and_action_topics_fields())
+    state_concat, action_concat = load_state_and_action_concat()
+    state_and_action_topics = {topic for topic, _ in state_concat + action_concat}
     sample_idxs = random.sample(range(len(dataset)), _NUM_MEMORY_SAMPLES + 1)
     tracemalloc.start(_TRACE_FRAMES)  # 记录足够深的调用栈, 才能认出经由 fetch_mcap_bytes 分配的内存块
     for sample_order, global_sample_idx in enumerate(sample_idxs):
@@ -209,6 +214,7 @@ def test_span_fetch_memory():
             episode["data_file"], episode["row_group"], global_sample_idx - episode["sample_offset"])
         used_topics = {topic: message for topic, message in sample_topics.items()
                        if message is not None and topic in state_and_action_topics}
+        mcap_key = mcap_key_from_index(episode["data_file"])
 
         _fetch_stats.update(requests=0, bytes=0)
         gc.collect()
@@ -216,7 +222,7 @@ def test_span_fetch_memory():
         traced_before = tracemalloc.get_traced_memory()[0]
         before_snapshot = tracemalloc.take_snapshot()
         with _count_fetch_bytes(), ThreadPoolExecutor(max_workers=lingyu_dataset_v2.SAMPLE_FETCH_WORKERS) as pool:
-            topic_messages = lingyu_dataset_v2.fetch_sample_messages(used_topics, pool)
+            topic_messages = lingyu_dataset_v2.fetch_sample_messages(used_topics, pool, mcap_key)
         traced_after, traced_peak = tracemalloc.get_traced_memory()
         result_snapshot = tracemalloc.take_snapshot()
         del topic_messages
@@ -255,10 +261,10 @@ def _counted_fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
     return data_bytes
 
 
-def _timed_fetch_sample_messages(sample_topics: dict, thread_pool) -> dict:
+def _timed_fetch_sample_messages(sample_topics: dict, thread_pool, mcap_key: str) -> dict:
     """计时版 fetch_sample_messages: 一个 sample 全部 location 并行读 S3 的整段墙钟时间。"""
     start_time = time.perf_counter()
-    topic_messages = _ORIGINAL_FETCH_SAMPLE_MESSAGES(sample_topics, thread_pool)
+    topic_messages = _ORIGINAL_FETCH_SAMPLE_MESSAGES(sample_topics, thread_pool, mcap_key)
     _elapsed_seconds["s3"] += time.perf_counter() - start_time
     return topic_messages
 
@@ -294,7 +300,7 @@ def _concat_parts(dataset, global_sample_idx, concat_config):
         episode["data_file"], episode["row_group"], global_sample_idx - episode["sample_offset"])
     # 只挑拼接用到的 topic, 免得为核对维度把三路视频再解一遍
     topic_data = filter_sample_messages(
-        {topic: sample_topics[topic] for topic, _ in concat_config})
+        {topic: sample_topics[topic] for topic, _ in concat_config}, mcap_key_from_index(episode["data_file"]))
     return [topic_data[topic][0][field_name] for topic, field_name in concat_config]
 
 

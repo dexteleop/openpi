@@ -11,7 +11,7 @@ Test plan:
 """
 from rosbags.interfaces import Nodetype
 
-from openpi.training.lingyu_dataloader_v2.utils.mcap_player import _play_messages
+from openpi.training.lingyu_dataloader_v2.utils._mcap_player import _play_messages
 from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import MCAP_Message_Fetcher
 from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import find_mcap_url_and_prompt_pairs
 from openpi.training.lingyu_dataloader_v2.test.logger import get_logger

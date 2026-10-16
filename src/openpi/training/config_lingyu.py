@@ -524,7 +524,8 @@ _CONFIGS = [
             base_config=DataConfig(
                 action_sequence_keys=("action",),  # Use 'action' not 'actions'
                 prompt_from_task=True,
-                iceberg_dir="/mnt/dex/a800/home/shihaoran/openpi/src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse",
+                # warehouse 在代码库内, 按本文件位置解析, 本机与训练机都指向各自代码库里的那一份
+                iceberg_dir=str(pathlib.Path(__file__).parent / "lingyu_dataloader_v2" / "iceberg_warehouse"),
             ),
         ),
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),

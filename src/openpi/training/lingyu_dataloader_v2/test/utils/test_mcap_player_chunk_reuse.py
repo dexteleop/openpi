@@ -8,13 +8,15 @@ import sys
 import time
 from collections import Counter
 
-from openpi.training.lingyu_dataloader_v2.mcap_sample_extractor import MCAP_SIGNAL_TOPIC
 from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
-from openpi.training.lingyu_dataloader_v2.utils import mcap_player
+from openpi.training.lingyu_dataloader_v2.utils import _mcap_player
 from openpi.training.lingyu_dataloader_v2.utils._mcap_utils import fetch_mcap_bytes, s3_client
 from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import MCAP_Message_Fetcher
 
 logger = get_logger(__file__)
+
+# 按键信号 topic, 顺带验证按键 message 反序列化; episode 起止识别已迁至数据平台, 不再读配置
+MCAP_SIGNAL_TOPIC = '/xr/left_hand_inputs'
 
 _MCAP_URL = ("raw/20251103-TEST/2026-07-29/15/20251103-TEST_20260729-151253-930136_"
              "20260729-152547-124514/rec_20260729_151253_0.mcap")
@@ -31,7 +33,7 @@ def _play(max_messages: int, request_counter: Counter) -> tuple[list, list]:
     """播前 max_messages 条, 返回 (产出元组列表, 按键列表); 请求数计入 request_counter"""
     fetcher = MCAP_Message_Fetcher()
     played, buttons = [], []
-    player = mcap_player.MCAP_Player(_MCAP_URL)
+    player = _mcap_player.MCAP_Player(_MCAP_URL)
     for message in player.play_messages(extra_topics=(MCAP_SIGNAL_TOPIC,)):
         topic_name, msg_type, msg_def, log_time, locations = message
         played.append(message)
@@ -69,15 +71,15 @@ def test():
 
     # 关掉两处复用, 还原成逐条回头请求 S3
     request_counter.clear()
-    remember_original, fetch_original = mcap_player.remember_chunk_records, mcap_player._fetch_buffered
-    mcap_player.remember_chunk_records = lambda *args: None
-    mcap_player._fetch_buffered = _fetch_unbuffered
+    remember_original, fetch_original = _mcap_player.remember_chunk_records, _mcap_player._fetch_buffered
+    _mcap_player.remember_chunk_records = lambda *args: None
+    _mcap_player._fetch_buffered = _fetch_unbuffered
     try:
         start_time = time.time()
         old_played, old_buttons = _play(_MAX_MESSAGES, request_counter)
         old_sec, old_requests = time.time() - start_time, dict(request_counter)
     finally:
-        mcap_player.remember_chunk_records, mcap_player._fetch_buffered = remember_original, fetch_original
+        _mcap_player.remember_chunk_records, _mcap_player._fetch_buffered = remember_original, fetch_original
     logger.info("old: %d messages in %.1fs, requests=%s", len(old_played), old_sec, old_requests)
 
     assert new_played == old_played, "复用 chunk 后产出与旧行为不一致"

@@ -66,13 +66,17 @@ def cpu_decode_current_frame(packets: list, pixel_format: str = "rgb24") -> np.n
     """
     assert packets, "没有任何 FFMPEGPacket 可解码"
     codec_ctx = av.CodecContext.create(_codec_name(packets[0].encoding), "r")
-    frames = []
+    # 只留最后解出的一帧: 攒下整段 GOP(最多 30 帧 4K)会让每个 DataLoader worker 多占约 0.5 GB,
+    # 256 个 worker 一起 CPU 解码时实测把 344 GB 内存耗尽、触发 OOM
+    current_frame = None
     for packet in packets:
-        frames.extend(codec_ctx.decode(av.Packet(bytes(packet.data))))
-    frames.extend(codec_ctx.decode(None))  # flush: 取出解码器内缓存的帧
-    if not frames:
+        for current_frame in codec_ctx.decode(av.Packet(bytes(packet.data))):
+            pass
+    for current_frame in codec_ctx.decode(None):  # flush: 取出解码器内缓存的帧
+        pass
+    if current_frame is None:
         raise ValueError(f"{len(packets)} 个 FFMPEGPacket 未解出任何帧")
-    return frames[-1].to_ndarray(format=pixel_format)
+    return current_frame.to_ndarray(format=pixel_format)
 
 
 def eye_crop_and_size(width: int, height: int, eye: str, rotate: bool,

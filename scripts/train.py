@@ -241,21 +241,23 @@ def main(config: _config.TrainConfig):
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    # 暂时只验证 dataloader: 模型加载、恢复、编译 train step 全部注释掉, 后续训练时去掉 [dataloader-only] 注释即可恢复
+    # [dataloader-only] train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    # [dataloader-only] jax.block_until_ready(train_state)
+    # [dataloader-only] logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+    # [dataloader-only] if resuming:
+        # [dataloader-only] train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
+    # [dataloader-only] ptrain_step = jax.jit(
+        # [dataloader-only] functools.partial(train_step, config),
+        # [dataloader-only] in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        # [dataloader-only] out_shardings=(train_state_sharding, replicated_sharding),
+        # [dataloader-only] donate_argnums=(1,),
+    # [dataloader-only] )
 
-    start_step = int(train_state.step)
+    # [dataloader-only] start_step = int(train_state.step)
+    start_step = 0  # [dataloader-only] 不加载模型, 从第 0 步开始只取 batch
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -266,8 +268,9 @@ def main(config: _config.TrainConfig):
     infos = []
     interval_start = time.perf_counter()  # 本日志间隔的起点, 用于算 samples_per_s
     for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+        # [dataloader-only] with sharding.set_mesh(mesh):
+            # [dataloader-only] train_state, info = ptrain_step(train_rng, train_state, batch)
+        info = {}  # [dataloader-only] 没有 train step, 只记录取 batch 的耗时
 
         # 取下一个 batch 的等待时间: 接近 0 说明 loader 跟得上训练, 很大则 loader 是瓶颈
         # (train step 是异步派发的, 这段时间与 GPU 计算重叠)
@@ -286,8 +289,8 @@ def main(config: _config.TrainConfig):
             infos = []
             interval_start = time.perf_counter()
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        # [dataloader-only] if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+            # [dataloader-only] _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

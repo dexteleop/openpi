@@ -7,9 +7,6 @@
     TELEAVATAV2_MCAP_TOPICS_MAPPING  {标准 topic: (mcap topic, ...)}  键标准名, 值 mcap 名
     USER_SELECTED_TOPICS             {标准 topic: obs/state/action}, 键用前需经映射表换成 mcap 名
     TELEAVATAV2_VIDEO_TOPICS_GOP     mcap topic 名, 直接可用
-    EPISODE_SIGNAL                   mcap topic 名, 直接可用; {topic_name, start, end}
-    TELEAVATAV2_STATE_and_ACTION_TOPICS_FIELDS
-                                     mcap topic 名, 直接可用; {mcap topic: (所需字段, ...)}
 """
 from __future__ import annotations
 
@@ -46,34 +43,3 @@ def load_mcap_video_topics_gop() -> dict[str, int]:
             f"in lingyu_dataloader_v2/robots_config."
         )
 
-
-#####
-# 用于 episode 确定起始和结束
-#####
-
-def load_mcap_episode_topic_signal() -> dict:
-    """返回当前机器人标记 episode 起止的按键信号 {topic_name, start, end}。"""
-    if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.MCAP_EPISODE_TOPIC_SIGNAL
-    # TODO： elif 其他机器人的常量配置
-    else:
-        raise ValueError(
-            f"Cannot find the relevant robot configuration of {ROBOT!r} "
-            f"in lingyu_dataloader_v2/robots_config."
-        )
-
-
-#####
-# 用于 state and action topic message 确定其中的字段
-#####
-
-def load_mcap_state_and_action_topics_fields() -> dict[str, tuple[str, ...]]:
-    """返回当前机器人的 {mcap topic: (所需字段, ...)}，键已是 mcap topic 名, 无需映射。"""
-    if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.MCAP_STATE_and_ACTION_TOPICS_FIELDS
-    # TODO： elif 其他机器人的常量配置
-    else:
-        raise ValueError(
-            f"Cannot find the relevant robot configuration of {ROBOT!r} "
-            f"in lingyu_dataloader_v2/robots_config."
-        )

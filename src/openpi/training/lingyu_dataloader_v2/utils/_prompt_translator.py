@@ -43,7 +43,7 @@ def _translate_via_openai(text: str) -> str:
     ]
 
     response = client.chat.completions.create(
-        model="claude-sonnet-4-6",
+        model="gemini-3.8-flash",
         temperature=0.1,
         messages=messages
     )

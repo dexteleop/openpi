@@ -4,6 +4,8 @@ checkpoints/
 data/
 wandb/
 *_output/
+# 运行时生成的 iceberg warehouse: catalog/全局索引/本地 parquet 缓存(1.5 GB)
+src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

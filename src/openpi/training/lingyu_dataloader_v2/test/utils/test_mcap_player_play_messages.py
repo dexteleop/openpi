@@ -4,7 +4,7 @@ that every message carries a non-empty msg_def string.
 """
 from collections import Counter
 from time import perf_counter
-from openpi.training.lingyu_dataloader_v2.utils.mcap_player import _play_messages
+from openpi.training.lingyu_dataloader_v2.utils._mcap_player import _play_messages
 from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
 
 logger = get_logger(__file__)

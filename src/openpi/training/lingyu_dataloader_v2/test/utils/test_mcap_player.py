@@ -2,7 +2,7 @@
 用 MCAP_Player 逐条播放 mcap（只产出 USER_SELECTED_TOPIC 中的话题），完成后
 统计每个 topic 的 message 数量，以及 ffmpeg 话题从 IDR 关键帧累积的定位条数
 """
-from openpi.training.lingyu_dataloader_v2.utils.mcap_player import MCAP_Player
+from openpi.training.lingyu_dataloader_v2.utils._mcap_player import MCAP_Player
 from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
 logger = get_logger(__file__)
 from collections import Counter

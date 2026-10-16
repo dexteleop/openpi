@@ -10,7 +10,7 @@ MCAP_Message_Fetcher 取出 ros2 message, 再用 ros2_message_filter 按配置�
 from collections import defaultdict
 import numpy as np
 
-from openpi.training.lingyu_dataloader_v2.utils.mcap_player import MCAP_Player
+from openpi.training.lingyu_dataloader_v2.utils._mcap_player import MCAP_Player
 from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import MCAP_Message_Fetcher
 from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import find_mcap_url_and_prompt_pairs
 from openpi.training.lingyu_dataloader_v2.utils.ros2_message_filter import ros2_message_filter

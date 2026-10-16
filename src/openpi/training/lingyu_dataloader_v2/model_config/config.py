@@ -10,7 +10,10 @@
 """
 from __future__ import annotations
 
-from openpi.training.lingyu_dataloader_v2.model_config import pi0  # 换模型只改这一行
+from openpi.training.lingyu_dataloader_v2.model_config import (
+    pi0,
+    pi0_ee,
+)
 
 
 MODEL = "pi0"  # TODO：选定使用哪个具身智能模型
@@ -24,6 +27,8 @@ def load_action_chunk_length() -> int:
     """返回当前模型一个 sample 的动作序列长度(含当前动作)。"""
     if MODEL == "pi0":
         return pi0.ACTION_CHUNK_LENGTH
+    if MODEL == "pi0_ee":
+        return pi0_ee.ACTION_CHUNK_LENGTH
     # TODO： elif 其他模型的常量配置
     else:
         raise ValueError(
@@ -40,6 +45,8 @@ def load_state_and_action_concat() -> tuple[tuple[tuple[str, str], ...], tuple[t
     """返回当前模型的 (STATE_CONCAT, ACTION_CONCAT), 元素为 (mcap topic, 字段名)。"""
     if MODEL == "pi0":
         return pi0.STATE_CONCAT, pi0.ACTION_CONCAT
+    if MODEL == "pi0_ee":
+        return pi0_ee.STATE_CONCAT, pi0_ee.ACTION_CONCAT
     # TODO： elif 其他模型的常量配置
     else:
         raise ValueError(
