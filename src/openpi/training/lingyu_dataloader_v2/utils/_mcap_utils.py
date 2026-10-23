@@ -12,7 +12,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, IncompleteReadError, ReadTimeoutError, ResponseStreamingError
 
 from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import (
-    BUCKET_NAME, make_client
+    BUCKET_NAME, KEY_PREFIX, make_client
 )
 
 logger = logging.getLogger(__name__)
@@ -177,6 +177,13 @@ def _log_fetch_timing(mcap_url: str, offset: int, data_size: int,
         (read_end - request_start) * 1000, throughput_mbps, pool_stats())
 
 
+def _bucket_key(mcap_url: str) -> str:
+    """索引 url -> 桶内真实 key: 同一批数据在两桶中的前缀不同(乌兰察布桶在 shihaoran/ 下,
+    北京桶在顶层), 而索引 url 只记录了采集时所在桶的 key。KEY_PREFIX 非空且 url 未含该
+    前缀时补上, 已含前缀的旧索引 url(如 shihaoran/raw/...)原样返回。"""
+    return mcap_url if not KEY_PREFIX or mcap_url.startswith(f"{KEY_PREFIX}/") else f"{KEY_PREFIX}/{mcap_url}"
+
+
 def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
     """按 byte range 读取桶内字节流; logger 开启 DEBUG 时记录本次读取的计时与连接池状态
 
@@ -190,7 +197,7 @@ def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
         _tcp_connect_local.connect_ms = None  # 清空本线程上一次请求的建连记录
         request_start = time.perf_counter()
         try:
-            response = s3_client().get_object(Bucket=BUCKET_NAME, Key=mcap_url, Range=byte_range)
+            response = s3_client().get_object(Bucket=BUCKET_NAME, Key=_bucket_key(mcap_url), Range=byte_range)
             header_received = time.perf_counter()
             data_bytes = response["Body"].read()
             break

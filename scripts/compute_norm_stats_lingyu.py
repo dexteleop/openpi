@@ -36,8 +36,8 @@ def create_torch_dataloader(
     num_workers: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
-    # 只读 state/action 的 topic, 视频既不下载也不解码
-    dataset = LingyuDatasetV2(data_config.iceberg_dir, load_images=False)
+    # 只读 state/action 的 topic, 视频既不下载也不解码; 与训练同一 action_horizon, 统计口径才与训练数据一致
+    dataset = LingyuDatasetV2(data_config.iceberg_dir, load_images=False, action_horizon=action_horizon)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -63,15 +63,17 @@ def create_torch_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, num_workers: int | None = None):
     config = _config.get_config(config_name)
     assert isinstance(config.data, _config.LingyuTeleavatarV2DataConfig), \
         f"{config_name} 不是 LingyuTeleavatarV2DataConfig, 不能用本脚本计算 norm stats"
     # 强制走只含 state/action 的 transforms, 训练 config 里无需打开 compute_norm_stats
     data_config = dataclasses.replace(config.data, compute_norm_stats=True).create(config.assets_dirs, config.model)
 
+    # 未显式指定时用 config 的 worker 数; OSS 并发实测有负收益(越高越容易整体超时), 可用 --num-workers 调小
+    num_workers = num_workers or config.num_workers
     data_loader, num_batches = create_torch_dataloader(
-        data_config, config.model.action_horizon, config.batch_size, config.num_workers, max_frames,
+        data_config, config.model.action_horizon, config.batch_size, num_workers, max_frames,
     )
 
     keys = ["state", "actions"]

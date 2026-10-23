@@ -14,7 +14,9 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
-from openpi.training.lingyu_dataloader.webdataset_load_tar import TeleavatarTarDataset
+# 临时禁用 WDS 通道: webdataset_load_tar 顶层 import torchcodec 需要 libnvrtc.so.13(本机仅有 CUDA 12.1),
+# 其 forkserver 预加载链会拖垮 LingyuDatasetV2 的 DataLoader worker; 恢复 WDS 数据时取消注释
+# from openpi.training.lingyu_dataloader.webdataset_load_tar import TeleavatarTarDataset
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import LingyuDatasetV2
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import load_video_decode_config
 import openpi.transforms as _transforms
@@ -168,7 +170,8 @@ def create_torch_wds_dataset(
     if data_config.repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    return TeleavatarTarDataset(data_config.wds_data_dir, preload=False)
+    # 同上: WDS 通道临时禁用, 唯一调用点(下方)本已注释, 此处仅保持 import 一致性
+    # return TeleavatarTarDataset(data_config.wds_data_dir, preload=False)
 
 
 def create_lingyu_dataset_v2(

@@ -46,7 +46,7 @@ from openpi.training.lingyu_dataloader_v2.utils.episode_signals import set_episo
 from openpi.training.lingyu_dataloader_v2.model_config.config import load_action_chunk_length
 
 # Constants
-MIN_EPISODE_LENGTH = 30
+MIN_EPISODE_LENGTH = 60 # 一个 episode 至少要 2 秒
 ACTION_OFFSET_RATIO = 1.0 / 3.0
 # episode 起止按键信号: 与 build_sample_idx.py 分属两套独立来源, 故此处仍硬编码, 不读 mcap_config
 MCAP_SIGNAL_TOPIC, X_BUTTON, Y_BUTTON = set_episode_signal()

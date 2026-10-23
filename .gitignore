@@ -171,3 +171,7 @@ cython_debug/
 
 # Local zenoh bridge binary (downloaded per V2 README setup)
 zenoh-bridge-ros2dds
+
+# lingyu dataloader v2 本地数据（本地 iceberg 仓库与采集数据表，不入库）
+src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse/
+*.csv

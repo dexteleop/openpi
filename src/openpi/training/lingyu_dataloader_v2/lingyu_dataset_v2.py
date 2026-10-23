@@ -18,7 +18,7 @@
 __getitem__ 的输出为单帧、不带前导帧维度的样本(可直接进 RepackTransform)::
     {"observation": {"images": {"left_color": (140, 224, 3) uint8, "head_camera": (224, 224, 3) uint8, ...},
                      "state":  (state_dim,) float32},
-     "action": (ACTION_CHUNK_LENGTH, action_dim) float32,
+     "action": (action_horizon or ACTION_CHUNK_LENGTH, action_dim) float32,
      "prompt": str}
 图像已按 openpi 的变换在 GPU 上裁好单目(TeleavatarInputs)并不变形缩放(ResizeImages 的 resize_with_pad),
 下游这两步遇到这样的图分别原样通过、只补黑边, 故 openpi 配置不变; worker 里不再有整幅 4K 帧的解码与缩放。
@@ -55,6 +55,7 @@ from openpi.training.lingyu_dataloader_v2.mcap_config.config import (
     load_mcap_video_topics_gop,
     load_mcap_state_and_action_topics_fields)
 from openpi.training.lingyu_dataloader_v2.model_config.config import (
+    load_action_chunk_length,
     load_state_and_action_concat)
 from openpi.training.lingyu_dataloader_v2.utils._mcap_utils import (
     RECORD_PREFIX,
@@ -240,7 +241,8 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
 
     def __init__(self, warehouse_dir: str = WAREHOUSE_DIR, load_images: bool = True,
                  video_key_to_crop: dict[str, tuple[str, bool]] | None = None,
-                 image_resolution: tuple[int, int] | None = None):
+                 image_resolution: tuple[int, int] | None = None,
+                 action_horizon: int | None = None):
         self.warehouse_dir = warehouse_dir
         # False: 只取 state/action, 输出的 images 为空 dict
         self.load_images = load_images
@@ -254,6 +256,12 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
         self.sample_offsets = [episode["sample_offset"] for episode in self.episodes]
         self.num_samples = self.sample_offsets[-1] + self.episodes[-1]["num_samples"]
         self.state_concat, self.action_concat = load_state_and_action_concat()
+        self.action_topics = frozenset(topic for topic, _ in self.action_concat)
+        # 训练只要前 action_horizon 步动作; 索引里最多 ACTION_CHUNK_LENGTH 步, horizon 超过它无数据可取
+        assert action_horizon is None or action_horizon <= load_action_chunk_length(), \
+            f"action_horizon={action_horizon} 超过索引的动作序列长度 ACTION_CHUNK_LENGTH={load_action_chunk_length()}, " \
+            "请重跑 build_sample_idx.py 或调小模型配置的 action_horizon"
+        self.action_horizon = action_horizon
         # 主进程里先起好各 GPU 的解码进程, 对象只存其地址字符串, 照常可 pickle 进 worker
         self.gpu_decoder_addresses = start_gpu_decoders() if load_images else []
 
@@ -284,11 +292,15 @@ class LingyuDatasetV2(torch.utils.data.Dataset):
         worker_info = torch.utils.data.get_worker_info()
         gpu_decoder_address = self.gpu_decoder_addresses[
             (worker_info.id if worker_info else 0) % len(self.gpu_decoder_addresses)] if self.load_images else None
+        sample_topics = load_sample_topics(episode["data_file"], episode["row_group"], index - episode["sample_offset"])
+        # 只取前 action_horizon 步动作, 读 mcap 前截掉多余 location, 省 S3 流量
+        if self.action_horizon is not None:
+            for action_topic in self.action_topics:
+                sample_topics[action_topic]["locations"] = sample_topics[action_topic]["locations"][:self.action_horizon]
         topic_data = filter_sample_messages(
-            load_sample_topics(episode["data_file"], episode["row_group"], index - episode["sample_offset"]),
-            gpu_decoder_address, self.video_key_to_crop, self.image_resolution)
+            sample_topics, gpu_decoder_address, self.video_key_to_crop, self.image_resolution)
 
-        # action 的步数由数据本身决定(即 locations 条数), 与 ACTION_CHUNK_LENGTH 一致
+        # action 的步数由数据本身决定(即 locations 条数, 截断后即 action_horizon)
         action_steps = len(topic_data[self.action_concat[0][0]])
         state = concat_vector(topic_data, self.state_concat, 0)
         action = np.stack([concat_vector(topic_data, self.action_concat, step_idx)

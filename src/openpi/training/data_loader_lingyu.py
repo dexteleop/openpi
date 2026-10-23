@@ -72,8 +72,9 @@ def create_lingyu_dataset_v2(
     logging.info(f"max_token_len: {model_config.max_token_len}")
     # GPU 解码的裁剪与缩放参数取自本 data_config 的 openpi 图像变换, 不另行配置
     video_key_to_crop, image_resolution = load_video_decode_config(data_config)
+    # 训练只要前 action_horizon 步动作, 数据集在读 mcap 前截掉索引里的多余 action location
     return LingyuDatasetV2(data_config.iceberg_dir, video_key_to_crop=video_key_to_crop,
-                           image_resolution=image_resolution)
+                           image_resolution=image_resolution, action_horizon=model_config.action_horizon)
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:

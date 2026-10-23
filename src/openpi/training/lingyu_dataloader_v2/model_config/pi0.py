@@ -1,7 +1,7 @@
 ######
 # Action Chunk Length
 ######
-ACTION_CHUNK_LENGTH = 30
+ACTION_CHUNK_LENGTH = 100
 
 
 ######
