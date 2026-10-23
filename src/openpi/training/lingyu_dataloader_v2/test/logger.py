@@ -17,7 +17,7 @@ def get_logger(caller_file: str) -> logging.Logger:
     # basicConfig() is a no-op when pytest has already initialized root logger
     # handlers, so handlers are added directly to guarantee file output.
     if not named_logger.handlers:
-        # 日志写到调用者所在目录，子目录中的 test 文件不再把 .log 落到上一级
+        # Logs go to the caller's directory, so test files in subdirectories no longer drop .log files one level up
         log_path = os.path.join(os.path.dirname(os.path.abspath(caller_file)), f"{stem}.log")
         _fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
         _fh.setFormatter(_fmt)

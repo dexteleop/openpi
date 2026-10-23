@@ -19,20 +19,20 @@ logger = logging.getLogger(__name__)
 
 
 ##########
-# MCAP Record 类型
+# MCAP Record types
 ##########
-# 存储信息
+# Storage information
 OP_HEADER         = 0x01
 OP_FOOTER         = 0x02
 OP_SUMMARY_OFFSET = 0x0E
 OP_MESSAGE        = 0x05
 OP_CHUNK          = 0x06
-# 存储索引
+# Storage index
 OP_SCHEMA         = 0x03
 OP_CHANNEL        = 0x04
 OP_MESSAGE_IDX    = 0x07
 OP_CHUNK_IDX      = 0x08
-# 存储统计数据
+# Storage statistics
 OP_STATISTICS     = 0x0B
 OP_METADATA       = 0x0C
 OP_METADATA_IDX   = 0x0D
@@ -42,7 +42,7 @@ OP_DATAEND        = 0x0F
 
 
 ##########
-# MCAP常见结构长度
+# Common MCAP structure lengths
 ##########
 MAGIC_SIZE = 8  # b"\x89MCAP0\r\n"
 OPCODE_PREFIX = 1
@@ -52,11 +52,11 @@ RECORD_PREFIX = OPCODE_PREFIX + 8  # opcode(1) + length(8)
 # Footer Data(20): summary_start(8) + summary_offset_start(8) + summary_crc(4)
 FOOTER_SIZE = RECORD_PREFIX + 8 + 8 + 4
 
-# Summary Offset Record 中可能出现的 opcode 集合
+# Set of opcodes that may appear in Summary Offset Records
 SUMMARY_OFFSET_OPCODES = {
     OP_SCHEMA, OP_CHANNEL, OP_CHUNK_IDX,
 }
-# 单条 Summary Offset Record： group_opcode(1)
+# A single Summary Offset Record: group_opcode(1)
 #                             + group_start(8)
 #                             + group_length(8)
 SUMMARY_OFFSET_REC_LEN = 17
@@ -69,7 +69,7 @@ SUMMARY_OFFSET_REC_LEN = 17
 #               + compression(4+name_len)
 #               + records_length(8)
 CHUNK_HEADER_FIXED = 8 + 8 + 8 + 4 + 4 + 8
-# chunk header 长度并不是固定的：不压缩,name_len=0; lz4,name_len=3; zstd,name_len=4
+# The chunk header length is not fixed: no compression, name_len=0; lz4, name_len=3; zstd, name_len=4
 
 # Message Record: RECORD_PREFIX + Message Header
 # Message Header: channel_id(2)
@@ -80,7 +80,7 @@ MESSAGE_HEADER = 2 + 4 + 8 + 8
 
 
 ##########
-# 字节流转整数
+# Byte stream to integer
 ##########
 u16 = struct.Struct("<H").unpack_from # 2 bytes -> int
 u32 = struct.Struct("<I").unpack_from # 4 bytes -> int
@@ -88,55 +88,55 @@ u64 = struct.Struct("<Q").unpack_from # 8 bytes -> int
 
 
 ##########
-# 对象存储读取函数
+# Object storage read functions
 ##########
-# 单进程连接池上限: 超过该数的并发请求仍会新建连接, 但用完即关闭, 无法复用
+# Per-process connection pool limit: concurrent requests beyond this still create new connections, but they are closed after use and cannot be reused
 S3_MAX_POOL_CONNECTIONS = 200
-# 读响应体超时/断流, 或 botocore 自身重试耗尽后仍被限流时, 整次请求的最多尝试次数;
-# 实测 OSS 网关会对个别对象区域连续卡住十几分钟, 配合 S3_READ_TIMEOUT 与最长 30s 的退避, 可容忍约 45 分钟的连续失败
+# Maximum attempts for one request when the response body read times out / the stream breaks, or throttling persists after botocore's own retries are exhausted;
+# in practice the OSS gateway can stall on individual object ranges for over ten minutes; together with S3_READ_TIMEOUT and backoff of up to 30s, this tolerates about 45 minutes of continuous failures
 S3_READ_ATTEMPTS = 60
-# 单次读取的 socket 超时(秒); botocore 默认 60s, 卡住的连接极少自行恢复, 缩短后能更快换连接重试
+# Socket timeout (seconds) per read; botocore defaults to 60s, stuck connections rarely recover on their own, shortening it switches to a new connection and retries faster
 S3_READ_TIMEOUT = 20
-# 实测网关对冷数据的大 range 读取会持续卡住十几分钟, 而同一位置不超过 16KiB 的小读取能立即返回;
-# 故同一 range 读超时达到 S3_SPLIT_AFTER_ATTEMPTS 次后, 改为按 S3_SPLIT_BYTES 分片依次读取再拼接
+# In practice the gateway keeps stalling for over ten minutes on large range reads of cold data, while small reads (<= 16KiB) at the same position return immediately;
+# so after S3_SPLIT_AFTER_ATTEMPTS timeouts on the same range, the read is split into S3_SPLIT_BYTES pieces read sequentially and concatenated
 S3_SPLIT_AFTER_ATTEMPTS = 2
 S3_SPLIT_BYTES = 16 * 1024
-# 视为限流/服务端暂时不可用、值得退避后重试的 HTTP 状态码
+# HTTP status codes treated as throttling / temporary server unavailability, worth retrying after backoff
 S3_THROTTLE_STATUS = {429, 500, 503}
 
-# 当前线程最近一次新建 TCP 连接的耗时(ms); None 表示本次请求复用了池内空闲连接
+# Time (ms) of the most recent TCP connection establishment in the current thread; None means this request reused an idle pooled connection
 _tcp_connect_local = threading.local()
-# http / https 连接都继承 urllib3 的同一个 _new_conn(DNS 解析 + TCP 三次握手)
+# Both http / https connections inherit the same urllib3 _new_conn (DNS resolution + TCP three-way handshake)
 _new_conn_original = AWSHTTPConnection._new_conn
 assert AWSHTTPSConnection._new_conn is _new_conn_original, "botocore 连接类结构已变化"
 
 
 def _new_conn_timed(self):
-    """包装 urllib3 建连, 把真实建连耗时写入当前线程; get_object 在调用线程内同步建连, 多线程互不干扰"""
+    """Wrap urllib3 connection establishment and record the real connect time in the current thread; get_object connects synchronously in the calling thread, so threads do not interfere with each other"""
     connect_start = time.perf_counter()
     sock = _new_conn_original(self)
     _tcp_connect_local.connect_ms = (time.perf_counter() - connect_start) * 1000
     return sock
 
 
-# 只替换 botocore 自己的连接子类, 不影响进程内其他 urllib3 用户
+# Only replace botocore's own connection subclass, without affecting other urllib3 users in the process
 AWSHTTPConnection._new_conn = _new_conn_timed
 AWSHTTPSConnection._new_conn = _new_conn_timed
 
 
 @lru_cache(maxsize=1)
 def s3_client():
-    """boto3 client 内部带连接池, 全进程复用一个即可"""
+    """A boto3 client carries its own connection pool internally; one per process is enough"""
     return make_client(Config(max_pool_connections=S3_MAX_POOL_CONNECTIONS, read_timeout=S3_READ_TIMEOUT,
-                              retries={"mode": "legacy", "max_attempts": 10}))  # OSS 限流返回 429 TooManyRequests, 只有 legacy 模式会重试
+                              retries={"mode": "legacy", "max_attempts": 10}))  # OSS throttling returns 429 TooManyRequests; only legacy mode retries it
 
 
 def pool_stats() -> list[dict[str, Any]]:
-    """读取 s3_client() 各连接池(每个 host:port 一个)的实时状态
+    """Read the live status of each connection pool in s3_client() (one per host:port)
 
-    idle: 池内空闲连接数; in_use: 被取走的池位数(上限 maxsize, 溢出的临时连接不计入)
-    created / requests: 累计新建连接数 / 累计请求数
-    依赖 botocore / urllib3 私有属性, 升级后结构变化时由 assert 直接报错
+    idle: number of idle connections in the pool; in_use: pool slots taken (capped at maxsize, overflow temporary connections not counted)
+    created / requests: cumulative new connections / cumulative requests
+    Relies on botocore / urllib3 private attributes; an assert fails directly if the structure changes after an upgrade
     """
     http_session = getattr(getattr(s3_client(), "_endpoint", None), "http_session", None)
     manager = getattr(http_session, "_manager", None)
@@ -145,9 +145,9 @@ def pool_stats() -> list[dict[str, Any]]:
     stats = []
     for pool_key in manager.pools.keys():
         conn_pool = manager.pools.get(pool_key)
-        if conn_pool is None or conn_pool.pool is None:  # 池已被淘汰或已关闭
+        if conn_pool is None or conn_pool.pool is None:  # The pool has been evicted or closed
             continue
-        # 持队列锁取快照, 避免与其他线程的取/还连接交错; 锁内不能再调 qsize()(同一把非重入锁)
+        # Hold the queue lock to take a snapshot, avoiding interleaving with other threads' get/return of connections; do not call qsize() inside the lock (the same non-reentrant lock)
         with conn_pool.pool.mutex:
             idle_count = sum(conn is not None for conn in conn_pool.pool.queue)
             in_use_count = conn_pool.pool.maxsize - len(conn_pool.pool.queue)
@@ -164,7 +164,7 @@ def pool_stats() -> list[dict[str, Any]]:
 
 def _log_fetch_timing(mcap_url: str, offset: int, data_size: int,
                       request_start: float, header_received: float, read_end: float) -> None:
-    """DEBUG 输出单次 range 读取的建连 / 首字节 / 传输耗时、吞吐与连接池状态"""
+    """Log at DEBUG the connect / first-byte / transfer time, throughput and pool status of a single range read"""
     connect_ms = getattr(_tcp_connect_local, "connect_ms", None)
     transfer_sec = read_end - header_received
     throughput_mbps = data_size / (1024 * 1024) / transfer_sec if transfer_sec > 0 else 0.0
@@ -178,23 +178,23 @@ def _log_fetch_timing(mcap_url: str, offset: int, data_size: int,
 
 
 def _bucket_key(mcap_url: str) -> str:
-    """索引 url -> 桶内真实 key: 同一批数据在两桶中的前缀不同(乌兰察布桶在 shihaoran/ 下,
-    北京桶在顶层), 而索引 url 只记录了采集时所在桶的 key。KEY_PREFIX 非空且 url 未含该
-    前缀时补上, 已含前缀的旧索引 url(如 shihaoran/raw/...)原样返回。"""
+    """Index url -> real key inside the bucket: the same batch of data has different prefixes in the two buckets (the Wulanchabu bucket under shihaoran/,
+    the Beijing bucket at the top level), while the index url only records the key in the bucket used at collection time. When KEY_PREFIX is non-empty and the url lacks that
+    prefix, it is prepended; legacy index urls that already contain the prefix (e.g. shihaoran/raw/...) are returned as-is."""
     return mcap_url if not KEY_PREFIX or mcap_url.startswith(f"{KEY_PREFIX}/") else f"{KEY_PREFIX}/{mcap_url}"
 
 
 def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
-    """按 byte range 读取桶内字节流; logger 开启 DEBUG 时记录本次读取的计时与连接池状态
+    """Read a byte range from the bucket; when the logger has DEBUG enabled, record the timing and pool status of this read
 
-    ttfb 从发请求到响应头返回(含可能的建连、签名与服务端处理), transfer 为读取响应体耗时。
-    读到文件尾时 S3 会截断 range, 返回字节数可能小于 length(_play_messages 依赖此行为)
+    ttfb spans from sending the request to receiving the response headers (including possible connection setup, signing and server-side processing); transfer is the time spent reading the response body.
+    At end of file S3 truncates the range, so the returned byte count may be smaller than length (_play_messages relies on this behavior)
     """
-    # length<=0 会拼出非法 Range, S3 可能直接返回整个对象
+    # length<=0 builds an invalid Range header; S3 may return the whole object
     assert length > 0 and offset >= 0, f"非法读取范围: length={length}, offset={offset}"
     byte_range = f"bytes={offset}-{offset + length - 1}"
     for attempt_idx in range(S3_READ_ATTEMPTS):
-        _tcp_connect_local.connect_ms = None  # 清空本线程上一次请求的建连记录
+        _tcp_connect_local.connect_ms = None  # Clear this thread's connection-establishment record from the previous request
         request_start = time.perf_counter()
         try:
             response = s3_client().get_object(Bucket=BUCKET_NAME, Key=_bucket_key(mcap_url), Range=byte_range)
@@ -202,7 +202,7 @@ def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
             data_bytes = response["Body"].read()
             break
         except (ReadTimeoutError, ResponseStreamingError, IncompleteReadError, ClientError) as error:
-            # ClientError 只重试限流类(如 TooManyRequests), NoSuchKey 等其它错误照常抛出
+            # For ClientError only retry throttling-type errors (e.g. TooManyRequests); other errors such as NoSuchKey are raised as usual
             is_throttled = (not isinstance(error, ClientError)
                             or error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") in S3_THROTTLE_STATUS)
             if not is_throttled or attempt_idx == S3_READ_ATTEMPTS - 1:
@@ -212,7 +212,7 @@ def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
                 logger.warning(f"读取 {mcap_url} {byte_range} 已连续失败 {attempt_idx + 1} 次, "
                                f"改为按 {S3_SPLIT_BYTES} 字节分片读取")
                 return _fetch_mcap_bytes_in_pieces(mcap_url, length, offset)
-            # 指数退避 + 随机抖动, 避免大量 worker 同时重试再次形成请求洪峰
+            # Exponential backoff + random jitter, avoiding a request storm when many workers retry at the same time
             backoff_seconds = min(2 ** attempt_idx, 30) * random.uniform(0.5, 1.5)
             logger.warning(f"读取 {mcap_url} {byte_range} 失败({type(error).__name__}), "
                            f"{backoff_seconds:.1f}s 后第 {attempt_idx + 2} 次尝试")
@@ -225,11 +225,11 @@ def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
 
 
 def _fetch_mcap_bytes_in_pieces(mcap_url: str, length: int, offset: int) -> bytes:
-    """把一次大 range 读取拆成若干个不超过 S3_SPLIT_BYTES 的小读取, 依次读取后拼接; 读到文件尾即停止"""
+    """Split one large range read into several small reads of at most S3_SPLIT_BYTES, read them in order and concatenate; stop at end of file"""
     pieces = []
     for piece_offset in range(offset, offset + length, S3_SPLIT_BYTES):
         piece_length = min(S3_SPLIT_BYTES, offset + length - piece_offset)
-        piece = fetch_mcap_bytes(mcap_url, piece_length, piece_offset)  # 小于 S3_SPLIT_BYTES, 不会再次分片
+        piece = fetch_mcap_bytes(mcap_url, piece_length, piece_offset)  # Smaller than S3_SPLIT_BYTES, so it will not be split again
         pieces.append(piece)
         if len(piece) < piece_length:
             break
@@ -237,18 +237,18 @@ def _fetch_mcap_bytes_in_pieces(mcap_url: str, length: int, offset: int) -> byte
 
 
 ##########
-# MCAP功能函数
+# MCAP utility functions
 ##########
-# 读取 MCAP 字节长度
+# Read the MCAP byte length
 def fetch_mcap_length(mcap_url: str) -> int:
-    """对象字节数"""
+    """Byte size of the object"""
     return s3_client().head_object(
         Bucket=BUCKET_NAME,
         Key=mcap_url
     )["ContentLength"]
 
 
-# 对压缩chunk进行解压缩
+# Decompress compressed chunks
 def decompress_chunk_record(
     mcap_url: str,
     records_start: int,
@@ -256,7 +256,7 @@ def decompress_chunk_record(
     compression: str,
     uncompressed_size: int,
 ) -> bytes:
-    """整块解压 chunk 的 records 区; 只缓存最近一块, 供同 chunk 的连续读取(如 ffmpeg GOP)复用。"""
+    """Decompress the whole records section of a chunk; only the most recent chunk is cached, for reuse by consecutive reads of the same chunk (e.g. ffmpeg GOP)."""
     import lz4.frame
     import zstandard
 
@@ -270,22 +270,22 @@ def decompress_chunk_record(
     raise ValueError(f"不支持的 chunk 压缩方式: {compression!r}")
 
 
-# 找到 Summary Records 的位置偏移
+# Locate the position offsets of the Summary Records
 def fetch_SummaryRecords(mcap_url: str) -> dict[bytes, tuple[int, int]]:
-    """ 定位 Summary Setion 中多个 Record 位置偏移
-    MCAP尾部的基本结构：
-    [Schema Record] (可选重复)  <-- 3. 摘要与索引区 (Summary Section)
-    [Channel Record] (可选重复)
-    [Chunk Index Record]  (所有 Chunk 的文件物理偏移量)
-    [Message Index Record]  (每个 Chunk 中 Message 的时间戳与偏移量，暂时不存在)
+    """ Locate the position offsets of multiple Records in the Summary Section
+    Basic structure at the end of an MCAP:
+    [Schema Record] (optional, repeated)  <-- 3. Summary and index section (Summary Section)
+    [Channel Record] (optional, repeated)
+    [Chunk Index Record]  (file physical offsets of all chunks)
+    [Message Index Record]  (timestamps and offsets of messages in each chunk; not present for now)
     ...
-    [Summary Offset Record] (指向上述各个摘要 Record 类型的起始位置)
+    [Summary Offset Record] (points to the start of each summary Record type above)
     [Footer Record]
     [Magic Record]
     """
     file_size = fetch_mcap_length(mcap_url)
 
-    # 从 MCAP尾部 找到 Footer
+    # Find the Footer at the end of the MCAP
     footer_offset_start = file_size - MAGIC_SIZE - FOOTER_SIZE
     footer_bytes = fetch_mcap_bytes(
         mcap_url, FOOTER_SIZE, footer_offset_start
@@ -303,7 +303,7 @@ def fetch_SummaryRecords(mcap_url: str) -> dict[bytes, tuple[int, int]]:
                          "（summary_start == 0）")
     summary_offset_start, = u64(footer_bytes, RECORD_PREFIX + 8)
 
-    # 利用 Footer 找到 Summary Offset Records
+    # Use the Footer to locate the Summary Offset Records
     summary_offset_length = footer_offset_start - summary_offset_start
     if summary_offset_length <= 0:
         return {}
@@ -312,17 +312,17 @@ def fetch_SummaryRecords(mcap_url: str) -> dict[bytes, tuple[int, int]]:
                                             summary_offset_length,
                                             summary_offset_start)
 
-    # 利用 Summary Offset Records 来找到 Summary Records 的位置
+    # Use the Summary Offset Records to locate the Summary Records
     summary_records_loca: dict[bytes, tuple[int, int]] = {}
     pos = 0
     while pos + RECORD_PREFIX <= summary_offset_length:
         op = summary_offset_bytes[pos]
         if op != OP_SUMMARY_OFFSET:
-            # 遇到非 Summary Offset Record，停止解析
+            # Stop parsing when a non-Summary-Offset Record is encountered
             break
         payload_len, = u64(summary_offset_bytes, pos + OPCODE_PREFIX)
 
-        # 每条 payload 固定 17 字节：
+        # Each payload is fixed at 17 bytes:
         # group_opcode(1) + group_start(8) + group_length(8)
         payload_pos = pos + RECORD_PREFIX
         group_opcode = summary_offset_bytes[payload_pos: payload_pos + OPCODE_PREFIX]
@@ -337,10 +337,10 @@ def fetch_SummaryRecords(mcap_url: str) -> dict[bytes, tuple[int, int]]:
     return summary_records_loca
 
 
-# 解析 Summary 中的 Schema
+# Parse Schemas from the Summary
 def parse_SchemaRecord_in_SummarySection(mcap_url: str, record_start: int, record_length: int) -> list[dict]:
-    """解析 Summary 中所有 Schema Record
-    返回字段: schema_id, name, encoding, msgdef
+    """Parse all Schema Records in the Summary
+    Returned fields: schema_id, name, encoding, msgdef
     """
     section = fetch_mcap_bytes(mcap_url, record_length, record_start)
     result = []
@@ -351,7 +351,7 @@ def parse_SchemaRecord_in_SummarySection(mcap_url: str, record_start: int, recor
         if section[pos] == OP_SCHEMA:
             payload = section[pos + RECORD_PREFIX:payload_end]
             schema_id, = u16(payload, 0)
-            # name / encoding / data 均为 prefixed 字段: uint32 长度 + 内容
+            # name / encoding / data are all prefixed fields: uint32 length + content
             name_len, = u32(payload, 2)
             name_end = 2 + 4 + name_len
             encoding_len, = u32(payload, name_end)
@@ -368,10 +368,10 @@ def parse_SchemaRecord_in_SummarySection(mcap_url: str, record_start: int, recor
     return result
 
 
-# 解析 Summary 中的 Channel
+# Parse Channels from the Summary
 def parse_ChannelRecord_in_SummarySection(mcap_url: str, record_start: int, record_length: int) -> list[dict]:
-    """解析 Summary 中所有 Channel Record
-    返回字段: channel_id, schema_id, topic, encoding
+    """Parse all Channel Records in the Summary
+    Returned fields: channel_id, schema_id, topic, encoding
     """
     section = fetch_mcap_bytes(mcap_url, record_length, record_start)
     result = []
@@ -383,7 +383,7 @@ def parse_ChannelRecord_in_SummarySection(mcap_url: str, record_start: int, reco
             payload = section[pos + RECORD_PREFIX:payload_end]
             channel_id, = u16(payload, 0)
             schema_id,  = u16(payload, 2)
-            # topic / message_encoding 均为 prefixed 字符串: uint32 长度 + UTF-8 字节
+            # topic / message_encoding are both prefixed strings: uint32 length + UTF-8 bytes
             topic_len, = u32(payload, 4)
             topic_end = 4 + 4 + topic_len
             encoding_len, = u32(payload, topic_end)
@@ -398,13 +398,13 @@ def parse_ChannelRecord_in_SummarySection(mcap_url: str, record_start: int, reco
     return result
 
 
-# 解析 Summary 中的 Chunk
+# Parse Chunks from the Summary
 def parse_ChunkIndexRecord_in_SummarySection(mcap_url: str, record_start: int, record_length: int) -> list[dict]:
-    """解析 Summary 中所有 Chunk Index Record，其中包含的9个字段：
+    """Parse all Chunk Index Records in the Summary, which contain 9 fields:
     msg_start_time, msg_end_time, chunk_start_offset, chunk_length,
     msg_idx_offsets, msg_idx_length, compression, compressed_size, uncompressed_size
 
-    返回字段：
+    Returned fields:
     chunk_start_offset, chunk_length,
     msg_idx_offsets, msg_idx_length,
     compression, compressed_size, uncompressed_size
@@ -417,11 +417,11 @@ def parse_ChunkIndexRecord_in_SummarySection(mcap_url: str, record_start: int, r
         payload_end = record_pos + RECORD_PREFIX + payload_len
         if section[record_pos] == OP_CHUNK_IDX:
             payload = section[record_pos + RECORD_PREFIX:payload_end]
-            pos = 8 + 8  # 跳过 msg_start_time / msg_end_time
+            pos = 8 + 8  # Skip msg_start_time / msg_end_time
             chunk_start_offset, = u64(payload, pos); pos += 8
             chunk_length,       = u64(payload, pos); pos += 8
             # message_index_offsets: map<uint16 channel_id, uint64 file_offset>
-            # u32 字段是 map 的字节总长，不是条目数；每条 10 字节（2+8）
+            # The u32 field is the total byte length of the map, not the entry count; each entry is 10 bytes (2+8)
             map_byte_len, = u32(payload, pos); pos += 4
             map_end = pos + map_byte_len
             msg_idx_offsets: dict[int, int] = {}
@@ -431,12 +431,12 @@ def parse_ChunkIndexRecord_in_SummarySection(mcap_url: str, record_start: int, r
                 msg_idx_offsets[ch_id] = offset
             pos = map_end
             msg_idx_length, = u64(payload, pos); pos += 8
-            # compression 为 prefixed 字符串: uint32 长度 + UTF-8 字节
+            # compression is a prefixed string: uint32 length + UTF-8 bytes
             compression_len, = u32(payload, pos); pos += 4
             compression = payload[pos:pos + compression_len].decode(
                 "utf-8", errors="replace")
             pos += compression_len
-            # compressed_size 即 records 区在文件中的字节数; uncompressed_size 供解压上界使用
+            # compressed_size is the byte size of the records section in the file; uncompressed_size is used as the decompression upper bound
             compressed_size,   = u64(payload, pos); pos += 8
             uncompressed_size, = u64(payload, pos)
             result.append({
@@ -452,20 +452,20 @@ def parse_ChunkIndexRecord_in_SummarySection(mcap_url: str, record_start: int, r
     return result
 
 
-# 利用 Chunk Index Record 解析某个 Chunk 内的 Message Index Record
+# Use the Chunk Index Record to parse the Message Index Records inside one chunk
 def parse_MessageIdx_from_ChunkIndexRecord(
     mcap_url: str,
     chunk: dict[str, Any],
 ) -> dict[int, list[tuple[int, int]]]:
-    """读取一个 Chunk 的整组 Message Index Record
+    """Read the whole group of Message Index Records of one chunk
 
-    参数:
-        chunk: parse_ChunkIndexRecord_in_SummarySection() 返回列表中的一项
+    Args:
+        chunk: one item of the list returned by parse_ChunkIndexRecord_in_SummarySection()
 
-    返回:
-        channel_id -> [(log_time, uncompressed_byte_offset), ...]，按写入顺序保持原样
+    Returns:
+        channel_id -> [(log_time, uncompressed_byte_offset), ...], kept in the original write order
     """
-    # 同一 chunk 的 MessageIndex 连续排列, msg_idx_offsets 中的最小偏移即整组起点
+    # The MessageIndex records of one chunk are laid out consecutively; the minimum offset in msg_idx_offsets is the start of the whole group
     msg_idx_bytes = fetch_mcap_bytes(mcap_url,
                                      chunk["msg_idx_length"],
                                      min(chunk["msg_idx_offsets"].values()))

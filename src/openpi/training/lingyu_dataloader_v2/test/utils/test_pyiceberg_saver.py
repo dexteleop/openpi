@@ -1,13 +1,13 @@
-"""用真实 mcap 的 episode 校验 EpisodeParquetWriter 的增量写与 IcebergEpisodeSaver 的注册。
+"""Verify EpisodeParquetWriter's incremental writes and IcebergEpisodeSaver's registration with episodes from a real mcap.
 
-核对::
-    1. 逐个 episode 写入时 RSS 不随行数增长: worker 的内存恒等于一个 episode
-    2. 按 roll_episodes 滚动换文件: 满的文件返回 (路径, 行数), 未满时返回 None
-    3. 一行一个 row group, 且行数 == 写入的 episode 数
-    4. add_files 能登记这种多 row group 文件, 读回的 samples 结构原样可用
+Checks::
+    1. RSS does not grow with row count while writing episode by episode: worker memory stays constant at one episode
+    2. Files roll by roll_episodes: a full file returns (path, row count); a not-yet-full one returns None
+    3. One row per row group, and row count == episodes written
+    4. add_files can register such multi-row-group files, and the read-back samples structure is usable as-is
 
-之所以要盯住第 1 条: 上一版把整批 episode 攒在内存里再转 Arrow, 64 个 worker 一起跑会
-把内存撑爆(曾被 OOM killer 杀掉), 增量写是否真的释放内存必须实测, 不能只看代码。
+Why item 1 matters: the previous version accumulated the whole batch of episodes in memory before converting to Arrow; 64 workers running together
+blew up memory (once OOM-killed), so whether incremental writes really free memory must be measured, not judged from code alone.
 """
 import os
 import shutil
@@ -27,18 +27,18 @@ logger = get_logger(__file__)
 
 _WAREHOUSE_DIR = "/tmp/test_pyiceberg_saver_wh"
 _PROMPT = "Test incremental writer."
-_ROLL_EPISODES = 3              # 缩小滚动阈值, 少抽几个 episode 就能看到换文件
-_NUM_EPISODES = 7               # 2 个满文件(3+3) + 1 个尾批(1)
-_RSS_TOLERANCE_GB = 0.30        # 一个 episode 的 Arrow 表约 40 MB, 留足余量
+_ROLL_EPISODES = 3              # Smaller roll threshold so a few episodes reveal file switching
+_NUM_EPISODES = 7               # 2 full files (3+3) + 1 tail batch (1)
+_RSS_TOLERANCE_GB = 0.30        # One episode's Arrow table is about 40 MB; leave generous headroom
 
 
 def _rss_gb() -> float:
-    """当前进程的 RSS, 直接读 /proc 避免引入依赖。"""
+    """Current process's RSS, read from /proc to avoid adding dependencies."""
     return int(open("/proc/self/statm").read().split()[1]) * 4096 / 1024**3
 
 
 def test_pyiceberg_saver():
-    """逐个 episode 增量写 parquet, 内存不涨、按阈值滚动, 再 add_files 注册后读回。"""
+    """Write parquet episode by episode with flat memory and rolling by threshold, then register via add_files and read back."""
     shutil.rmtree(_WAREHOUSE_DIR, ignore_errors=True)
     topic_names = sorted(filter_topics())
     table = load_episodes_table(_WAREHOUSE_DIR, topic_names, _PROMPT)
@@ -50,17 +50,17 @@ def test_pyiceberg_saver():
                 mcap_path, _NUM_EPISODES, _ROLL_EPISODES)
 
     base_rss = _rss_gb()
-    closed_files = []           # [(路径, episode 数), ...]
+    closed_files = []           # [(path, episode count), ...]
     num_written = 0
     for source_episode_seq, samples in extractor.iter_episodes():
         episode = EpisodeRecord(extractor.source_id, source_episode_seq, samples)
         closed_file = writer.write(episode)
         num_written += 1
-        # --- 1. 内存不随已写行数增长 ---
+        # --- 1. Memory does not grow with rows written ---
         rss_growth = _rss_gb() - base_rss
         assert rss_growth < _RSS_TOLERANCE_GB, \
             f"写到第 {num_written} 个 episode 时 RSS 已涨 {rss_growth:.2f} GB, 增量写没有释放内存"
-        # --- 2. 只有写满 _ROLL_EPISODES 行才交出文件, 未满时返回 None ---
+        # --- 2. Only a file filled with _ROLL_EPISODES rows is handed over; not-yet-full returns None ---
         if num_written % _ROLL_EPISODES == 0:
             assert closed_file is not None, f"第 {num_written} 个 episode 应当刚好写满一个文件"
             closed_files.append(closed_file)
@@ -72,13 +72,13 @@ def test_pyiceberg_saver():
         if num_written >= _NUM_EPISODES:
             break
 
-    tail_file = writer.close()  # 尾批: 不满一个文件也要交出来
+    tail_file = writer.close()  # Tail batch: even a not-yet-full file must be handed over
     assert tail_file is not None and tail_file[1] == _NUM_EPISODES % _ROLL_EPISODES, \
         f"尾批行数与预期不符: {tail_file}"
     closed_files.append(tail_file)
     assert writer.close() is None, "重复 close() 不应再交出文件"
 
-    # --- 3. 一行一个 row group, 行数与写入的 episode 数一致 ---
+    # --- 3. One row per row group, and row count matches episodes written ---
     for parquet_path, num_episodes in closed_files:
         parquet_file = pq.ParquetFile(parquet_path.removeprefix("file://"))
         assert parquet_file.metadata.num_rows == num_episodes, \
@@ -89,7 +89,7 @@ def test_pyiceberg_saver():
         logger.info("文件 %d 行 / %d 个 row group / %.2f MB", num_episodes,
                     parquet_file.num_row_groups, size_mb)
 
-    # --- 4. add_files 登记这些文件, 一个文件一个 snapshot, 读回结构原样可用 ---
+    # --- 4. add_files registers these files, one snapshot per file; read-back structure usable as-is ---
     saver = IcebergEpisodeSaver(table)
     for parquet_path, num_episodes in closed_files:
         saver.extend([parquet_path], num_episodes)

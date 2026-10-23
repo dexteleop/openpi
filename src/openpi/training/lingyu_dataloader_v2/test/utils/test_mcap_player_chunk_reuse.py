@@ -1,8 +1,8 @@
 """
-验证顺序播放复用已下载 chunk(预读缓冲 + fetch_data_bytes 命中刚播完的 chunk)后:
-1. 产出与逐条回头请求 S3 的旧行为逐条一致(含 GOP locations, 即关键帧判断结果一致)
-2. 按键 message 反序列化结果一致
-3. S3 请求数降到约每个 chunk 一次
+Verify that sequential playback reusing downloaded chunks (prefetch buffer + fetch_data_bytes hitting the just-played chunk):
+1. Output matches the old behavior of re-requesting S3 per message, item by item (including GOP locations, i.e. identical keyframe decisions)
+2. Deserialized key messages match
+3. S3 request count drops to about one per chunk
 """
 import sys
 import time
@@ -18,17 +18,17 @@ logger = get_logger(__file__)
 
 _MCAP_URL = ("raw/20251103-TEST/2026-07-29/15/20251103-TEST_20260729-151253-930136_"
              "20260729-152547-124514/rec_20260729_151253_0.mcap")
-_MAX_MESSAGES = 8000     # 旧行为每帧两次 S3 往返, 很慢, 只比前一段
+_MAX_MESSAGES = 8000     # The old behavior costs two S3 round trips per frame, very slow; compare only a prefix
 _BIG_READ_BYTES = 64 * 1024
 
 
 def _fetch_unbuffered(mcap_path, buffer, length, offset):
-    """旧行为: 每次都直接请求 S3, 不用预读缓冲"""
+    """Old behavior: request S3 directly every time, no prefetch buffer"""
     return fetch_mcap_bytes(mcap_path, length, offset), buffer
 
 
 def _play(max_messages: int, request_counter: Counter) -> tuple[list, list]:
-    """播前 max_messages 条, 返回 (产出元组列表, 按键列表); 请求数计入 request_counter"""
+    """Play the first max_messages messages, returning (yielded tuple list, key list); requests are counted into request_counter"""
     fetcher = MCAP_Message_Fetcher()
     played, buttons = [], []
     player = mcap_player.MCAP_Player(_MCAP_URL)
@@ -44,7 +44,7 @@ def _play(max_messages: int, request_counter: Counter) -> tuple[list, list]:
 
 
 def _count_requests(request_counter: Counter):
-    """包一层 get_object, 按读取大小分类计数"""
+    """Wrap get_object, counting reads by size class"""
     client = s3_client()
     original_get = client.get_object
 
@@ -58,7 +58,7 @@ def _count_requests(request_counter: Counter):
 
 
 def test():
-    """新旧行为逐条对比, 并检查请求数"""
+    """Compare old and new behaviors item by item, and check request counts"""
     request_counter = Counter()
     _count_requests(request_counter)
 
@@ -67,7 +67,7 @@ def test():
     new_sec, new_requests = time.time() - start_time, dict(request_counter)
     logger.info("new: %d messages in %.1fs, requests=%s", len(new_played), new_sec, new_requests)
 
-    # 关掉两处复用, 还原成逐条回头请求 S3
+    # Disable both reuse points to restore per-message S3 re-requesting
     request_counter.clear()
     remember_original, fetch_original = mcap_player.remember_chunk_records, mcap_player._fetch_buffered
     mcap_player.remember_chunk_records = lambda *args: None
@@ -85,7 +85,7 @@ def test():
     gop_max = max(len(message[4]) for message in new_played)
     logger.info("一致: %d messages, %d signals, 最长 GOP locations=%d, 提速 %.1fx",
                 len(new_played), len(new_buttons), gop_max, old_sec / new_sec)
-    # 每个 chunk 一次大请求, 小请求只剩开头的少量(文件头之后的首个缓冲)
+    # One large request per chunk; small requests reduce to the few at the start (first buffer after the file header)
     assert new_requests.get("small", 0) <= 2, f"仍有逐条小请求: {new_requests}"
 
 

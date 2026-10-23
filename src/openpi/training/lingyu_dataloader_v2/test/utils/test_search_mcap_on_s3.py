@@ -19,7 +19,7 @@ def test():
     for mcap_url, prompt in mcap_urls.items():
         logger.info("%s\t%s", prompt, mcap_url)
 
-    # 取首个 mcap 读 8 字节, 验证确实能读到内容(mcap 魔数为 \x89MCAP0\r\n)
+    # Take the first mcap and read 8 bytes, verifying content is really readable (the mcap magic is \x89MCAP0\r\n)
     first_mcap_url = next(iter(mcap_urls))
     start_time = time()
     magic = make_client().get_object(

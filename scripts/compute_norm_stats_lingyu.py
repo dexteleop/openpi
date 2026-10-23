@@ -9,8 +9,10 @@ from collections.abc import Sequence
 import dataclasses
 import glob
 import io
+import logging
 import os
 import tarfile
+from pathlib import Path
 
 import numpy as np
 from torch.utils.data import IterableDataset as TorchIterableDataset
@@ -18,10 +20,12 @@ import tqdm
 import tyro
 
 import openpi.shared.normalize as normalize
-import openpi.training.config_lingyu as _config
-import openpi.training.data_loader_lingyu as _data_loader
+import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import LingyuDatasetV2
 import openpi.transforms as transforms
+
+logger = logging.getLogger(__name__)
 
 
 class RemoveStrings(transforms.DataTransformFn):
@@ -63,7 +67,14 @@ def create_torch_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None, num_workers: int | None = None):
+def main(config_name: str, max_frames: int | None = None, num_workers: int | None = None, log: bool = False):
+    # 仅 --log 时才生成脚本同名 .log(入口处配置日志路由); 不带则不产生任何日志文件
+    # force=True: import 链上的第三方库可能已给 root logger 挂过 handler, 不加 force 时 basicConfig 会静默失效
+    if log:
+        logging.basicConfig(level=logging.INFO, filename=Path(__file__).with_suffix(".log"),
+                            filemode="w", encoding="utf-8",
+                            format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
+    logger.info(f"start: config={config_name}, max_frames={max_frames}, num_workers={num_workers}")
     config = _config.get_config(config_name)
     assert isinstance(config.data, _config.LingyuTeleavatarV2DataConfig), \
         f"{config_name} 不是 LingyuTeleavatarV2DataConfig, 不能用本脚本计算 norm stats"

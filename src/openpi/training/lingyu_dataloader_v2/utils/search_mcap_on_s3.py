@@ -1,14 +1,14 @@
 """
-数据平台的 rosbag 存在 S3 上, csv 中的“rosbag文件夹路径”即桶内对象前缀,
-故 mcap_url 就是桶内 key, 不再经过本地挂载。
+The data platform's rosbags live on S3, and the csv's "rosbag folder path" is the object prefix inside the bucket,
+so mcap_url is simply the in-bucket key, no longer going through a local mount.
 
-运行前需设置环境变量:
+Environment variables required before running:
     export S3_ENDPOINT="http://x.x.x.x:19000"
     export REGION_NAME="us-east-1"
     export ACCESS_KEY_ID="xxx"
     export SECRET_ACCESS_KEY="xxx"
     export BUCKET_NAME="xxx"
-    export KEY_PREFIX="shihaoran"  # 可选: 桶与 csv 路径之间的前缀, 不设则为空
+    export KEY_PREFIX="shihaoran"  # Optional: prefix between the bucket and the csv paths; empty if unset
 """
 import glob
 import logging
@@ -20,18 +20,18 @@ from botocore.config import Config
 from openpi.training.lingyu_dataloader_v2.utils._prompt_translator import translate_prompts
 from openpi.training.lingyu_dataloader_v2.utils._read_csv_columns import read_rosbag_dirs_from_csv
 
-# 项目根目录 (openpi/), 数据平台导出的 csv 放在这里
+# Project root (openpi/); the data platform's exported csv goes here
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
 BUCKET_NAME = os.environ["BUCKET_NAME"]
-# 桶内 key = KEY_PREFIX/csv 中的 rosbag 路径; 列举结果已含前缀, 下游 get_object 无需再拼
+# In-bucket key = KEY_PREFIX + the rosbag path from the csv; listing results already include the prefix, so downstream get_object need not re-join
 KEY_PREFIX = os.environ.get("KEY_PREFIX", "").strip("/")
 
 logger = logging.getLogger(__name__)
 
 
 def make_client(config: Config | None = None):
-    """按环境变量建立 S3 客户端; 缺少变量时 os.environ[] 直接抛 KeyError
-    config: 可选 botocore Config(如连接池大小), None 时使用 botocore 默认值
+    """Build an S3 client from environment variables; missing variables raise KeyError directly from os.environ[]
+    config: optional botocore Config (e.g. pool size); None uses botocore defaults
     """
     return boto3.client(
         "s3",
@@ -44,17 +44,17 @@ def make_client(config: Config | None = None):
 
 
 def list_buckets() -> list[str]:
-    """返回端点上全部桶名"""
+    """Return all bucket names on the endpoint"""
     return [bucket["Name"] for bucket in make_client().list_buckets()["Buckets"]]
 
 
 def find_mcap_url_and_prompt_pairs() -> dict[str, str]:
     """
-    把 csv 中的 rosbag 目录当作桶内前缀逐个列举, 检查前缀下是否有 .mcap,
-    返回 {mcap url: 所属作业(英文)}。
+    List each rosbag directory from the csv as an in-bucket prefix, check whether .mcap files exist under it,
+    and return {mcap url: owning job (English)}.
     """
     csv_files = glob.glob(os.path.join(PROJECT_ROOT, "*.csv"))
-    # 判断是否这个csv_file是否存在
+    # Check whether this csv_file exists
     assert len(csv_files) == 1, f"项目根目录应有且仅有一个 csv, 实际: {csv_files}"
 
     rosbag_dirs = read_rosbag_dirs_from_csv(csv_files[0])
@@ -63,20 +63,20 @@ def find_mcap_url_and_prompt_pairs() -> dict[str, str]:
     client = make_client()
     mcap_urls = {}
     for rosbag_dir, prompt in rosbag_dirs.items():
-        # key 前缀必须以 / 结尾, 否则会匹配到同名前缀的兄弟目录
-        # KEY_PREFIX 为空时 posixpath.join 退化为原路径
+        # The key prefix must end with /, otherwise a sibling directory with the same name prefix would match
+        # When KEY_PREFIX is empty, posixpath.join degrades to the original path
         key_prefix = posixpath.join(KEY_PREFIX, rosbag_dir.strip("/")) + "/"
         response = client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=key_prefix)
         found = sorted(obj["Key"] for obj in response.get("Contents", ())
                        if obj["Key"].endswith(".mcap"))
         if not found:
-            logger.warning(f"[无 mcap] {rosbag_dir}")  # 缺数据用 WARNING, 调高级别时仍可见
+            logger.warning(f"[无 mcap] {rosbag_dir}")  # Missing data uses WARNING, still visible at higher levels
             continue
 
-        # 将 {mcap_url, prompt} 放到 mcap_urls 中
+        # Put the {mcap_url, prompt} pairs into mcap_urls
         mcap_urls.update(dict.fromkeys(found, prompt))
 
-    # 作业名中英文相间, 统一翻成英文; 先去重再翻, 同一作业名只请求一次
+    # Job names mix English and Chinese; translate all to English, deduplicating first so each job name is requested once
     prompts = list(dict.fromkeys(mcap_urls.values()))
     prompts_en = dict(zip(prompts, translate_prompts(prompts, max_workers=100)))
 

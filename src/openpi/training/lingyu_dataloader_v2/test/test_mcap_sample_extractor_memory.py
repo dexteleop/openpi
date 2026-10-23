@@ -1,10 +1,10 @@
 """
-观察 MCAPSampleExtractor 抽取一个 mcap 时 worker 内存如何增长, 定位 build_sample_idx 的 OOM。
+Watch how worker memory grows while MCAPSampleExtractor extracts one mcap, locating build_sample_idx's OOM.
 
-后台线程每 _MONITOR_SEC 秒记录一次: 进程 RSS、当前 episode 已攒 sample 数、
-各视频 topic 当前最新一帧的 GOP 长度(len(locations))。RSS 超过 _RSS_LIMIT_GB 时直接退出。
+A background thread records every _MONITOR_SEC seconds: process RSS, the current episode's accumulated sample count,
+and the GOP length (len(locations)) of each video topic's latest frame. It exits directly when RSS exceeds _RSS_LIMIT_GB.
 
-用法::
+Usage::
     python test/test_mcap_sample_extractor_memory.py <mcap_url>
 """
 import os
@@ -21,16 +21,16 @@ from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
 logger = get_logger(__file__)
 
 _MONITOR_SEC = 10
-_RSS_LIMIT_GB = 30      # 超过即主动退出, 免得把机器打进 OOM
+_RSS_LIMIT_GB = 30      # Exceeding this exits proactively, so the machine never reaches OOM
 
 
 def _monitor_memory(extractor: MCAPSampleExtractor, video_topics: list, stop_event):
-    """周期记录 RSS / 当前 episode 的 sample 数 / 各视频 topic 的 GOP 长度"""
+    """Periodically record RSS / the current episode's sample count / each video topic's GOP length"""
     process = psutil.Process()
     start_time = time.time()
     while not stop_event.wait(_MONITOR_SEC):
         rss_gb = process.memory_info().rss / 1024 ** 3
-        # 只读引用, 不改 extractor 状态; 读到半更新的 dict 也只影响本行日志
+        # Read-only reference, extractor state untouched; reading a half-updated dict only affects this one log line
         gop_lens = {topic.split('/')[1]: len(extractor._cur_msg_record[topic][3])
                     for topic in video_topics if topic in extractor._cur_msg_record}
         logger.info("t=%4ds rss=%.2fGB episodes=%d cur_episode_samples=%d gop_lens=%s",
@@ -42,7 +42,7 @@ def _monitor_memory(extractor: MCAPSampleExtractor, video_topics: list, stop_eve
 
 
 def run(mcap_url: str):
-    """抽取整个 mcap, 并记录每个 episode 收尾时的 sample 数与 RSS"""
+    """Extract the whole mcap, recording each episode's sample count and RSS at its end"""
     assert mcap_url.endswith(".mcap"), f"不是 mcap: {mcap_url}"
     video_topics = [topic for topic, gop in load_mcap_video_topics_gop().items() if gop > 1]
     extractor = MCAPSampleExtractor(mcap_url)

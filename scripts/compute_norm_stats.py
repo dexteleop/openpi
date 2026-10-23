@@ -5,14 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
-from collections.abc import Sequence
-import glob
-import io
-import os
-import tarfile
 
 import numpy as np
-from torch.utils.data import IterableDataset as TorchIterableDataset
 import tqdm
 import tyro
 
@@ -112,7 +106,7 @@ def create_torch_dataloader(
         dataset = _create_torch_dataset_skip_video(data_config, action_horizon, model_config)
     else:
         # dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
-        dataset = _data_loader.create_lingyu_dataset_v2(data_config)
+        dataset = _data_loader.create_lingyu_dataset_v2(data_config, model_config)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -133,120 +127,6 @@ def create_torch_dataloader(
         local_batch_size=batch_size,
         num_workers=num_workers,
         shuffle=shuffle,
-        num_batches=num_batches,
-    )
-    return data_loader, num_batches
-
-
-class WDSStateActionDataset(TorchIterableDataset):
-    """Iterates the WDS .tar shards reading only .state_action.npz.
-
-    compute_norm_stats needs nothing but state / action, so this bypasses the
-    whole training WDS pipeline (video decode of one frame per camera per
-    sample). Reading the tars sequentially with tarfile is enough: no shuffling
-    is needed since RunningStats is order-independent, and every sample must be
-    visited exactly once anyway.
-
-    Yields the same dict layout as TeleavatarTarDataset -- nested
-    observation/images/state, with the leading length-1 frame axis still on
-    images and state -- so the config's repack group (which starts with
-    transforms.wds_v2_to_sample) applies unchanged. Images are dummies
-    (see _DUMMY_FRAME).
-    """
-
-    # (1, C, H, W) like a real decoded frame, so wds_v2_to_sample's [0] leaves a
-    # channel-first (3, 4, 4) that _parse_image recognises. 1:1 aspect so
-    # TeleavatarInputs._extract_stereo_view's `width >= 2*height` guard leaves it
-    # alone, and small so stacking it into a batch is cheap. Never read:
-    # RunningStats only touches state / actions.
-    _DUMMY_FRAME = np.zeros((1, 3, 4, 4), dtype=np.float32)
-
-    def __init__(self, dataset_dir: str, camera_keys: Sequence[str]):
-        self._tars = sorted(glob.glob(os.path.join(dataset_dir, "*.tar")))
-        if not self._tars:
-            raise FileNotFoundError(f"No .tar files found in {dataset_dir}")
-        self._camera_keys = list(camera_keys)
-        self._num_samples: int | None = None
-
-    def __iter__(self):
-        for tar_path in self._tars:
-            with tarfile.open(tar_path) as tf:
-                for member in tf:
-                    if not member.name.endswith(".state_action.npz"):
-                        continue
-                    npz = np.load(io.BytesIO(tf.extractfile(member).read()))
-                    yield {
-                        "observation": {
-                            "images": dict.fromkeys(self._camera_keys, self._DUMMY_FRAME),
-                            # Kept at (1, state_dim) as packed; wds_v2_to_sample
-                            # drops that axis, same as in training.
-                            "state": npz["state"].astype(np.float32),
-                        },
-                        "action": npz["action"].astype(np.float32),
-                    }
-
-    def __len__(self) -> int:
-        # Counting member names (no payload read) over all shards; ~3s for the
-        # 478-shard / 47760-sample set. Cached, since main() needs it before
-        # iterating to size the tqdm bar.
-        if self._num_samples is None:
-            total = 0
-            for tar_path in self._tars:
-                with tarfile.open(tar_path) as tf:
-                    total += sum(1 for m in tf if m.name.endswith(".state_action.npz"))
-            self._num_samples = total
-        return self._num_samples
-
-
-def create_wds_dataloader(
-    data_config: _config.DataConfig,
-    batch_size: int,
-    max_frames: int | None = None,
-) -> tuple[_data_loader.DataLoader, int]:
-    """Norm-stats loader for the Lingyu WDS .tar datasets.
-
-    Same transform chain as create_torch_dataloader (repack -> data_transforms
-    -> RemoveStrings), only the source dataset differs, so the resulting
-    norm_stats.json is identical in format to the LeRobot path.
-    """
-    assert data_config.wds_data_dir is not None, "wds_data_dir must be set for the WDS loader."
-
-    # The repack group's RepackTransform names every camera the policy transform
-    # will read; reuse that instead of hardcoding the camera set here, so a
-    # config that adds or drops a camera stays consistent with its dummy frames.
-    # Its VALUES are the source paths -- i.e. what this dataset has to supply --
-    # while the keys are the post-repack names.
-    prefix = "observation/images/"
-    camera_keys = [
-        src.removeprefix(prefix)
-        for tf in data_config.repack_transforms.inputs
-        if isinstance(tf, transforms.RepackTransform)
-        for src in transforms.flatten_dict(tf.structure).values()
-        if src.startswith(prefix)
-    ]
-    dataset = WDSStateActionDataset(data_config.wds_data_dir, camera_keys)
-    num_samples = len(dataset)
-
-    dataset = _data_loader.IterableTransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
-    )
-    if max_frames is not None and max_frames < num_samples:
-        num_batches = max_frames // batch_size
-    else:
-        num_batches = num_samples // batch_size
-
-    # num_workers=0: reading npz off local disk is not the bottleneck, and a
-    # single pass keeps every sample counted exactly once.
-    data_loader = _data_loader.WDSDataLoader(
-        dataset,
-        local_batch_size=batch_size,
-        num_workers=0,
         num_batches=num_batches,
     )
     return data_loader, num_batches
@@ -285,9 +165,7 @@ def main(config_name: str, max_frames: int | None = None, skip_video: bool = Fal
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    if data_config.wds_data_dir is not None:
-        data_loader, num_batches = create_wds_dataloader(data_config, config.batch_size, max_frames)
-    elif data_config.rlds_data_dir is not None:
+    if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )

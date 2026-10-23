@@ -1,6 +1,6 @@
-"""验证 fetch_mcap_bytes 的计时日志与 pool_stats 连接池监控:
-串行读取只建一条连接并持续复用; 并发读取的新建连接数不超过并发线程数,
-请求结束后连接全部回到池中空闲。计时日志写入同一个 .log 文件。
+"""Verify fetch_mcap_bytes's timing log and pool_stats connection-pool monitoring:
+serial reads build one connection and keep reusing it; concurrent reads build no more connections than threads,
+and after the requests all connections return to the pool idle. Timing logs go into this test's own .log file.
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -17,13 +17,13 @@ from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import (
 from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
 logger = get_logger(__file__)
 
-# 并发读取的线程数与请求数
+# Thread count and request count for concurrent reads
 CONCURRENT_WORKERS = 32
 CONCURRENT_REQUESTS = 128
 
 
 def _route_mcap_utils_log() -> None:
-    """把 _mcap_utils 的 DEBUG 计时日志导入本测试的 .log 文件"""
+    """Route _mcap_utils's DEBUG timing log into this test's .log file"""
     mcap_utils_logger = logging.getLogger(_mcap_utils.__name__)
     mcap_utils_logger.setLevel(logging.DEBUG)
     for handler in logger.handlers:
@@ -36,7 +36,7 @@ def test():
     mcap_url = next(iter(find_mcap_url_and_prompt_pairs()))
     logger.info(f"mcap_url: {mcap_url}")
 
-    # --- 串行: 读 magic + Summary, 只应新建 1 条连接, 其余请求全部复用 ---
+    # --- Serial: read magic + Summary; only 1 new connection expected, every other request reuses it ---
     magic = fetch_mcap_bytes(mcap_url, MAGIC_SIZE, 0)
     assert magic == b"\x89MCAP0\r\n", f"magic 不符: {magic!r}"
     fetch_SummaryRecords(mcap_url)
@@ -47,7 +47,7 @@ def test():
     assert serial_stats[0]["created"] == 1, "串行请求应只新建一条连接"
     assert serial_stats[0]["idle"] == 1 and serial_stats[0]["in_use"] == 0
 
-    # --- 并发: 新建连接数不超过线程数, 结束后连接全部空闲 ---
+    # --- Concurrent: new connections <= thread count, and all connections idle afterwards ---
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as pool:
         results = list(pool.map(lambda req_idx: fetch_mcap_bytes(mcap_url, 4096, req_idx * 4096),
                                 range(CONCURRENT_REQUESTS)))

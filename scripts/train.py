@@ -22,8 +22,8 @@ import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
-import openpi.training.config_lingyu as _config
-import openpi.training.data_loader_lingyu as _data_loader
+import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils

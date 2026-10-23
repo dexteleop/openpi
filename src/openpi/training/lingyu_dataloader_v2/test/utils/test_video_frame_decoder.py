@@ -1,11 +1,11 @@
 """
-用 MCAP_Player 播放 mcap, 三个视频 topic 各取 num_P = 0/5/10/15 的 message
-(num_P = len(locations) - 1, 即当前帧之前需要先解的 P 帧数),
-用 MCAP_Message_Fetcher 按 locations 取回 packets, 交给 cpu_decode_current_frame() 解码出当前帧,
-并把图像保存到本地 png。
+Play an mcap with MCAP_Player and take num_P = 0/5/10/15 messages from each of the three video topics
+(num_P = len(locations) - 1, the number of P frames to decode before the current frame),
+fetch the packets by locations with MCAP_Message_Fetcher, hand them to cpu_decode_current_frame() to decode the current frame,
+and save the images as local pngs.
 
-test_gpu: 同样的 packets 经 GPU 解码进程解码、裁单目(含旋转)、缩放, 与 CPU 解码 + openpi 原有的裁剪与缩放代码对照;
-按倒序再解一遍, 核对常驻解码器跨 GOP 复用(不 flush)时取到的仍是同一帧。
+test_gpu: the same packets go through the GPU decode process (decoding, mono-eye cropping with rotation, scaling) and are compared against CPU decoding + openpi's original crop and scale code;
+decoding again in reverse order verifies that the resident decoder reused across GOPs (no flush) still yields the same frame.
 """
 import itertools
 import os
@@ -16,7 +16,7 @@ from openpi_client import image_tools
 from PIL import Image
 
 from openpi.policies import teleavatar_v2_policy
-import openpi.training.config_lingyu as _config
+import openpi.training.config as _config
 
 from openpi.training.lingyu_dataloader_v2.utils.mcap_message_fetcher import MCAP_Message_Fetcher
 from openpi.training.lingyu_dataloader_v2.utils.mcap_player import MCAP_Player
@@ -31,16 +31,16 @@ from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
 
 logger = get_logger(__file__)
 
-_TESTED_P_COUNTS = (0, 5, 10, 15)  # 待测的 P 帧数: 0 为纯 IDR, 其余需回溯解码
+_TESTED_P_COUNTS = (0, 5, 10, 15)  # P-frame counts under test: 0 is pure IDR, the others require tracing back to decode
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "video_frame_decoder_output")
-# GPU 与 CPU+PIL 结果的平均绝对误差上限: 两种解码器的色度上采样与缩放滤波不同, 实测约 1.8
+# Upper bound on mean absolute error between GPU and CPU+PIL results: the two decoders differ in chroma upsampling and scaling filters, measured about 1.8
 _MAX_GPU_CPU_MAD = 3.0
-_CONFIG_NAME = "pi0_teleavatar_v2_lingyu"  # 裁剪/缩放参数取自这个训练配置
+_CONFIG_NAME = "pi0_teleavatar_v2_lingyu"  # Crop/scale parameters come from this training config
 
 
 def test():
-    """三个视频 topic 在 num_P = 0/5/10/15 下都能解出当前帧, 并保存成 png。"""
+    """All three video topics decode the current frame at num_P = 0/5/10/15 and save it as png."""
     path = next(iter(find_mcap_url_and_prompt_pairs()))
     video_topics = set(load_mcap_video_topics_gop())
     fetcher = MCAP_Message_Fetcher()
@@ -48,19 +48,19 @@ def test():
     logger.info("播放 %s, 视频 topic: %s, 待测 num_P: %s",
                 path, sorted(video_topics), _TESTED_P_COUNTS)
 
-    decoded_samples_idx = set()  # 已解码的 (topic_name, num_P)
+    decoded_samples_idx = set()  # Already-decoded (topic_name, num_P) pairs
     wanted_total = len(video_topics) * len(_TESTED_P_COUNTS)
     for message in MCAP_Player(path).play_messages():
         topic_name, msg_type, msg_def, log_time, locations = message
-        num_p = len(locations) - 1  # 首个 location 是 IDR, 其余都是 P 帧
+        num_p = len(locations) - 1  # The first location is the IDR, the rest are P frames
 
-        # 只取视频 topic 中尚未测过的 num_P
+        # Only take num_P values of the video topic not yet tested
         if (topic_name not in video_topics
             or num_p not in _TESTED_P_COUNTS
             or (topic_name, num_p) in decoded_samples_idx):
             continue
 
-        # 测试是否能够正常解出图片
+        # Check that an image can be decoded correctly
         frame = cpu_decode_current_frame(fetcher.fetch_message(msg_type, msg_def, locations))
         assert frame.ndim == 3 and frame.shape[2] == 3, f"{topic_name} 解码结果异常: {frame.shape}"
 
@@ -79,13 +79,13 @@ def test():
 
 
 def test_gpu():
-    """三个视频 topic 在 num_P = 0/5/10/15、旋转与否下, GPU 解出的当前帧与 openpi 的 CPU 处理一致。
+    """At num_P = 0/5/10/15, with and without rotation, the GPU-decoded current frame matches openpi's CPU processing for all three video topics.
 
-    裁剪/缩放参数与训练一样由 load_video_decode_config 从 openpi 配置里取; 对照组走 openpi 的原代码:
-    CPU 解码整帧 -> TeleavatarInputs._extract_stereo_view(先转 180° 再裁单目) -> ResizeImages 的 resize_with_pad,
-    GPU 结果同样经 resize_with_pad(只补黑边)后再比。
+    CPU-decode the whole frame -> TeleavatarInputs._extract_stereo_view (rotate 180° then crop the mono eye) -> ResizeImages's resize_with_pad,
+    and the GPU result is likewise put through resize_with_pad (only black-border padding) before comparing.
+    Crop/scale parameters come from the openpi config via load_video_decode_config, same as training; the control group runs openpi's original code:
     """
-    # 只要一个 mcap 路径, 用不到 prompt, 故跳过翻译(翻译要另配 LINGYU_* 环境变量)
+    # Only one mcap path is needed; the prompt is unused, so translation is skipped (translation needs extra LINGYU_* environment variables)
     with patch.object(search_mcap_on_s3, "translate_prompts", lambda prompts, max_workers: prompts):
         path = next(iter(find_mcap_url_and_prompt_pairs()))
     train_config = _config.get_config(_CONFIG_NAME)
@@ -106,7 +106,7 @@ def test_gpu():
     assert len(gop_packets) == len(video_topics) * len(_TESTED_P_COUNTS), f"未取全样本: {sorted(gop_packets)}"
 
     gpu_frames = {}
-    # 正序、倒序各解一遍: 解码器跨 GOP 常驻复用, 两遍结果必须逐像素相同; 旋转与否各用一套解码器
+    # Decode once forward and once in reverse: the decoder persists across GOPs, so both passes must match pixel-for-pixel; each rotation mode uses its own decoder set
     for sample_keys in (sorted(gop_packets), sorted(gop_packets, reverse=True)):
         for (topic_name, num_p), rotate in itertools.product(sample_keys, (False, True)):
             packets = gop_packets[(topic_name, num_p)]

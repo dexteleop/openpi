@@ -48,8 +48,6 @@ We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-GIT_LFS_SKIP_SMUDGE=1 uv pip install boto3 rosbags duckdb pyiceberg "pyiceberg[sql-sqlite]" openai
 ```
 
 NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.

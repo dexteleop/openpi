@@ -1,6 +1,6 @@
-"""用 fetch_SummaryRecords 定位 Summary Section, 再分别解析其中的
-Schema / Channel / ChunkIndex Record, 并用 ChunkIndex 读出一个 chunk 内的
-全部 MessageIdx, 打印解析结果。
+"""Locate the Summary Section via fetch_SummaryRecords, then parse the
+Schema / Channel / ChunkIndex Records within it, and use the ChunkIndex to read out all
+MessageIdx values inside each chunk and print the parsing results.
 """
 from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import (
     find_mcap_url_and_prompt_pairs
@@ -22,7 +22,7 @@ def test():
     mcap_url = next(iter(find_mcap_url_and_prompt_pairs()))
     logger.info(f"mcap_url: {mcap_url}")
 
-    # Summary Section 中各类 Record 的位置: opcode -> (start, length)
+    # Positions of each Record type in the Summary Section: opcode -> (start, length)
     summary_records_loca = fetch_SummaryRecords(mcap_url)
     logger.info(f"{ {f'0x{k.hex()}': v for k, v in summary_records_loca.items()} }")
 
@@ -42,10 +42,10 @@ def test():
         mcap_url, *summary_records_loca[bytes([OP_CHUNK_IDX])])
     logger.info(f"===== ChunkIndex x{len(chunks)} =====")
     for chunk in chunks[:3]:
-        # 只打印前三条
+        # Print only the first three entries
         logger.info(f"{chunk}")
 
-    # 第一个 chunk 内的全部 MessageIdx: channel_id -> [(log_time, offset), ...]
+    # All MessageIdx values in the first chunk: channel_id -> [(log_time, offset), ...]
     msg_idxes = parse_MessageIdx_from_ChunkIndexRecord(mcap_url, chunks[0])
     logger.info(f"===== ChunkIndex 0 MessageIdx x{len(msg_idxes)} channels, "
                 f"{sum(map(len, msg_idxes.values()))} messages =====")

@@ -1,23 +1,23 @@
-"""拆解 spawn 方式下一个 DataLoader worker 的启动耗时, 并验证 worker 为什么是一个接一个起来的。
+"""Break down one DataLoader worker's startup cost under spawn, and verify why workers start one after another.
 
-复现 torch DataLoader 起 worker 的方式: 在 for 循环里对每个 worker 调用
-spawn 上下文的 Process(target, args=(dataset, ...)).start()。子进程不取样, 只回报各阶段时间戳,
-不会向 OSS 发任何请求, 也不占 GPU。
+Reproduce how torch DataLoader starts workers: in a for loop call
+spawn-context Process(target, args=(dataset, ...)).start() per worker. Children do not sample, only report per-stage timestamps,
+sending no requests to OSS and using no GPU.
 
-核对::
-    1. 主模块(与 compute_norm_stats_lingyu.py 相同的 import)里各包的 import 耗时
-    2. dataset 的 pickle 体积, 以及 pickle / unpickle 耗时
-    3. 子进程各阶段: 解释器启动 -> 重新执行主模块的 import -> unpickle dataset -> 进入 target
-    4. 父进程 Process.start() 的阻塞时长: 参数很小时 vs 参数为真实 dataset 时
-    5. 改用 forkserver 后的 TorchDataLoader: worker 启动耗时, 且取出的 batch 与主进程直接取样完全一致
-       (只取 _SAMPLE_IDXS 这一个 batch, 约 2 x 360 次 S3 请求)
+Checks::
+    1. Import cost of each package in the main module (the same imports as compute_norm_stats_lingyu.py)
+    2. The dataset's pickle size, plus pickle / unpickle durations
+    3. Child stages: interpreter start -> re-import of the main module -> unpickle dataset -> enter target
+    4. How long Process.start() blocks the parent: tiny args vs args being the real dataset
+    5. TorchDataLoader switched to forkserver: worker startup cost, and fetched batches exactly matching main-process sampling
+       (fetching only the single _SAMPLE_IDXS batch, about 2 x 360 S3 requests)
 
-必须以脚本方式运行, 子进程才会像 compute_norm_stats_lingyu.py 那样把本文件当 __mp_main__ 重新执行::
+Must run as a script so children re-execute this file as __mp_main__ just like compute_norm_stats_lingyu.py::
     python src/openpi/training/lingyu_dataloader_v2/test/test_spawn_worker_startup.py
 """
 import time
 
-# 子进程重新执行本文件时, 这两个时间戳界定了"重新 import 主模块"这一段
+# When a child re-executes this file, these two timestamps bound the "re-import the main module" span
 MODULE_IMPORT_START = time.time()
 
 import collections
@@ -31,11 +31,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # 不碰正在跑的任务所用的 GPU
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # Do not touch GPUs used by running jobs
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[5] / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
-import compute_norm_stats_lingyu as norm_script  # noqa: E402  与被测脚本完全相同的一组顶层 import
+import compute_norm_stats_lingyu as norm_script  # noqa: E402  exactly the same top-level imports as the script under test
 
 import jax  # noqa: E402
 import numpy as np  # noqa: E402
@@ -44,18 +44,18 @@ from openpi.training.lingyu_dataloader_v2.test.logger import get_logger  # noqa:
 
 MODULE_IMPORT_END = time.time()
 
-# 子进程里本文件名为 __mp_main__, 不能再建 FileHandler(mode="w"), 否则会清空父进程的日志
+# In children this file is named __mp_main__; do not create a FileHandler(mode="w") again, or the parent's log would be truncated
 logger = get_logger(__file__) if __name__ == "__main__" else logging.getLogger(__name__)
 
 _CONFIG_NAME = "pi0_teleavatar_v2_lingyu"
-_NUM_WORKERS = 4      # 每种参数起几个 worker, 足以看出串行规律
-_TOP_PACKAGES = 15    # import 耗时榜单展示的包数
-_LOADER_WORKERS = 8   # TorchDataLoader 验证用的 worker 数, spawn 下约需 8 x 5.3s
-_SAMPLE_IDXS = [0, 1]  # TorchDataLoader 只取这一个 batch, 用作 sampler
+_NUM_WORKERS = 4      # Workers started per parameter set, enough to expose the serial pattern
+_TOP_PACKAGES = 15    # How many packages to show in the import-time ranking
+_LOADER_WORKERS = 8   # Worker count for the TorchDataLoader check; under spawn about 8 x 5.3s
+_SAMPLE_IDXS = [0, 1]  # The single batch TorchDataLoader fetches, used as the sampler
 
 
 def build_norm_dataset(config_name: str):
-    """与 compute_norm_stats_lingyu.create_torch_dataloader 相同地构造 dataset(不建 DataLoader)。"""
+    """Build the dataset exactly like compute_norm_stats_lingyu.create_torch_dataloader (no DataLoader built)."""
     config = norm_script._config.get_config(config_name)
     data_config = dataclasses.replace(config.data, compute_norm_stats=True).create(config.assets_dirs, config.model)
     dataset = norm_script.LingyuDatasetV2(data_config.iceberg_dir, load_images=False)
@@ -66,7 +66,7 @@ def build_norm_dataset(config_name: str):
 
 
 def measure_import_breakdown() -> float:
-    """在新解释器里 -X importtime 导入被测脚本, 按顶层包汇总 self 耗时并记日志, 返回墙钟耗时。"""
+    """Import the script under test with -X importtime in a fresh interpreter, aggregate self time by top-level package into the log, and return wall-clock time."""
     import_cmd = [sys.executable, "-X", "importtime", "-c",
                   f"import sys; sys.path.insert(0, {str(_SCRIPTS_DIR)!r}); import compute_norm_stats_lingyu"]
     start_time = time.perf_counter()
@@ -88,14 +88,14 @@ def measure_import_breakdown() -> float:
 
 
 def read_process_start_time() -> float:
-    """从 /proc 读本进程被内核创建的绝对时间(10ms 精度), 用于计算解释器启动段。"""
+    """Read this process's absolute creation time by the kernel from /proc (10ms resolution), for the interpreter-start segment."""
     boot_time = next(int(line.split()[1]) for line in open("/proc/stat") if line.startswith("btime"))
     start_ticks = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19])
     return boot_time + start_ticks / os.sysconf("SC_CLK_TCK")
 
 
 def report_worker_timeline(payload, result_queue) -> None:
-    """spawn 子进程的 target: 拿到 payload 即说明 unpickle 已完成, 回报各阶段时间戳后退出。"""
+    """spawn child's target: reaching here means unpickle finished; report per-stage timestamps and exit."""
     main_module = sys.modules["__mp_main__"]
     result_queue.put({
         "pid": os.getpid(),
@@ -108,7 +108,7 @@ def report_worker_timeline(payload, result_queue) -> None:
 
 
 def spawn_workers(payload, num_workers: int, label: str) -> None:
-    """像 torch DataLoader 一样逐个 start() worker, 记录父进程每次 start() 的阻塞时长与子进程时间线。"""
+    """start() workers one by one like torch DataLoader, recording each start()'s parent blocking time and child timelines."""
     assert num_workers > 0, "num_workers 必须为正"
     spawn_context = multiprocessing.get_context("spawn")
     result_queue = spawn_context.Queue()
@@ -135,7 +135,7 @@ def spawn_workers(payload, num_workers: int, label: str) -> None:
 
 
 def check_forkserver_loader(dataset) -> None:
-    """用 data_loader_lingyu.TorchDataLoader(forkserver) 取一个 batch, 记录 worker 启动耗时并与主进程取样逐元素比对。"""
+    """Fetch one batch with data_loader_lingyu.TorchDataLoader (forkserver), record worker startup cost, and compare element-wise with main-process sampling."""
     data_loader = norm_script._data_loader.TorchDataLoader(
         dataset, local_batch_size=len(_SAMPLE_IDXS), sampler=_SAMPLE_IDXS,
         num_batches=1, num_workers=_LOADER_WORKERS, framework="pytorch")
@@ -143,7 +143,7 @@ def check_forkserver_loader(dataset) -> None:
     assert torch_loader.multiprocessing_context.get_start_method() == "forkserver", "TorchDataLoader 未使用 forkserver"
 
     start_time = time.perf_counter()
-    torch_iter = iter(torch_loader)  # 返回时全部 worker 已 start()
+    torch_iter = iter(torch_loader)  # When this returns, all workers have started
     startup_seconds = time.perf_counter() - start_time
     start_time = time.perf_counter()
     loader_batch = next(torch_iter)
@@ -161,7 +161,7 @@ def check_forkserver_loader(dataset) -> None:
 
 
 def test():
-    """依次拆解 import 耗时、dataset 序列化开销, 再对比两种参数下 worker 的启动方式。"""
+    """Break down import time and dataset serialization cost, then compare worker startup under the two parameter sets."""
     measure_import_breakdown()
 
     dataset = build_norm_dataset(_CONFIG_NAME)
@@ -169,7 +169,7 @@ def test():
     dataset_bytes = pickle.dumps(dataset)
     dump_seconds = time.perf_counter() - start_time
     start_time = time.perf_counter()
-    pickle.loads(dataset_bytes)  # 字节是本进程刚 dumps 出来的, 来源可信
+    pickle.loads(dataset_bytes)  # The bytes were just dumped in this process, so the source is trusted
     load_seconds = time.perf_counter() - start_time
     logger.info(f"[pickle] dataset: {len(dataset)} samples / {len(dataset._dataset.episodes)} episodes, "
                 f"pickle {len(dataset_bytes) / 1024:.0f} KiB, dumps {dump_seconds * 1000:.0f}ms, "

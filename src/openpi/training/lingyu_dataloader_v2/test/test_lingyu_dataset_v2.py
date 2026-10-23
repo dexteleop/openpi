@@ -1,18 +1,18 @@
-"""核对 LingyuDatasetV2 的 len 与取样结果, 并与全局索引交叉验证。
+"""Verify LingyuDatasetV2's len and sampling results, cross-checked against the global index.
 
-本测试只读, 故须先跑完采集与编号(数据已采集时只需 --index-only 重建索引)::
+This test is read-only, so collection and numbering must have finished first (when data is already collected, just rebuild the index with --index-only)::
     python -m openpi.training.lingyu_dataloader_v2.build_sample_idx [--index-only]
 
-核对::
-    1. len(dataset) == episode_index.parquet 里 num_samples 之和
-    2. locate_sample 与 DuckDB 直接反查的 (prompt, episode_id, sample_idx) 完全一致
-    3. 随机 5 个样本都能取出, 且为不带前导帧维度的单帧结构:
-       images 为 (H, W, 3) uint8, state 为 (state_dim,), action 为 (chunk, action_dim)
-    4. state/action 的维度 == 各自拼接配置里字段长度之和, 即拼接顺序真的被用上了
-    5. 同一 episode 内相邻的两个样本各不相同(取到的不是同一帧/同一条 message)
-每个随机样本存到 lingyu_dataset_v2_output/sample_<全局编号>/: 各 camera 存为 png, state/action 存为 json
-取样耗时拆为三段: 按 (data_file, row_group) 读 sample 的 locations 索引 /
-多线程并行从 S3 读 mcap 原始字节并反序列化(整段墙钟时间) / 视频解码+取字段+拼接成样本
+Checks::
+    1. len(dataset) == the sum of num_samples in episode_index.parquet
+    2. locate_sample agrees exactly with a direct DuckDB lookup of (prompt, episode_id, sample_idx)
+    3. 5 random samples can all be fetched and are single-frame structures without a leading frame dimension:
+       images are (H, W, 3) uint8, state is (state_dim,), action is (chunk, action_dim)
+    4. state/action dims == the sum of field lengths in their concat configs, i.e. the concat order is really used
+    5. Two adjacent samples within one episode differ (what was fetched is not the same frame/message)
+Each random sample is saved to lingyu_dataset_v2_output/sample_<global number>/: each camera as png, state/action as one json
+Sampling time splits into three parts: reading the sample's locations index by (data_file, row_group) /
+reading raw mcap bytes from S3 in parallel threads and deserializing (whole wall-clock span) / video decoding + field extraction + assembling into a sample
 """
 import gc
 import json
@@ -32,7 +32,7 @@ import pytest
 import torch
 from PIL import Image
 
-import openpi.training.config_lingyu as _config
+import openpi.training.config as _config
 from openpi.training.lingyu_dataloader_v2 import lingyu_dataset_v2
 from openpi.training.lingyu_dataloader_v2.build_sample_idx import GLOBAL_INDEX_NAME, WAREHOUSE_DIR
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import (
@@ -45,45 +45,45 @@ from openpi.training.lingyu_dataloader_v2.utils import _mcap_utils, mcap_message
 
 logger = get_logger(__file__)
 
-_NUM_RANDOM_SAMPLES = 5  # 随机抽查的样本数
-_NUM_MEMORY_SAMPLES = 3  # test_span_fetch_memory 统计内存的样本数(另加 1 个预热样本); 深调用栈快照很慢, 每个样本约 7 分钟
-_TRACE_FRAMES = 64  # tracemalloc 每个内存块记录的调用栈深度
+_NUM_RANDOM_SAMPLES = 5  # Number of samples randomly spot-checked
+_NUM_MEMORY_SAMPLES = 3  # Samples whose memory test_span_fetch_memory measures (plus 1 warm-up sample); deep call-stack snapshots are slow, about 7 minutes per sample
+_TRACE_FRAMES = 64  # Call-stack depth tracemalloc records per memory block
 _OUTPUT_DIR = Path(__file__).resolve().parent / "lingyu_dataset_v2_output"
-_CONFIG_NAME = "pi0_teleavatar_v2_lingyu"  # GPU 裁剪/缩放参数取自这个训练配置
+_CONFIG_NAME = "pi0_teleavatar_v2_lingyu"  # GPU crop/scale parameters come from this training config
 
-# 被计时包装的原函数; 取样期间替换成下方 _timed_* 版本, 耗时累加进 _elapsed_seconds
+# The original functions wrapped by the timing wrappers; swapped for the _timed_* versions below during sampling, accumulating into _elapsed_seconds
 _ORIGINAL_FETCH_SAMPLE_MESSAGES = lingyu_dataset_v2.fetch_sample_messages
 _ORIGINAL_LOAD_SAMPLE_TOPICS = lingyu_dataset_v2.load_sample_topics
 _elapsed_seconds = {"s3": 0.0, "index": 0.0}
-# 被计数包装的原函数; test_span_fetch 期间替换成 _counted_fetch_mcap_bytes, 累计进 _fetch_stats
+# The original functions wrapped by the counting wrappers; swapped for _counted_fetch_mcap_bytes during test_span_fetch, accumulating into _fetch_stats
 _ORIGINAL_FETCH_MCAP_BYTES = _mcap_utils.fetch_mcap_bytes
 _fetch_stats = {"requests": 0, "bytes": 0}
 _fetch_stats_lock = threading.Lock()
 
 
 def test():
-    """随机取 5 个样本, 核对编号反查与输出结构, 并把样本落盘。"""
+    """Randomly fetch 5 samples, verify number lookup and output structure, and save the samples to disk."""
     index_path = Path(WAREHOUSE_DIR, GLOBAL_INDEX_NAME)
     if not index_path.exists():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
-    # 与训练一样, GPU 裁剪/缩放参数取自 openpi 训练配置
+    # Like training, GPU crop/scale parameters come from the openpi training config
     train_config = _config.get_config(_CONFIG_NAME)
     video_key_to_crop, image_resolution = load_video_decode_config(
         train_config.data.create(train_config.assets_dirs, train_config.model))
     dataset = LingyuDatasetV2(video_key_to_crop=video_key_to_crop, image_resolution=image_resolution)
     logger.info(f"len(dataset) = {len(dataset)}, {len(dataset.episodes)} 个 episode")
 
-    # --- 1. 总数与索引一致 ---
+    # --- 1. Total count matches the index ---
     total_samples = duckdb.sql(f"SELECT sum(num_samples) FROM '{index_path}'").fetchone()[0]
     assert len(dataset) == total_samples, "len(dataset) 与全局索引的 sample 总数不符"
 
-    # 清空上一次运行的输出, 目录里只留本次随机抽到的样本
+    # Clear the previous run's output so the directory holds only this run's random samples
     shutil.rmtree(_OUTPUT_DIR, ignore_errors=True)
     random_samples_idx = sorted(random.sample(range(len(dataset)), _NUM_RANDOM_SAMPLES))
     logger.info(f"随机抽取的全局 sample 编号: {random_samples_idx}")
     for global_sample_idx in random_samples_idx:
-        # --- 2. 反查结果与 DuckDB 一致 ---
+        # --- 2. Lookups agree with DuckDB ---
         located = duckdb.sql(
             f"SELECT prompt, episode_id, {global_sample_idx} - sample_offset AS sample_idx "
             f"FROM '{index_path}' "
@@ -93,14 +93,14 @@ def test():
         assert dataset.locate_sample(global_sample_idx) == located[0], \
             f"locate_sample({global_sample_idx}) 与 DuckDB 反查不一致"
 
-        # --- 3. 取样, 核对结构 ---
+        # --- 3. Sample and verify structure ---
         _elapsed_seconds.update(s3=0.0, index=0.0)
         start_time = time.perf_counter()
         with (patch.object(lingyu_dataset_v2, "fetch_sample_messages", _timed_fetch_sample_messages),
               patch.object(lingyu_dataset_v2, "load_sample_topics", _timed_load_sample_topics)):
             sample = dataset[global_sample_idx]
         elapsed = time.perf_counter() - start_time
-        # 总耗时扣掉读索引与读 S3, 余下即由原始字节转换为样本的耗时
+        # Total time minus index reading and S3 reading leaves the cost of turning raw bytes into samples
         convert_elapsed = elapsed - _elapsed_seconds["index"] - _elapsed_seconds["s3"]
 
         images = sample["observation"]["images"]
@@ -115,11 +115,11 @@ def test():
         assert action.shape[0] == load_action_chunk_length(), \
             f"action 步数与 ACTION_CHUNK_LENGTH 不符: {tuple(action.shape)}"
 
-        # --- 4. 维度 == 拼接配置里各字段长度之和 ---
+        # --- 4. Dims == the sum of each concat config's field lengths ---
         for vector_name, vector, concat_config in (
             ("state", state, dataset.state_concat),("action", action, dataset.action_concat),):
             assert vector.shape[-1] == sum(
-                # 拼接的每一项就是该 topic 那个字段的长度, 逐项相加即向量总宽
+                # Each concat entry is that topic field's length; summing them gives the vector's total width
                 len(part) for part in _concat_parts(dataset, global_sample_idx, concat_config)), \
                 f"{vector_name} 维度与拼接配置不符: {tuple(vector.shape)}"
 
@@ -130,7 +130,7 @@ def test():
                     f"+ S3 读原始数据 {_elapsed_seconds['s3']:.3f}s + 转换为样本 {convert_elapsed:.3f}s")
         _save_sample(sample, global_sample_idx, located[0])
 
-    # --- 5. 同一 episode 内相邻样本内容不同 ---
+    # --- 5. Adjacent samples within one episode differ in content ---
     prompt, episode_id, sample_idx = dataset.locate_sample(0)
     assert dataset.locate_sample(1)[:2] == (prompt, episode_id), "前两个样本不在同一 episode, 无法比较"
     assert not torch.equal(dataset[0]["observation"]["state"], dataset[1]["observation"]["state"]), \
@@ -138,12 +138,12 @@ def test():
 
 
 def test_span_fetch():
-    """按 chunk 合并读取与逐条读取得到的 message 逐字节一致, 并统计两种方式的 S3 请求次数与下载量。"""
+    """Messages fetched merged-by-chunk vs one-by-one are byte-identical; count both ways' S3 requests and downloaded bytes."""
     index_path = Path(WAREHOUSE_DIR, GLOBAL_INDEX_NAME)
     if not index_path.exists():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
-    dataset = LingyuDatasetV2(load_images=False)  # 只用它反查 sample 的物理位置, 不读图像
+    dataset = LingyuDatasetV2(load_images=False)  # Used only to look up samples' physical locations, no images read
     used_topic_names = set(load_mcap_video_topics_gop()) | set(load_mcap_state_and_action_topics_fields())
     request_totals = {"span": [0, 0], "single": [0, 0]}
     for global_sample_idx in sorted(random.sample(range(len(dataset)), _NUM_RANDOM_SAMPLES)):
@@ -158,7 +158,7 @@ def test_span_fetch():
             span_messages = lingyu_dataset_v2.fetch_sample_messages(used_topics, pool)
         span_stats = (_fetch_stats["requests"], _fetch_stats["bytes"])
 
-        # 对照组: 改动前的逐条读取, 每个 location 单独 fetch_message
+        # Control group: the pre-change per-message read, one fetch_message per location
         _fetch_stats.update(requests=0, bytes=0)
         with _count_fetch_bytes():
             single_messages = {topic: [lingyu_dataset_v2.fetcher.fetch_message(
@@ -166,7 +166,7 @@ def test_span_fetch():
                 for location in message["locations"]] for topic, message in used_topics.items()}
         single_stats = (_fetch_stats["requests"], _fetch_stats["bytes"])
 
-        # 重新序列化成 CDR 逐字节比对, 字节相同即 message 内容完全相同
+        # Re-serialize to CDR and compare byte by byte; identical bytes mean identical message content
         typestore = lingyu_dataset_v2.fetcher._typestore
         assert span_messages.keys() == single_messages.keys(), "两种读取方式的 topic 集合不同"
         for topic, message in used_topics.items():
@@ -190,19 +190,19 @@ def test_span_fetch():
 
 
 def test_span_fetch_memory():
-    """合并读取的整段字节在 fetch_sample_messages 返回后即被释放, 返回结果只持有各条 message 自己的 CDR 副本。
+    """The merged-read whole-segment bytes are released once fetch_sample_messages returns; the result holds only each message's own CDR copy.
 
-    用 tracemalloc 统计每个样本的 Python 内存: 峰值(读取期间)/返回后仍被结果持有/结果释放后的残留,
-    并与该样本的 S3 下载字节对照。tracemalloc 自身会大量占内存, 故不看 RSS。
+    and compare against the sample's S3 download bytes. tracemalloc itself uses a lot of memory, so RSS is not looked at.
+    Use tracemalloc to measure per-sample Python memory: peak (during reads) / still held by the result after return / residual after the result is released,
     """
     index_path = Path(WAREHOUSE_DIR, GLOBAL_INDEX_NAME)
     if not index_path.exists():
         pytest.skip(f"没有 {index_path}, 请先运行 build_sample_idx.py")
 
-    dataset = LingyuDatasetV2(load_images=False)  # 只用它反查 sample 的物理位置, 不读图像
+    dataset = LingyuDatasetV2(load_images=False)  # Used only to look up samples' physical locations, no images read
     state_and_action_topics = set(load_mcap_state_and_action_topics_fields())
     sample_idxs = random.sample(range(len(dataset)), _NUM_MEMORY_SAMPLES + 1)
-    tracemalloc.start(_TRACE_FRAMES)  # 记录足够深的调用栈, 才能认出经由 fetch_mcap_bytes 分配的内存块
+    tracemalloc.start(_TRACE_FRAMES)  # Record deep enough call stacks to recognize blocks allocated via fetch_mcap_bytes
     for sample_order, global_sample_idx in enumerate(sample_idxs):
         episode = dataset.locate_episode(global_sample_idx)
         sample_topics = load_sample_topics(
@@ -223,10 +223,10 @@ def test_span_fetch_memory():
         gc.collect()
         traced_released = tracemalloc.get_traced_memory()[0]
         if sample_order == 0:
-            continue  # 首个样本含 S3 client 创建、typestore 注册等一次性开销, 不计入
+            continue  # The first sample includes one-time costs of S3 client creation, typestore registration etc., not counted
 
         downloaded = _fetch_stats["bytes"]
-        # 结果仍在时, 本次取样新增且调用栈经过 _mcap_utils(即 fetch_mcap_bytes 下载)的存活内存块 = 未释放的整段字节
+        # While the result is alive, the surviving blocks newly allocated during this sample whose stack passes through _mcap_utils (i.e. fetched by fetch_mcap_bytes) = the unreleased whole-segment bytes
         download_filter = [tracemalloc.Filter(True, _mcap_utils.__file__, all_frames=True)]
         span_alive = sum(stat.size_diff for stat in result_snapshot.filter_traces(download_filter).compare_to(
             before_snapshot.filter_traces(download_filter), "filename"))
@@ -240,14 +240,14 @@ def test_span_fetch_memory():
 
 @contextmanager
 def _count_fetch_bytes():
-    """把 mcap_message_fetcher 与 _mcap_utils 里的 fetch_mcap_bytes 换成计数版, 累计请求次数与下载字节。"""
+    """Swap fetch_mcap_bytes in mcap_message_fetcher and _mcap_utils for counting versions, accumulating request counts and downloaded bytes."""
     with (patch.object(mcap_message_fetcher, "fetch_mcap_bytes", _counted_fetch_mcap_bytes),
           patch.object(_mcap_utils, "fetch_mcap_bytes", _counted_fetch_mcap_bytes)):
         yield
 
 
 def _counted_fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
-    """计数版 fetch_mcap_bytes: 多线程并发调用, 计数在锁内累加。"""
+    """Counting fetch_mcap_bytes: called concurrently from threads; counters accumulate under a lock."""
     data_bytes = _ORIGINAL_FETCH_MCAP_BYTES(mcap_url, length, offset)
     with _fetch_stats_lock:
         _fetch_stats["requests"] += 1
@@ -256,7 +256,7 @@ def _counted_fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
 
 
 def _timed_fetch_sample_messages(sample_topics: dict, thread_pool) -> dict:
-    """计时版 fetch_sample_messages: 一个 sample 全部 location 并行读 S3 的整段墙钟时间。"""
+    """Timed fetch_sample_messages: the whole wall-clock span of reading one sample's all locations from S3 in parallel."""
     start_time = time.perf_counter()
     topic_messages = _ORIGINAL_FETCH_SAMPLE_MESSAGES(sample_topics, thread_pool)
     _elapsed_seconds["s3"] += time.perf_counter() - start_time
@@ -264,7 +264,7 @@ def _timed_fetch_sample_messages(sample_topics: dict, thread_pool) -> dict:
 
 
 def _timed_load_sample_topics(data_file: str, row_group: int, sample_idx: int) -> dict[str, dict]:
-    """计时版 load_sample_topics: 按 (data_file, row_group) 读该 sample 的 locations 索引。"""
+    """Timed load_sample_topics: reading that sample's locations index by (data_file, row_group)."""
     start_time = time.perf_counter()
     sample_topics = _ORIGINAL_LOAD_SAMPLE_TOPICS(data_file, row_group, sample_idx)
     _elapsed_seconds["index"] += time.perf_counter() - start_time
@@ -272,11 +272,11 @@ def _timed_load_sample_topics(data_file: str, row_group: int, sample_idx: int) -
 
 
 def _save_sample(sample: dict, global_sample_idx: int, located: tuple):
-    """把一个样本存到 sample_<全局编号>/ 下: 每个 camera 一张 png, state/action 合存一个 json。"""
+    """Save one sample under sample_<global number>/: one png per camera, state/action together in one json."""
     sample_dir = _OUTPUT_DIR / f"sample_{global_sample_idx}"
     sample_dir.mkdir(parents=True, exist_ok=True)
     for camera_key, frame in sample["observation"]["images"].items():
-        Image.fromarray(frame).save(sample_dir / f"{camera_key}.png")  # 已是 (H, W, 3) uint8
+        Image.fromarray(frame).save(sample_dir / f"{camera_key}.png")  # Already (H, W, 3) uint8
 
     prompt, episode_id, sample_idx = located
     json_path = sample_dir / "state_action.json"
@@ -288,11 +288,11 @@ def _save_sample(sample: dict, global_sample_idx: int, located: tuple):
 
 
 def _concat_parts(dataset, global_sample_idx, concat_config):
-    """取出该样本在拼接配置里每一项对应的一维数组, 供核对维度用。"""
+    """Extract the 1-D array for each entry of the sample's concat configs, for dimension checks."""
     episode = dataset.locate_episode(global_sample_idx)
     sample_topics = load_sample_topics(
         episode["data_file"], episode["row_group"], global_sample_idx - episode["sample_offset"])
-    # 只挑拼接用到的 topic, 免得为核对维度把三路视频再解一遍
+    # Pick only topics used by concat, so verifying dims does not decode the three video streams again
     topic_data = filter_sample_messages(
         {topic: sample_topics[topic] for topic, _ in concat_config})
     return [topic_data[topic][0][field_name] for topic, field_name in concat_config]

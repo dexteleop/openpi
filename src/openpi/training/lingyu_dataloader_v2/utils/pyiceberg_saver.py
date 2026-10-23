@@ -1,45 +1,45 @@
-# Copyright (c) 2026 Dexteleop Intelligence (灵御智能)
+# Copyright (c) 2026 Dexteleop Intelligence (Lingyu Intelligence)
 # Licensed under the MIT License.
 # See LICENSE file in the project root for full license information.
 
-"""把 MCAPSampleExtractor 产出的一批 episode 写成一个 Iceberg snapshot。
+"""Write a batch of episodes produced by MCAPSampleExtractor as one Iceberg snapshot.
 
-保存链路, 两阶段, 跨进程::
-    worker 进程  EpisodeParquetWriter.write(): 一个 episode -> 一行 -> 一个 row group
-                                               攒够 roll_episodes 行就关文件, 交出路径
-    主进程      IcebergEpisodeSaver.extend(): table.add_files(路径) -> 一次 snapshot
+Save pipeline, two stages, across processes::
+    worker process  EpisodeParquetWriter.write(): one episode -> one row -> one row group
+                                               close the file once roll_episodes rows accumulate and hand over the path
+    main process    IcebergEpisodeSaver.extend(): table.add_files(path) -> one snapshot
 
-之所以拆成两阶段: Arrow 转换占了整个保存开销的 95% 且是持 GIL 的纯 Python, 多线程实测
-零加速(1.00x), 只有放进 worker 进程才真并行; add_files 只登记文件不重写数据, 主进程一次
-调用仅 0.12 s。队列里因此只需要传文件路径, 不必把 episode 数据 pickle 回主进程。
-之所以逐个 episode 增量写而不是攒一批再写: worker 的内存占用就此与文件行数无关, 恒等于
-一个 episode(实测 RSS 平稳在 +0.11 GB), 于是文件想攒多大都行, commit 次数可以压得很低。
+Why two stages: Arrow conversion is 95% of the save cost and pure Python holding the GIL -- measured
+multithreading speedup was zero (1.00x); only worker processes truly parallelize. add_files only registers files
+without rewriting data, so one main-process call takes just 0.12 s. Queues therefore only carry file paths,
+Why episodes are written incrementally rather than batched: the worker's memory thus becomes independent of file
+row count, staying constant at one episode (measured RSS steady at +0.11 GB); files can grow as large as desired and the commit count kept very low.
 
-一行就是一个 episode::
-    episode_id          string  = "{source_id}:{source_episode_seq:08d}", 全局稳定唯一, 供重试去重
-    source_id           string  = mcap 文件名(去后缀)
-    source_episode_seq  int64   = 该 mcap 内的 X/Y 对序号
-    num_samples         int64   = len(samples), 冗余存一列, 使最终编号阶段不必读 samples 这根巨大的列
+One row is one episode::
+    episode_id          string  = "{source_id}:{source_episode_seq:08d}", globally stable and unique, for retry deduplication
+    source_id           string  = mcap file name (without extension)
+    source_episode_seq  int64   = the X/Y pair sequence number within that mcap
+    num_samples         int64   = len(samples), stored redundantly so the final numbering stage need not read the huge samples column
     samples             LIST<STRUCT<topic: STRUCT<msg_type, msg_def, log_time, locations>>>
 
-episode_offset 不存进这张原始表: 它属于 finalize 阶段, 由 build_sample_idx.py 用 DuckDB
-在最终 snapshot 上按 (source_id, source_episode_seq) 排序生成。
+    num_samples         int64   = len(samples), stored redundantly so the final numbering stage need not read the huge samples column
+on the final snapshot, ordered by (source_id, source_episode_seq).
 
-数据按 "机器人/任务" 两级切分: catalog 名即当前机器人(mcap_config 里选定的 ROBOT),
-namespace 名由该 mcap 的 prompt(任务)派生, 故一台机器人的多个任务各占一个 namespace。
-不合成一张大表是因为 samples 的 STRUCT schema 由机器人的 topic 集合决定, 混表会逼出并集
-schema; 而跨任务的全局编号只依赖元数据列, 由 build_sample_idx.py 在索引阶段统一完成。
+Data is split by "robot/task": the catalog name is the current robot (ROBOT selected in mcap_config),
+and the namespace name derives from the mcap's prompt (task), so one robot's tasks each get a namespace.
+Not merging into one big table: samples' STRUCT schema depends on the robot's topic set, and mixing tables would force a union
+schema; cross-task global numbering depends only on metadata columns and is done uniformly by build_sample_idx.py at index time.
 
-用法::
+Usage::
     table = load_episodes_table(warehouse_dir, topic_names, prompt)
-    # worker 进程里
+    # in a worker process
     writer = EpisodeParquetWriter(table, topic_names, roll_episodes)
-    closed = writer.write(EpisodeRecord(...))   # 写满一个文件时返回 (路径, episode 数)
-    closed = writer.close()                     # 收尾, 交出最后那个不满的文件
-    # 主进程里
+    closed = writer.write(EpisodeRecord(...))   # Returns (path, episode count) when a file fills up
+    closed = writer.close()                     # Wrap up, hand over the last not-yet-full file
+    # in the main process
     IcebergEpisodeSaver(table).extend([path], num_episodes)
 
-一个 parquet 攒多少个 episode 由调用方决定, 见 build_sample_idx.EPISODES_PER_PARQUET。
+How many episodes one parquet accumulates is the caller's decision; see build_sample_idx.EPISODES_PER_PARQUET.
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ from openpi.training.lingyu_dataloader_v2.mcap_config.config import ROBOT
 # Constants
 EPISODES_TABLE_NAME = "episodes"
 
-# 一条 message 的定位主键, 字段名与 MCAP_Player 产出的 location 四元组逐位对应
+# A message's locating primary key; field names map one to one to MCAP_Player's location quadruple
 LOCATION_TYPE = pa.struct([
     pa.field("mcap_url", pa.string(), nullable=False),
     pa.field("chunk_file_offset", pa.int64(), nullable=False),
@@ -67,7 +67,7 @@ LOCATION_TYPE = pa.struct([
     pa.field("record_length", pa.int64(), nullable=False),
 ])
 
-# 一个 topic 在某个 sample 上选中的 message; locations 条数随角色而异(obs 一段 GOP, action 一个 chunk)
+# The messages a topic selects on one sample; the location count varies by role (obs one GOP, action one chunk)
 TOPIC_MESSAGE_TYPE = pa.struct([
     pa.field("msg_type", pa.string(), nullable=False),
     pa.field("msg_def", pa.string(), nullable=False),
@@ -78,7 +78,7 @@ TOPIC_MESSAGE_TYPE = pa.struct([
 
 def build_episodes_schema(topic_names: Sequence[str]) -> pa.Schema:
     """Build the Iceberg/Arrow schema of one episode row for the given topics."""
-    # 一个 sample 是固定 topic 集合的 STRUCT; 某 topic 在某 sample 缺失时写 None, 故 nullable
+    # A sample is a STRUCT with a fixed topic set; a missing topic is written as None, hence nullable
     sample_type = pa.struct([
         pa.field(topic_name, TOPIC_MESSAGE_TYPE, nullable=True)
         for topic_name in topic_names
@@ -99,10 +99,10 @@ def prompt_to_namespace(prompt: str) -> str:
 
 def load_episodes_catalog(warehouse_dir: str) -> Catalog:
     """Open (creating the warehouse dir on first use) the current robot's sqlite-backed catalog."""
-    # catalog 由本函数而非 saver 负责, saver 只拿 Table, 与 sqlite/REST/S3 等环境解耦
+    # The catalog is this function's responsibility, not the saver's; the saver only takes a Table, decoupled from sqlite/REST/S3 environments
     warehouse_path = Path(warehouse_dir)
     warehouse_path.mkdir(parents=True, exist_ok=True)
-    # 同一个 catalog.db 用 catalog 名区分机器人, 故换机器人不必另建 warehouse 目录
+    # One catalog.db distinguishes robots by catalog name, so switching robots needs no new warehouse directory
     return load_catalog(
         ROBOT,
         **{"type": "sql",
@@ -115,7 +115,7 @@ def load_episodes_table(warehouse_dir: str, topic_names: Sequence[str], prompt: 
     """Load (creating on first use) the episodes table of one prompt (task) of the current robot."""
     catalog = load_episodes_catalog(warehouse_dir)
     namespace = prompt_to_namespace(prompt)
-    # namespace 名规范化后不可逆, 故把原始 prompt 原文存进 namespace 属性, 训练时可取回
+    # Namespace names are irreversible after normalization, so the original prompt text is stored in namespace attributes and recoverable at training time
     catalog.create_namespace_if_not_exists(namespace, properties={"prompt": prompt})
     return catalog.create_table_if_not_exists(
         f"{namespace}.{EPISODES_TABLE_NAME}", schema=build_episodes_schema(topic_names))
@@ -126,7 +126,7 @@ class EpisodeRecord:
     """One episode as produced by MCAPSampleExtractor.iter_episodes()."""
     source_id: str
     source_episode_seq: int
-    # [{topic: [msg_type, msg_def, log_time, [location, ...]]}, ...], 下标即 sample_idx
+    # [{topic: [msg_type, msg_def, log_time, [location, ...]]}, ...], the index being sample_idx
     samples: list[dict[str, Any]]
 
     @property
@@ -141,9 +141,9 @@ def _message_to_arrow(message: Sequence[Any]) -> dict[str, Any]:
     return {
         "msg_type": msg_type,
         "msg_def": msg_def,
-        "log_time": int(log_time),   # log_time 为字符串纳秒, int64 原样存下不损失精度
+        "log_time": int(log_time),   # log_time is a nanosecond string; stored as int64 without precision loss
         "locations": [
-            # 给四元组各位起名, 之后 SQL 里可以直接写 location.mcap_url
+            # Name the quadruple's positions so SQL can write location.mcap_url directly afterwards
             dict(zip(LOCATION_TYPE.names, (url, int(chunk), int(offset), int(length))))
             for url, chunk, offset, length in locations
         ],
@@ -157,7 +157,7 @@ def _episode_to_row(episode: EpisodeRecord, topic_names: Sequence[str]) -> dict[
         "source_id": episode.source_id,
         "source_episode_seq": int(episode.source_episode_seq),
         "num_samples": len(episode.samples),
-        # 每个 sample 都补齐同一套 topic 键, 缺的写 None, 保证所有行的 STRUCT schema 完全一致
+        # Every sample is padded to the same topic key set, missing ones written as None, keeping every row's STRUCT schema identical
         "samples": [
             {topic_name: (_message_to_arrow(sample[topic_name])
                           if topic_name in sample else None)
@@ -187,17 +187,17 @@ class EpisodeParquetWriter:
         self._writer: pq.ParquetWriter | None = None
         self._output_stream = None
         self._path = ""
-        self._num_episodes = 0      # 当前文件里已写入的 episode 数
+        self._num_episodes = 0      # Episodes written into the current file
 
     def write(self, episode: EpisodeRecord) -> tuple[str, int] | None:
         """Write one episode; return (path, episode count) when the file just rolled."""
         if self._writer is None:
-            # uuid 文件名: 几十个 worker 同时写同一个 data 目录, 靠它保证互不覆盖
+            # uuid file name: dozens of workers write the same data directory concurrently; it guarantees no overwriting
             self._path = f"{self._table.location().rstrip('/')}/data/{uuid4()}.parquet"
             self._output_stream = self._table.io.new_output(self._path).create(overwrite=False)
             self._writer = pq.ParquetWriter(self._output_stream, self._arrow_schema,
                                             compression="zstd")
-        # 一行一个 row group: 训练时按 episode 取数, 读一个 row group 就够, 无读放大
+        # One row per row group: training fetches by episode, so reading one row group suffices, with no read amplification
         self._writer.write_table(pa.Table.from_pylist(
             [_episode_to_row(episode, self._topic_names)], schema=self._arrow_schema))
         self._num_episodes += 1
@@ -210,7 +210,7 @@ class EpisodeParquetWriter:
         self._writer.close()
         self._output_stream.close()
         self._writer, self._output_stream = None, None
-        # 先取走再归零: 下一个 episode 会开一个新文件
+        # Take it then reset to zero: the next episode opens a new file
         closed = (self._path, self._num_episodes)
         self._num_episodes = 0
         return closed
@@ -221,12 +221,12 @@ class IcebergEpisodeSaver:
 
     def __init__(self, table: Table):
         self._table = table
-        self.num_episodes = 0       # 已注册的 episode 总数
-        self.num_commits = 0        # 已产生的 snapshot 数
+        self.num_episodes = 0       # Total episodes registered
+        self.num_commits = 0        # Total snapshots produced
 
     def extend(self, parquet_paths: Sequence[str], num_episodes: int) -> None:
         """Register already-written parquet files as one Iceberg snapshot."""
-        # add_files 只登记文件不重写数据; 路径带 uuid 不可能重复, 故关掉那次全表扫描
+        # add_files only registers files without rewriting data; uuid paths cannot repeat, so that full-table scan is disabled
         self._table.add_files(
             file_paths=list(parquet_paths),
             snapshot_properties={"writer": "lingyu-episode-saver",

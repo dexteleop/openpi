@@ -76,40 +76,6 @@ def compose(transforms: Sequence[DataTransformFn]) -> DataTransformFn:
     return CompositeTransform(transforms)
 
 
-def wds_v2_to_sample(item: DataDict) -> DataDict:
-    """Adapt one TeleavatarTarDataset item to what the transforms expect.
-
-    Replaces the old WDSTuple2Dict, which unpacked the (key, frames, state,
-    action) tuple yielded by the v1 iterable pipeline and renamed rosbag topics
-    to camera keys. The v2 tar Dataset already returns a nested dict keyed by
-    camera name, so only the leading axis has to go.
-
-    TeleavatarTarDataset keeps lerobot's per-frame layout: torch tensors, with
-    images at (1, C, H, W) and state at (1, state_dim) -- the leading axis is
-    the single queried frame. The transform chain works on unbatched numpy, and
-    TeleavatarInputs indexes state positionally (state[0:7]), so that frame axis
-    has to go before it reaches the transforms; leaving it in would slice the
-    frame axis instead of the joint axis, and would also defeat _parse_image's
-    `shape[0] == 3` channel-first check. Actions are already
-    (action_seq_len, state_dim) -- that leading axis is time, so it stays.
-
-    The tars carry no task text, so "prompt" is not produced here; it is
-    injected by InjectDefaultPrompt from DataConfig.wds_prompt.
-    """
-    images = {k: np.asarray(v)[0] for k, v in item["observation"]["images"].items()}
-    sample = {
-        "observation": {
-            "images": images,
-            "state": np.asarray(item["observation"]["state"])[0],
-        },
-        "action": np.asarray(item["action"]),
-    }
-    # LingyuDatasetV2 自带每个 sample 的 prompt, 原样透传; 没有时再由 InjectDefaultPrompt 补上
-    if "prompt" in item:
-        sample["prompt"] = item["prompt"]
-    return sample
-
-
 @dataclasses.dataclass(frozen=True)
 class RepackTransform(DataTransformFn):
     """Repacks an input dictionary into a new dictionary.

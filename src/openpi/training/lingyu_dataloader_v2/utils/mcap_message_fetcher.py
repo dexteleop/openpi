@@ -1,5 +1,5 @@
 """
-利用 ("mcap_url", "chunk_file_offset", "uncompressed_byte_offset", "record_length") 来找到一个message
+Locate one message using ("mcap_url", "chunk_file_offset", "uncompressed_byte_offset", "record_length").
 """
 from __future__ import annotations
 import threading
@@ -9,26 +9,26 @@ from rosbags.typesys import (
 )
 
 from openpi.training.lingyu_dataloader_v2.utils._mcap_utils import (
-    # MCAP Record 类型
+    # MCAP Record types
     OP_MESSAGE,
-    # MCAP常见结构长度
+    # Common MCAP structure lengths
     OPCODE_PREFIX, RECORD_PREFIX, MESSAGE_HEADER, CHUNK_HEADER_FIXED,
-    # 字节流转整数
+    # Byte stream to integer
     u32, u64,
-    # MCAP功能函数
+    # MCAP utility functions
     fetch_mcap_bytes, decompress_chunk_record
 )
 
-# 最近一个被整块读入内存的 chunk: (mcap_url, chunk_file_offset, records_bytes)。
-# 顺序播放时 player 刚读完一个 chunk, 紧接着就会按条取其中的 message(关键帧判断、按键解析),
-# 命中即直接切片, 免去每条 message 两次 S3 往返; 只存一块, 内存恒定
+# The most recent chunk read into memory as a whole: (mcap_url, chunk_file_offset, records_bytes).
+# During sequential playback the player has just finished reading a chunk and immediately fetches its messages one by one (keyframe checks, key parsing);
+# on a hit it slices directly, saving two S3 round trips per message; only one chunk is stored, so memory stays constant
 _last_chunk_records: tuple[str, int, bytes] | None = None
 
 
 def remember_chunk_records(mcap_url: str, chunk_file_offset: int, records_bytes: bytes) -> None:
     """Keep the chunk just read whole so fetch_data_bytes() can slice it instead of hitting S3."""
     global _last_chunk_records
-    # 整个元组一次赋值: 读方拿到的要么是旧块要么是新块, 不会读到拼了一半的状态
+    # The whole tuple is assigned at once: readers see either the old chunk or the new one, never a half-merged state
     _last_chunk_records = (mcap_url, chunk_file_offset, records_bytes)
 
 
@@ -38,47 +38,47 @@ def fetch_data_bytes(
     uncompressed_byte_offset: int,
     msg_record_length: int,
 ) -> bytes:
-    """按 (chunk_file_offset, uncompressed_byte_offset) O(1) 定位并读取单条 message。
-    未压缩 chunk 无需任何扫描，两次 pread 完成定位与读取；
-    压缩 chunk(zstd/lz4) 先整块解压，再用同一偏移在解压流内切片。
-    chunk_file_offset 是 chunk 记录在文件中的绝对字节位置.
+    """Locate and read a single message in O(1) by (chunk_file_offset, uncompressed_byte_offset).
+    Uncompressed chunks need no scanning: two pread calls finish locating and reading;
+    compressed chunks (zstd/lz4) are decompressed whole first, then sliced at the same offset within the decompressed stream.
+    chunk_file_offset is the chunk record's absolute byte position in the file.
 
     Returns:
         cdr_bytes
     """
     last_chunk = _last_chunk_records
     if last_chunk is not None and last_chunk[:2] == (mcap_url, chunk_file_offset):
-        # 命中刚播完的 chunk: records_bytes 与下方两条路径读到的是同一段字节流, 直接切片
+        # Hit the chunk just played: records_bytes is the same byte stream as read by the two paths below, so slice directly
         msg_record = last_chunk[2][uncompressed_byte_offset:
                                    uncompressed_byte_offset + RECORD_PREFIX + msg_record_length]
         return _message_cdr(msg_record, chunk_file_offset, uncompressed_byte_offset)
 
-    # --- 解析 chunk header, 定位 records 起始位置 ---
+    # --- Parse the chunk header to locate the start of records ---
     chunk_head = fetch_mcap_bytes(
         mcap_url,
         CHUNK_HEADER_FIXED + 4, # max(name_len)=4
-        chunk_file_offset + RECORD_PREFIX # 跳过 Chunk Record Prefix
+        chunk_file_offset + RECORD_PREFIX # Skip the Chunk Record Prefix
     )
-    # 读取 Chunk Header compression 中的前缀值。
-    # name_len=0,不压缩; name_len=3,lz4; name_len=4,zstd
+    # Read the prefix value from the Chunk Header's compression field.
+    # name_len=0, no compression; name_len=3, lz4; name_len=4, zstd
     name_len, = u32(chunk_head, 28)
-    # 读取压缩算法，空字符串,'lz4','zstd'
+    # Read the compression algorithm: empty string, 'lz4', 'zstd'
     compression = chunk_head[32 : 32 + name_len].decode() # '' or 'lz4' or 'zstd'
-    # 读取 Chunk Header records_length
+    # Read the Chunk Header records_length
     records_length, = u64(chunk_head, 32 + name_len)
-    # 从第一个record开始
+    # Start from the first record
     records_start = chunk_file_offset + RECORD_PREFIX + CHUNK_HEADER_FIXED + name_len
 
     if compression:
-        # 压缩 chunk: uncompressed_byte_offset 是解压流内的偏移，须先整块解压
+        # Compressed chunk: uncompressed_byte_offset is an offset within the decompressed stream, so decompress the chunk whole first
         records_bytes = decompress_chunk_record(
             mcap_url, records_start, records_length, compression,
-            u64(chunk_head, 16)[0],   # uncompressed_size, zstd 解压上界
+            u64(chunk_head, 16)[0],   # uncompressed_size, the zstd decompression upper bound
         )
         msg_record = records_bytes[uncompressed_byte_offset:
                             uncompressed_byte_offset + RECORD_PREFIX + msg_record_length]
     else:
-        # 未压缩 chunk: uncompressed_byte_offset 即文件内偏移，一次 range 读取目标 message 记录
+        # Uncompressed chunk: uncompressed_byte_offset is the in-file offset; one range read targets the message record
         msg_record = fetch_mcap_bytes(mcap_url, RECORD_PREFIX + msg_record_length,
                                records_start + uncompressed_byte_offset)
     return _message_cdr(msg_record, chunk_file_offset, uncompressed_byte_offset)
@@ -97,10 +97,10 @@ def _message_cdr(msg_record: bytes, chunk_file_offset: int, uncompressed_byte_of
 
 def slice_span_cdr(span_bytes: bytes, span_start: int,
                    uncompressed_byte_offset: int, msg_record_length: int) -> bytes | None:
-    """从按未压缩 chunk 读出的 records 区字节段里切出一条 message 的 CDR。
+    """Slice one message's CDR out of a records-section byte segment read from an uncompressed chunk.
 
-    span_bytes 是 records 区内从 span_start 起的一段; 切出的记录 opcode 与长度字段都须与索引一致,
-    否则返回 None(如 chunk 实际被压缩, 文件内偏移与解压流内偏移不同), 由调用方退回 fetch_data_bytes。
+    span_bytes is a segment of the records section starting at span_start; the sliced record's opcode and length fields must match the index,
+    otherwise return None (e.g. the chunk is actually compressed, so in-file and in-stream offsets differ); the caller falls back to fetch_data_bytes.
     """
     record_pos = uncompressed_byte_offset - span_start
     assert record_pos >= 0, f"message 偏移 {uncompressed_byte_offset} 在读取段起点 {span_start} 之前"
@@ -113,24 +113,24 @@ def slice_span_cdr(span_bytes: bytes, span_start: int,
 
 class MCAP_Message_Fetcher:
     """
-    按 locations 随机读取并反序列化 mcap 中的 message。
+    Read and deserialize messages in an mcap randomly by locations.
 
-    所有 topic 均将 CDR 字节反序列化为 rosbags message 对象后返回，包括 FFMPEGPacket。
-    FFMPEGPacket 的视频解码（→ 图像像素）由调用方负责。
-    fetch_message 可被多线程并发调用: 唯一的共享可变状态(typestore 注册)由锁保护。
+    All topics have their CDR bytes deserialized into rosbags message objects before returning, including FFMPEGPacket.
+    Decoding FFMPEGPacket video (-> image pixels) is the caller's responsibility.
+    fetch_message may be called concurrently from multiple threads: the only shared mutable state (typestore registration) is lock-protected.
     """
 
     def __init__(self):
         self._typestore = get_typestore(Stores.ROS2_HUMBLE)
-        self._registered_types: set[str] = set()  # 已注册的自定义类型名, 避免重复 register
-        self._register_lock = threading.Lock()    # 多线程首次遇到同一类型时, 只让一个线程去 register
+        self._registered_types: set[str] = set()  # Names of registered custom types, avoiding duplicate register calls
+        self._register_lock = threading.Lock()    # When multiple threads first hit the same type, only one performs the register
 
     def _ensure_type_registered(self, msg_type: str, msg_def: str) -> None:
-        """若 msg_type 不在标准库且尚未注册, 用 msg_def 动态注册进 typestore"""
+        """If msg_type is not in the standard library and not yet registered, register it dynamically into the typestore with msg_def"""
         if msg_type in self._registered_types:
             return
         with self._register_lock:
-            if msg_type in self._registered_types:  # 等锁期间已被别的线程注册
+            if msg_type in self._registered_types:  # Already registered by another thread while waiting for the lock
                 return
             try:
                 self._typestore.deserialize_cdr(b"\x00\x01\x00\x00", msg_type)
@@ -140,11 +140,11 @@ class MCAP_Message_Fetcher:
 
     def fetch_message(self, msg_type: str, msg_def: str, locations: list[tuple]):
         """
-        输入 mcap_player.play_messages 产出的 msg_type/msg_def/locations, 返回反序列化后的 message 列表。
+        Takes the msg_type/msg_def/locations produced by mcap_player.play_messages as input, returns the deserialized message list.
 
-        对 locations 中每个定位元组调用一次 fetch_data_bytes + deserialize_cdr,
-        返回 list[ros2 message]。调用方根据 msg_type 决定后续处理（如 FFMPEGPacket 的视频解码）。
-        locations 长度为 1 时返回单元素列表; 长度 > 1 (ffmpeg GOP) 时返回整段帧的列表。
+        Takes the msg_type/msg_def/locations produced by mcap_player.play_messages as input; for each locating tuple in locations
+        it calls fetch_data_bytes + deserialize_cdr once, returning a list[ros2 message]. The caller decides further processing by msg_type (e.g. FFMPEGPacket video decoding).
+        A locations length of 1 returns a single-element list; length > 1 (ffmpeg GOP) returns the whole segment's frame list.
         """
         self._ensure_type_registered(msg_type, msg_def)
         message = []
@@ -156,16 +156,16 @@ class MCAP_Message_Fetcher:
         return message
 
     def fetch_span_messages(self, mcap_url: str, chunk_file_offset: int, span_messages: list[tuple]) -> list:
-        """一次 range 读取同一 chunk 内一段相邻的 message, 再逐条切片、反序列化。
+        """Read one range covering a run of adjacent messages in the same chunk, then slice and deserialize one by one.
 
-        span_messages 为 [(msg_type, msg_def, uncompressed_byte_offset, record_length), ...], 可跨 topic;
-        按未压缩 chunk 直接算出 records 区起点, 省去读 chunk header 的那次请求。
-        切片校验不通过的 message(压缩 chunk)退回 fetch_data_bytes 逐条读取。返回顺序与 span_messages 一致。
+        span_messages is [(msg_type, msg_def, uncompressed_byte_offset, record_length), ...] and may span topics;
+        for uncompressed chunks the records-section start is computed directly, saving the request that would read the chunk header.
+        Messages failing the slice check (compressed chunks) fall back to per-message fetch_data_bytes. The return order matches span_messages.
         """
         assert span_messages, "span_messages 不能为空"
         span_start = min(span_message[2] for span_message in span_messages)
         span_end = max(span_message[2] + RECORD_PREFIX + span_message[3] for span_message in span_messages)
-        # 未压缩 chunk 的 header 中 compression 为空串(name_len=0), records 区紧跟其后
+        # In an uncompressed chunk's header, compression is an empty string (name_len=0) and the records section immediately follows
         records_start = chunk_file_offset + RECORD_PREFIX + CHUNK_HEADER_FIXED
         span_bytes = fetch_mcap_bytes(mcap_url, span_end - span_start, records_start + span_start)
 

@@ -1,30 +1,30 @@
-"""统一配置入口: 指定当前使用哪个具身智能模型, 并对外提供读取其配置的函数。
+"""Unified config entry: specify which embodied-AI model is in use and expose functions to read its configs.
 
-其他程序一律通过 load_action_chunk_length() 拿配置, 不直接 import 某个模型的配置文件,
-这样换模型时只需改本文件顶部那一行 import。
+Other programs always get configs via load_action_chunk_length() and never import a model's config file directly,
+so switching models only requires changing that single import line at the top of this file.
 
-每个模型配置文件必须提供同名的常量:
-    ACTION_CHUNK_LENGTH  一个 sample 的动作序列长度, 即 [当前动作, 后续 n-1 个动作] 的长度
+Every model config file must provide the same-named constants:
+    ACTION_CHUNK_LENGTH  one sample's action sequence length, i.e. the length of [current action, the next n-1 actions]
     STATE_CONCAT / ACTION_CONCAT
-                         ((mcap topic, 字段名), ...), 即 state/action 向量的拼接顺序
+                         ((mcap topic, field name), ...), i.e. the concat order of the state/action vectors
 """
 from __future__ import annotations
 
-from openpi.training.lingyu_dataloader_v2.model_config import pi0  # 换模型只改这一行
+from openpi.training.lingyu_dataloader_v2.model_config import pi0  # Switching models only changes this line
 
 
-MODEL = "pi0"  # TODO：选定使用哪个具身智能模型
+MODEL = "pi0"  # TODO: pick which embodied-AI model to use
 
 
 #####
-# 加载一个 sample 的动作序列长度
+# Load one sample's action sequence length
 #####
 
 def load_action_chunk_length() -> int:
-    """返回当前模型一个 sample 的动作序列长度(含当前动作)。"""
+    """Return the current model's action sequence length per sample (including the current action)."""
     if MODEL == "pi0":
         return pi0.ACTION_CHUNK_LENGTH
-    # TODO： elif 其他模型的常量配置
+    # TODO: elif other models' constant configs
     else:
         raise ValueError(
             f"Cannot find the relevant model configuration of {MODEL!r} "
@@ -33,14 +33,14 @@ def load_action_chunk_length() -> int:
 
 
 #####
-# 加载 state / action 向量的拼接顺序
+# Load the concat order of the state / action vectors
 #####
 
 def load_state_and_action_concat() -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
-    """返回当前模型的 (STATE_CONCAT, ACTION_CONCAT), 元素为 (mcap topic, 字段名)。"""
+    """Return the current model's (STATE_CONCAT, ACTION_CONCAT), elements being (mcap topic, field name)."""
     if MODEL == "pi0":
         return pi0.STATE_CONCAT, pi0.ACTION_CONCAT
-    # TODO： elif 其他模型的常量配置
+    # TODO: elif other models' constant configs
     else:
         raise ValueError(
             f"Cannot find the relevant model configuration of {MODEL!r} "

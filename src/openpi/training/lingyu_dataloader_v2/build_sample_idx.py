@@ -1,47 +1,48 @@
-# Copyright (c) 2026 Dexteleop Intelligence (灵御智能)
+# Copyright (c) 2026 Dexteleop Intelligence (Lingyu Intelligence)
 # Licensed under the MIT License.
 # See LICENSE file in the project root for full license information.
 
-"""并行抽取所有 mcap 的 episode 存进 Iceberg, 再用 DuckDB 生成全局索引。
+"""Extract episodes from all mcaps into Iceberg in parallel, then build the global index with DuckDB.
 
-采集阶段::
-    mcap_queue: 主进程一次性填入全部 (mcap 路径, prompt), 末尾每个 worker 一个 None 哨兵
-        -> MAX_MCAP_WORKERS 个常驻 worker 进程(spawn, 绕过 GIL)各自取一个 mcap
-           worker 内 MCAPSampleExtractor.iter_episodes() 每产出一个 episode 就增量写进
-           当前 parquet(一行一个 row group), 攒满 EPISODES_PER_PARQUET 行才换新文件
-    parquet_queue: 里面只有写完文件的路径, 不含 episode 数据, 故无需限长
-        -> 主进程单消费循环, 每收到一个文件就 saver.extend() 注册成一个 snapshot
+Collection stage::
+    mcap_queue: the main process fills in all (mcap path, prompt) at once, followed by one None sentinel per worker
+        -> MAX_MCAP_WORKERS resident worker processes (spawn, bypassing the GIL) each take one mcap
+           inside a worker, MCAPSampleExtractor.iter_episodes() incrementally writes each produced episode
+           into the current parquet (one row per row group), switching to a new file only after EPISODES_PER_PARQUET rows
+    parquet_queue: contains only paths of finished files, no episode data, so no length limit is needed
+        -> the main process's single consumer loop registers each received file as one snapshot via saver.extend()
 
-worker 不抽完整个 mcap 再返回，逐个 episode 增量写之后, 每个
-worker 的内存恒等于一个 episode, 与文件行数无关, 故 worker 数可以放心开大。
-Arrow 转换放 worker 而非主进程: 它占保存开销的 95% 且是持 GIL 的纯 Python, 多线程实测
-零加速(1.00x), 只有跨进程才真并行; 顺带队列里也不必再 pickle episode 数据。
-主进程只做 add_files: 登记文件不重写数据, 单次 0.12 s, 不会成为瓶颈。
+A worker does not finish a whole mcap before returning; by writing each episode incrementally, every
+worker's memory stays constant at one episode regardless of file row count, so the worker count can safely be large.
+Arrow conversion runs in workers rather than the main process: it accounts for 95% of the save cost and is pure Python holding
+the GIL -- measured multithreading speedup was zero (1.00x); only processes truly parallelize, and it also avoids pickling episode data through queues.
+The main process only does add_files: registering files rewrites no data, 0.12 s each, never a bottleneck.
 
-一个 prompt(任务)一张 Iceberg 表, 由 find_mcap_urls() 返回的 {mcap url: prompt} 决定,
-故进程池是全局共享的, 队列元素带上 prompt, 单写线程再按 prompt 分派给对应的 saver。
+One Iceberg table per prompt (task), decided by the {mcap url: prompt} returned by find_mcap_urls(),
+so the process pool is globally shared; queue elements carry the prompt, and the single writer thread dispatches to the matching saver by prompt.
 
-最终编号阶段::
-    各 prompt 表当前 snapshot 的数据文件 -> 逐文件只读元数据列, 并记下每行所在 (data_file, row_group)
-        -> 拼成一张 Arrow 表 -> DuckDB
+Final numbering stage::
+    data files of each prompt table's current snapshot -> read only the metadata columns file by file, recording each row's (data_file, row_group)
+        -> concatenated into one Arrow table -> DuckDB
         -> ORDER BY (prompt, source_id, source_episode_seq) + ROW_NUMBER()
         -> episode_index.parquet: {prompt, episode_id, source_id, source_episode_seq,
                                    num_samples, data_file, row_group, episode_offset, sample_offset}
-episode_offset 是全局连续的 episode 编号, sample_offset 是该 episode 首个 sample 的全局编号,
-故全局 sample 编号 s 属于满足 sample_offset <= s < sample_offset + num_samples 的那个 episode,
-其局部 sample_idx 为 s - sample_offset。
-(data_file, row_group) 是该 episode 的物理位置: 写入端一个 episode 一行一个 row group, 故行号
-即 row group 号。取样时凭它直接 read_row_group, 不再经 Iceberg scan 逐个 manifest/footer 去找。
-编号跨全部 prompt 只产出一份索引: Iceberg 的 namespace 不参与编号, prompt 列即定位表的坐标。
-编号只读元数据列, 不碰 samples 这根巨大的列, 因此与数据量无关。
+episode_offset is the globally contiguous episode number; sample_offset is the global number of the episode's first sample,
+so a global sample number s belongs to the episode satisfying sample_offset <= s < sample_offset + num_samples,
+and its local sample_idx is s - sample_offset.
+(data_file, row_group) is the episode's physical location: the writer emits one episode per row group, so the row number
+is the row group number. Sampling uses it to read_row_group directly instead of hunting through Iceberg manifests/footers.
+Numbering across all prompts produces a single index: Iceberg namespaces take no part in numbering; the prompt column is the table's coordinates.
+Numbering reads only metadata columns and never touches the huge samples column, so it is independent of data volume.
 
-示例命令：
+Example commands:
     cd ~/openpi/src/openpi/training/lingyu_dataloader_v2
-    python build_sample_idx.py                # 采集 + 编号
-    python build_sample_idx.py --index-only   # 数据已在 Iceberg 里, 只重跑编号阶段
+    python build_sample_idx.py                # collect + number, no log file generated
+    python build_sample_idx.py --log          # same, and write run logs to build_sample_idx.log
+    python build_sample_idx.py --index-only   # data already in Iceberg, rerun only the numbering stage
 
-按进程实时查看网卡 enp6s18 上的流量
-    sudo nethogs -v 4 enp6s18   # 直接以 MB/s 显示
+Watch per-process traffic on NIC enp6s18 in real time
+    sudo nethogs -v 4 enp6s18   # displayed directly in MB/s
 """
 from __future__ import annotations
 
@@ -64,28 +65,28 @@ from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import find_mc
 from openpi.training.lingyu_dataloader_v2.utils.mcap_topics_filter import filter_topics
 
 # Constants
-MAX_MCAP_WORKERS = 128          # 最多 MCAP 并行抽取数量
-# 每个 parquet 攒多少个 episode(即一次 add_files/一个 snapshot)。只决定文件大小与 commit
-# 次数, 不影响内存: worker 是逐个 episode 增量写的, 实测约 0.29 MB/episode。
+MAX_MCAP_WORKERS = 128          # Maximum number of mcaps extracted in parallel
+# How many episodes each parquet accumulates (i.e. one add_files / one snapshot). Only affects file size and commit
+# count, not memory: workers write episode by episode, measured at about 0.29 MB/episode.
 EPISODES_PER_PARQUET = 100
 WAREHOUSE_DIR = str(Path(__file__).parent / "iceberg_warehouse")
 GLOBAL_INDEX_NAME = "episode_index.parquet"
-# 主进程与 spawn worker 共用同一个日志文件与级别: spawn 子进程不继承主进程的 logging 配置
+# Main process and spawn workers share the same log file and level: spawn children do not inherit the main process's logging config
 LOG_PATH = str(Path(__file__).with_suffix(".log"))
 LOG_LEVEL = logging.INFO
-# 带时间与进程号: 128 个 worker 写同一文件, 靠 pid 把 start/episode/done 串成一条时间线
+# With timestamp and process number: 128 workers write one file; pid stitches start/episode/done into one timeline
 LOG_FORMAT = "%(asctime)s %(processName)s[%(process)d] %(levelname)s %(name)s: %(message)s"
-# 哨兵要跨进程传, 必须用 pickle 后仍可按值比较的对象, 不能用 object() —— 它 pickle 后身份就变了
-_WORKER_DONE = "__worker_done__"    # worker 领到 None 收工时送出, 主进程据此计数
-# 主进程等 episode 的超时: 超时就查一次 worker 存活, 免得 worker 被 OOM killer 杀掉(送不出
-# _WORKER_DONE)时主进程永远挂在 get() 上
+# Sentinels cross process boundaries, so they must be objects that remain equal by value after pickling; object() does not work -- its identity changes after pickling
+_WORKER_DONE = "__worker_done__"    # Sent when a worker receives None and finishes; the main process counts these
+# Timeout for the main process waiting for episodes: on timeout it checks worker liveness once, so the main process does not hang on get() forever
+# when a worker is killed by the OOM killer (and can never send _WORKER_DONE)
 QUEUE_POLL_SEC = 60
-# 编号阶段从数据文件里读的元数据列, samples 那根巨大的列不读
+# Metadata columns read from data files during the numbering stage; the huge samples column is not read
 EPISODE_META_COLUMNS = ["episode_id", "source_id", "source_episode_seq", "num_samples"]
 
-# 全局编号: 先按 episode_id 去重(commit 重试可能写重, 任取一份的位置即可), 再按 source 稳定排序连续编号。
-# 绝不用 parquet 行位置或 Iceberg commit 顺序当编号依据, 那两者都会随重跑而变;
-# (data_file, row_group) 只是随编号一起存下的物理位置, 不参与排序。
+# Global numbering: first deduplicate by episode_id (commit retries may write duplicates; any copy's location works), then stable-sort by source for contiguous numbering.
+# Never use parquet row positions or Iceberg commit order as numbering bases -- both change across reruns;
+# (data_file, row_group) is just the physical location stored along with the number and takes no part in sorting.
 _GLOBAL_INDEX_SQL = """
 WITH unique_episodes AS (
     SELECT DISTINCT ON (prompt, episode_id)
@@ -114,46 +115,48 @@ logger = logging.getLogger(__name__)
 
 
 def extract_episodes_to_parquet(mcap_queue, parquet_queue, warehouse_dir: str,
-                                topic_names: list) -> None:
+                                topic_names: list, log_enabled: bool) -> None:
     """Take mcaps off mcap_queue, append episodes to parquet, push each full file's path.
 
     Top-level (not nested) so the spawn worker process can import it.
     Runs until it draws the None sentinel; one bad mcap only loses that mcap.
     """
-    # spawn worker 是独立的执行入口, 须自行配置日志; 追加写入主进程已清空的同一文件
-    logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, filename=LOG_PATH, filemode="a",
-                        encoding="utf-8")
-    # 只保留 WARNING 及以上，屏蔽 extractor 里的 Start/Stop INFO
-    logging.getLogger("openpi.training.lingyu_dataloader_v2.mcap_sample_extractor").setLevel(logging.WARNING)
-    # prompt -> writer, 一个 prompt 一个在写的文件; 跨 mcap 续写, 故文件总能攒满
+    # spawn workers are separate execution entries and must configure logging themselves; with --log only, append to the same file the main process truncated
+    # force=True: third-party libraries may already have attached handlers to the root logger at import time; without force, basicConfig silently does nothing
+    if log_enabled:
+        logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, filename=LOG_PATH, filemode="a",
+                            encoding="utf-8", force=True)
+        # Keep WARNING and above; silence the extractor's Start/Stop INFO
+        logging.getLogger("openpi.training.lingyu_dataloader_v2.mcap_sample_extractor").setLevel(logging.WARNING)
+    # prompt -> writer, one in-progress file per prompt; writes continue across mcaps so files always fill up
     writers: dict[str, EpisodeParquetWriter] = {}
     while True:
         task = mcap_queue.get()
         if task is None:
-            for prompt, writer in writers.items():      # 收工: 交出最后那些不满的文件
+            for prompt, writer in writers.items():      # Wrapping up: hand over the last not-yet-full files
                 _report_closed_file(parquet_queue, prompt, writer.close())
             parquet_queue.put(_WORKER_DONE)
             return
         mcap_url, prompt = task
-        # 被 OOM killer 杀掉的进程来不及写任何日志, 只能靠 "有 start 无 done" 反查是哪个 mcap
+        # A process killed by the OOM killer writes no logs at all; only a "start without done" can identify which mcap it was
         logger.info(f"start: {mcap_url}")
         try:
-            # 建表/建 writer 也放进 try: 否则其异常只进 stderr, 日志文件里看不到
+            # Table/writer creation is also inside the try: otherwise its exception only goes to stderr, invisible in the log file
             if prompt not in writers:
                 table = load_episodes_table(warehouse_dir, topic_names, prompt)
                 writers[prompt] = EpisodeParquetWriter(table, topic_names, EPISODES_PER_PARQUET)
             extractor = MCAPSampleExtractor(mcap_url)
             for source_episode_seq, samples in extractor.iter_episodes():
-                # 写一行就落一个 row group, 本进程内存恒等于一个 episode
+                # Flush one row group per row written; this process's memory stays constant at one episode
                 record = EpisodeRecord(extractor.source_id, source_episode_seq, samples)
                 _report_closed_file(parquet_queue, prompt, writers[prompt].write(record))
-                # 每个 episode 一行心跳: 证明进程还活着, 并暴露内存是否在持续增长
+                # One heartbeat line per episode: proves the process is alive and exposes whether memory keeps growing
                 logger.info(f"episode {record.episode_id} ({len(samples)} samples), "
                             f"peak_rss={_peak_rss_gb():.2f}GB")
             logger.info(f"done: {mcap_url} ({extractor.num_episodes} episodes, "
                         f"{extractor.total_samples} samples), peak_rss={_peak_rss_gb():.2f}GB")
         except Exception:
-            logger.exception(f"error: {mcap_url}")      # exception() 附带完整 traceback
+            logger.exception(f"error: {mcap_url}")      # exception() includes the full traceback
 
 
 def _peak_rss_gb() -> float:
@@ -176,7 +179,7 @@ def register_parquets_from_queue(parquet_queue, savers: dict[str, IcebergEpisode
         try:
             item = parquet_queue.get(timeout=QUEUE_POLL_SEC)
         except Empty:
-            # 只有 worker 全死光才收工: 被 OOM killer 杀掉的 worker 送不出 _WORKER_DONE
+            # Only finish when all workers are dead: an OOM-killed worker can never send _WORKER_DONE
             if not any(worker.is_alive() for worker in workers):
                 logger.error("worker 已全部退出但哨兵不齐, 可能有进程被杀, 提前收尾")
                 break
@@ -185,11 +188,12 @@ def register_parquets_from_queue(parquet_queue, savers: dict[str, IcebergEpisode
             num_done_workers += 1
             continue
         prompt, parquet_path, num_episodes = item
-        # 逐个文件注册而非全部写完再一次性 add_files: 中途崩了已注册的部分仍在表里
+        # Register file by file instead of one add_files after everything is written: if we crash midway, the registered files remain in the table
         savers[prompt].extend([parquet_path], num_episodes)
 
 
-def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WAREHOUSE_DIR) -> dict:
+def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WAREHOUSE_DIR,
+                         log_enabled: bool = False) -> dict:
     """Extract all mcaps in parallel worker processes and write episodes to Iceberg.
 
     mcap_prompts is find_mcap_urls()'s {mcap url: prompt}; one prompt is one table.
@@ -198,8 +202,8 @@ def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WARE
     is the single consumer and only registers those files, one snapshot per file.
     Returns {prompt: Table}.
     """
-    topic_names = sorted(filter_topics())   # 排序: 同一套 topic 每次都得到同一个 schema
-    # 主进程先建好表, worker 里的 load_episodes_table() 就只是只读加载, 不会并发建表
+    topic_names = sorted(filter_topics())   # Sorted: the same topic set yields the same schema every time
+    # The main process creates the tables first, so load_episodes_table() in workers is a read-only load and tables are not created concurrently
     tables = {prompt: load_episodes_table(warehouse_dir, topic_names, prompt)
               for prompt in dict.fromkeys(mcap_prompts.values())}
     savers = {prompt: IcebergEpisodeSaver(table) for prompt, table in tables.items()}
@@ -211,9 +215,9 @@ def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WARE
     for mcap_url, prompt in mcap_prompts.items():
         mcap_queue.put((mcap_url, prompt))
     for _ in range(num_workers):
-        mcap_queue.put(None)        # 一个 worker 一个收工哨兵
+        mcap_queue.put(None)        # One finish sentinel per worker
     workers = [mp_ctx.Process(target=extract_episodes_to_parquet,
-                              args=(mcap_queue, parquet_queue, warehouse_dir, topic_names),
+                              args=(mcap_queue, parquet_queue, warehouse_dir, topic_names, log_enabled),
                               daemon=True)
                for _ in range(num_workers)]
     for worker in workers:
@@ -223,7 +227,7 @@ def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WARE
 
     for worker in workers:
         worker.join()
-    # pid -> exitcode: 用 pid 到日志里找该 worker 最后一条 start, 即是出事的 mcap
+    # pid -> exitcode: use the pid to find that worker's last start in the log, which identifies the failing mcap
     killed_exitcodes = {worker.pid: worker.exitcode for worker in workers if worker.exitcode}
     if killed_exitcodes:
         logger.error(f"{len(killed_exitcodes)} 个 worker 非正常退出, "
@@ -237,7 +241,7 @@ def build_episodes_table(mcap_prompts: dict[str, str], warehouse_dir: str = WARE
 
 def build_global_index(tables: dict, warehouse_dir: str = WAREHOUSE_DIR) -> str:
     """Number every episode/sample of all prompts globally and write one episode_index.parquet."""
-    # 各 prompt 表只取元数据列与物理位置(samples 那根巨大的列完全不读), 拼成一张 Arrow 表
+    # Take only metadata columns and physical locations from each prompt table (the huge samples column is never read), concatenated into one Arrow table
     episodes_meta = pa.concat_tables(
         [load_episodes_meta(prompt, table) for prompt, table in tables.items()])
     index_path = str(Path(warehouse_dir) / GLOBAL_INDEX_NAME)
@@ -262,11 +266,11 @@ def load_episodes_meta(prompt: str, table) -> pa.Table:
     Returns columns EPISODE_META_COLUMNS + [data_file, row_group, prompt], one row per episode.
     """
     file_metas = []
-    # plan_files 给出当前 snapshot 的全部数据文件; add_files 写入的表没有 delete 文件, 逐文件读即全表
+    # plan_files gives all data files of the current snapshot; tables written by add_files have no delete files, so reading file by file reads the whole table
     for scan_task in table.scan().plan_files():
         data_file = scan_task.file.file_path
         parquet_file = pq.ParquetFile(data_file)
-        # 写入端一个 episode 一行一个 row group, 行号才等于 row group 号
+        # The writer emits one episode per row group, so the row number equals the row group number
         assert parquet_file.num_row_groups == parquet_file.metadata.num_rows, \
             f"{data_file} 不是一行一个 row group, 行号不能当 row group 号"
         file_meta = parquet_file.read(columns=EPISODE_META_COLUMNS)
@@ -281,7 +285,7 @@ def load_episodes_meta(prompt: str, table) -> pa.Table:
 def load_existing_tables(warehouse_dir: str = WAREHOUSE_DIR) -> dict:
     """Load every prompt's episodes table already in the catalog, as {prompt: Table}."""
     catalog = load_episodes_catalog(warehouse_dir)
-    # 建表时 namespace 属性里存了 prompt 原文(namespace 名规范化后不可逆), 据此取回对应关系
+    # Table creation stores the prompt text in namespace attributes (namespace names are normalized and irreversible); use it to recover the mapping
     tables = {catalog.load_namespace_properties(namespace)["prompt"]:
               catalog.load_table((*namespace, EPISODES_TABLE_NAME))
               for namespace in catalog.list_namespaces()}
@@ -289,10 +293,10 @@ def load_existing_tables(warehouse_dir: str = WAREHOUSE_DIR) -> dict:
     return tables
 
 
-def build_all() -> str:
+def build_all(log_enabled: bool = False) -> str:
     """Extract all mcaps into Iceberg, then build the global index."""
-    # 全部 mcap 入队, 由 MAX_MCAP_WORKERS 个常驻 worker 轮流领取, 进程数不随 mcap 数增长
-    tables = build_episodes_table(find_mcap_url_and_prompt_pairs(), WAREHOUSE_DIR)
+    # All mcaps are enqueued and picked up by MAX_MCAP_WORKERS resident workers; the process count does not grow with mcap count
+    tables = build_episodes_table(find_mcap_url_and_prompt_pairs(), WAREHOUSE_DIR, log_enabled)
     return build_global_index(tables, WAREHOUSE_DIR)
 
 
@@ -300,13 +304,17 @@ if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser(description="并行抽取 mcap 存进 Iceberg, 再生成全局索引")
     arg_parser.add_argument("--index-only", action="store_true",
                             help="跳过采集, 只用 catalog 里已有的表重建 episode_index.parquet")
+    arg_parser.add_argument("--log", action="store_true",
+                            help="把运行日志写入 build_sample_idx.log; 不带此参数则不生成日志文件")
     cli_args = arg_parser.parse_args()
-    # 先删旧日志再以追加方式打开: 各进程都用 O_APPEND 才不会互相覆盖, "w" 模式会从 0 偏移覆写 worker 的内容
-    Path(LOG_PATH).unlink(missing_ok=True)
-    logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, filename=LOG_PATH, filemode="a",
-                        encoding="utf-8")
+    # Only write the log file with --log: delete the old log first, then open in append mode; every process uses O_APPEND so they do not overwrite each other.
+    # "w" mode would overwrite worker content from offset 0
+    if cli_args.log:
+        Path(LOG_PATH).unlink(missing_ok=True)
+        logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, filename=LOG_PATH, filemode="a",
+                            encoding="utf-8", force=True)
     if cli_args.index_only:
-        # 不再采集: 重跑采集会把同一批数据再 add_files 一遍, 表里每个 episode 存两份
+        # Do not re-collect: rerunning collection would add_files the same data again, leaving two copies of every episode in the table
         build_global_index(load_existing_tables())
     else:
-        build_all()
+        build_all(cli_args.log)

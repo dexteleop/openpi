@@ -1,4 +1,4 @@
-# 运行前需设置环境变量：
+# Environment variables required before running:
 # export LINGYU_BASE_URL="xxx"
 # export LINGYU_API_KEY="sk-xxxx"
 
@@ -21,15 +21,15 @@ def _translate_via_openai(text: str) -> str:
     """
     Translate text using OpenAI SDK (compatible proxy format).
     """
-    # 缺少环境变量时 os.environ[] 直接抛 KeyError，避免带着空值发请求
-    # 环境变量只填网关根地址，这里补上 /v1；否则请求会打到网关首页并返回 HTML
+    # With missing variables os.environ[] raises KeyError directly, avoiding requests sent with empty values
+    # The environment variable holds only the gateway root address; '/v1' is appended here, otherwise requests hit the gateway's homepage and return HTML
     client = OpenAI(
         base_url=f"{os.environ['LINGYU_BASE_URL'].rstrip('/')}/v1",
         api_key=os.environ["LINGYU_API_KEY"],
     )
 
-    # 网关会丢弃 system 消息，指令必须和待翻译文本一起放进 user 消息
-    # 使用 SDK 的 TypedDict 显式构造消息，消除 PyCharm 类型检查警告（运行时仍是普通 dict）
+    # The gateway drops system messages, so the instruction must go into the user message together with the text to translate
+    # Build messages explicitly with the SDK's TypedDict to silence PyCharm type warnings (still a plain dict at runtime)
     messages = [
         ChatCompletionUserMessageParam(
             role="user",
@@ -67,6 +67,6 @@ def translate_prompts(prompts: list[str], max_workers: int = 100) -> list[str]:
     """
     Translate a batch of texts concurrently; results keep the input order.
     """
-    # 网络 IO 密集，用线程池并行请求；map 保证结果顺序与输入一致
+    # Network-IO-bound, so use a thread pool for parallel requests; map keeps result order matching the input
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         return list(executor.map(_process_single_prompt, prompts))

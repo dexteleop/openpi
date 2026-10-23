@@ -26,7 +26,7 @@ def test():
     topic_msg_defs: dict[str, str] = {}   # topic_name -> msg_def (first seen)
     log_time_first = log_time_last = 0
 
-    play_start = perf_counter()  # 播放耗时: 从取第一条消息开始计时
+    play_start = perf_counter()  # Playback time: timed from fetching the first message
     msg_gen = _play_messages(path)
     for i, message in enumerate(msg_gen):
         logger.info("  %s", message)
@@ -42,7 +42,7 @@ def test():
     play_elapsed = perf_counter() - play_start
 
     close_start = perf_counter()
-    msg_gen.close()   # 显式关闭 generator
+    msg_gen.close()   # Close the generator explicitly
     close_elapsed = perf_counter() - close_start
 
     assert counts_per_topic, "no messages found in mcap"

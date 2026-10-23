@@ -1,35 +1,35 @@
-"""拆解 forkserver 下 DataLoader worker 逐个启动时每个 worker 的耗时, 以及关闭 DataLoader 时的等待。
+"""Break down the per-worker startup cost of DataLoader workers under forkserver, and the wait when closing the DataLoader.
 
-主模块与 scripts/train.py 一样在顶层 import train, 故子进程重新执行主模块时的开销与训练时相同。
-用与 data_loader_lingyu.TorchDataLoader 相同的参数直接建 torch DataLoader(forkserver + 同一组 preload),
-只把 worker_init_fn 换成回报时间戳的版本, 子进程不取样也不碰 GPU。
+The main module imports train at top level just like scripts/train.py, so the children's cost of re-executing the main module matches training.
+It builds a torch DataLoader directly with the same parameters as data_loader_lingyu.TorchDataLoader (forkserver + the same preload set),
+only swapping worker_init_fn for a version that reports timestamps; children neither sample nor touch the GPU.
 
-核对::
-    1. 预加载 '__main__' 为何不生效: forkserver 只认 preparation data 里的 'main_path',
-       spawn.get_preparation_data 产出的却是 'init_main_from_path'
-    2. 父进程每次 start() 都要重新 pickle 一遍 dataset, 记下体积与耗时
-    3. 三种 preload 下每个 worker 的时间线:
-       fork 出来 -> 重新执行主模块(import train 的全部依赖) -> unpickle dataset -> 进入 worker_init_fn
-       现状 / 额外预加载 'train'(3.11 的 forkserver.main 收下 sys_path 却从不设置, import train 静默失败) /
-       按包名预加载 train.py 的全部顶层依赖
-    4. 关闭: worker 正在取一个 batch(64 个样本)时, _shutdown_workers 对每个 worker 依次 join(timeout=5s)
-    5. 修复后的 data_loader_lingyu.TorchDataLoader: 每次 start() 的阻塞时长, 以及关掉迭代器时
-       直接 terminate 全部 worker 的耗时(worker 同样都在取样), 关完后不留存活的 worker
-dataset 与训练相同(读图像, 会在各 GPU 起解码进程), 关闭时 worker 都在取各自的第一个 batch。
+Checks::
+    1. Why preloading '__main__' does not work: forkserver only honors 'main_path' in the preparation data,
+       while spawn.get_preparation_data produces 'init_main_from_path'
+    2. The parent re-pickles the dataset on every start(); record its size and duration
+    3. Each worker's timeline under three preload modes:
+       forked -> re-execute the main module (all of import train's dependencies) -> unpickle dataset -> enter worker_init_fn
+       status quo / additionally preloading 'train' (3.11's forkserver.main accepts sys_path but never sets it, so import train fails silently) /
+       preloading all top-level dependencies of train.py by package name
+    4. Closing: while a worker is sampling one batch (64 samples), _shutdown_workers joins each worker with timeout=5s in turn
+    5. The fixed data_loader_lingyu.TorchDataLoader: the blocking duration of each start(), and the cost of
+       terminating all workers directly when the iterator is closed (workers are all sampling too), leaving no surviving workers afterwards
+The dataset matches training (reads images, starts decode processes on each GPU); on close all workers are sampling their first batch.
 
-必须以脚本方式运行, forkserver 的子进程才会像 train.py 那样把本文件当 __mp_main__ 重新执行::
+Must run as a script so that forkserver's children re-execute this file as __mp_main__ just like train.py::
     python src/openpi/training/lingyu_dataloader_v2/test/test_forkserver_worker_startup.py
 """
 import sys
 import time
 
-# 子进程重新执行本文件时, 这两个时间戳界定了"重新执行主模块"这一段; 模块数之差即这一段新 import 的模块数
+# When a child re-executes this file, these two timestamps bound the "re-execute the main module" span; the module-count difference is the modules newly imported in it
 MODULE_IMPORT_START = time.time()
 MODULE_COUNT_START = len(sys.modules)
 
 import cProfile  # noqa: E402
 
-# worker(__mp_main__)重新执行本文件时全程 profile, 看这段时间花在哪; 主进程不 profile
+# Profile the whole span when a worker (__mp_main__) re-executes this file, to see where the time goes; the main process does not profile
 _MAIN_RERUN_PROFILER = cProfile.Profile() if __name__ == "__mp_main__" else None
 if _MAIN_RERUN_PROFILER is not None:
     _MAIN_RERUN_PROFILER.enable()
@@ -46,68 +46,68 @@ import pstats  # noqa: E402
 import tempfile  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # JAX 不碰 GPU; GPU 只给解码进程用
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # JAX never touches the GPU; the GPU is reserved for decode processes
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[5] / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
-import train  # noqa: E402  与 scripts/train.py 作为主模块时同一组顶层 import
+import train  # noqa: E402  same top-level imports as scripts/train.py as the main module
 
 import random  # noqa: E402
 
 import torch  # noqa: E402
 
-import openpi.training.data_loader_lingyu as _data_loader  # noqa: E402
+import openpi.training.data_loader as _data_loader  # noqa: E402
 from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import (  # noqa: E402
     LingyuDatasetV2, load_video_decode_config)
 from openpi.training.lingyu_dataloader_v2.test.logger import get_logger  # noqa: E402
 
 MODULE_IMPORT_END = time.time()
 MODULE_COUNT_END = len(sys.modules)
-# 子进程把时间线与 profile 写到这里; 路径经环境变量传给 forkserver 起的子进程
+# Children write their timeline and profile here; the path is passed via an environment variable to forkserver-spawned children
 _TIMELINE_DIR_ENV = "FORKSERVER_TIMELINE_DIR"
 if _MAIN_RERUN_PROFILER is not None:
     _MAIN_RERUN_PROFILER.disable()
-    if _TIMELINE_DIR_ENV in os.environ:  # spawn 起的 GPU 解码进程也是 __mp_main__, 但没有这个环境变量
+    if _TIMELINE_DIR_ENV in os.environ:  # GPU decode processes started via spawn are also __mp_main__, but lack this environment variable
         _MAIN_RERUN_PROFILER.dump_stats(f"{os.environ[_TIMELINE_DIR_ENV]}/{os.getpid()}.prof")
 
-# 子进程里本文件名为 __mp_main__, 不能再建 FileHandler(mode="w"), 否则会清空父进程的日志
+# In children this file is named __mp_main__; do not create a FileHandler(mode="w") again, or the parent's log would be truncated
 logger = get_logger(__file__) if __name__ == "__main__" else None
 
 _CONFIG_NAME = "pi0_teleavatar_v2_lingyu"
 _ICEBERG_DIR = str(Path(__file__).resolve().parents[1] / "iceberg_warehouse")
-_NUM_WORKERS = 8  # 足以看出每个 worker 的固定开销
-_BATCH_SIZE = 64  # 与训练相同, 关闭时每个 worker 手上都是一整个 batch
-# 现状(TorchDataLoader 里写死的)与额外预加载 train 两种 preload
+_NUM_WORKERS = 8  # Enough to expose each worker's fixed overhead
+_BATCH_SIZE = 64  # Same as training; on close every worker holds a full batch
+# Two preload modes: the status quo (hardcoded in TorchDataLoader) and additionally preloading train
 _PRELOAD_VARIANTS = {
-    "现状 preload": ["openpi.training.data_loader_lingyu", "openpi.training.config_lingyu"],
-    # forkserver.main 收下 sys_path 却从不设置, scripts/ 不在其 sys.path 上, import train 的 ImportError 被静默吞掉
-    "额外预加载 train": ["openpi.training.data_loader_lingyu", "openpi.training.config_lingyu", "train"],
-    # 直接按包名预加载 train.py 顶层 import 的全部模块, 不依赖 sys.path
+    "现状 preload": ["openpi.training.data_loader", "openpi.training.config"],
+    # forkserver.main accepts sys_path but never sets it; scripts/ is not on its sys.path, so import train's ImportError is silently swallowed
+    "额外预加载 train": ["openpi.training.data_loader", "openpi.training.config", "train"],
+    # Preload all modules of train.py's top-level imports directly by package name, independent of sys.path
     "预加载 train.py 的全部依赖": [
-        "openpi.training.data_loader_lingyu", "openpi.training.config_lingyu", "etils.epath", "flax.nnx",
+        "openpi.training.data_loader", "openpi.training.config", "etils.epath", "flax.nnx",
         "flax.training.common_utils", "flax.traverse_util", "jax", "optax", "tqdm_loggable.auto", "wandb",
         "openpi.models.model", "openpi.shared.array_typing", "openpi.shared.nnx_utils", "openpi.training.checkpoints",
         "openpi.training.optimizer", "openpi.training.sharding", "openpi.training.utils",
         "openpi.training.weight_loaders"],
 }
-_PROFILE_TOP = 20  # 记录 profile 里累计耗时最多的前几项
+_PROFILE_TOP = 20  # How many top cumulative-time entries from the profile to record
 
 
 def build_train_dataset():
-    """与 train.py -> data_loader_lingyu.create_torch_data_loader 相同的 dataset 与 transforms。"""
+    """The same dataset and transforms as train.py -> data_loader_lingyu.create_torch_data_loader."""
     config = train._config.get_config(_CONFIG_NAME)
     data_config = config.data.create(config.assets_dirs, config.model)
-    # 只看启动与关闭, 不关心数值, 故跳过 norm stats; 其余 transforms 与训练一致
+    # Only startup and shutdown matter, not values, so norm stats are skipped; all other transforms match training
     video_key_to_crop, image_resolution = load_video_decode_config(data_config)
     dataset = LingyuDatasetV2(_ICEBERG_DIR, video_key_to_crop=video_key_to_crop, image_resolution=image_resolution)
     return _data_loader.transform_dataset(dataset, data_config, skip_norm_stats=True)
 
 
 def read_process_start_time() -> float:
-    """从 /proc 读本进程被内核创建的绝对时间(10ms 精度)。
+    """Read this process's absolute creation time by the kernel from /proc (10ms resolution).
 
-    用 当前时间 - (开机时长 - 进程创建时的开机时长) 推算; 不用 /proc/stat 的 btime: 它是取整的秒数,
-    本机实测比真实开机时刻早 1.05s, 会让每个 worker 的 "fork->重新执行主模块" 都凭空多出约 1s。
+    Computed as current time - (uptime - uptime at process creation); /proc/stat's btime is not used: it is rounded to seconds,
+    measured 1.05s earlier than the real boot time on this machine, which would add a phantom ~1s to every worker's "fork -> re-execute main module".
     """
     uptime_seconds = float(open("/proc/uptime").read().split()[0])
     start_ticks = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19])
@@ -115,9 +115,9 @@ def read_process_start_time() -> float:
 
 
 def report_worker_timeline(worker_id: int) -> None:
-    """worker_init_fn: 进到这里说明主模块已重新执行完、dataset 已 unpickle 完, 把各阶段时间戳写成 json。"""
+    """worker_init_fn: reaching here means the main module has been re-executed and the dataset unpickled; write each stage's timestamps as json."""
     main_module = sys.modules["__mp_main__"]
-    # /proc/self/stat 第 10/12/14/15 项: minflt, majflt, utime, stime(单位 clock tick)
+    # /proc/self/stat fields 10/12/14/15: minflt, majflt, utime, stime (in clock ticks)
     proc_stat = open("/proc/self/stat").read().rsplit(")", 1)[1].split()
     clock_ticks = os.sysconf("SC_CLK_TCK")
     timeline = {
@@ -135,7 +135,7 @@ def report_worker_timeline(worker_id: int) -> None:
 
 
 def check_main_preload_key() -> None:
-    """核对 '__main__' 预加载失效的原因: forkserver 要的键与 spawn 给的键对不上。"""
+    """Check why the '__main__' preload fails: forkserver's expected key does not match spawn's provided key."""
     preparation_keys = set(multiprocessing.spawn.get_preparation_data("ignore"))
     logger.info(f"[preload] spawn.get_preparation_data 的键: {sorted(preparation_keys)}")
     logger.info(f"[preload] ForkServer.ensure_running 只转交 {{'main_path', 'sys_path'}} -> "
@@ -145,7 +145,7 @@ def check_main_preload_key() -> None:
 
 
 def measure_parent_pickle(dataset) -> None:
-    """父进程每次 start() 都会把 Process 对象(含 dataset)重新 pickle 一遍, 记下体积与耗时。"""
+    """The parent re-pickles the Process object (including the dataset) on every start(); record its size and duration."""
     start_time = time.perf_counter()
     dataset_bytes = pickle.dumps(dataset)
     dump_seconds = time.perf_counter() - start_time
@@ -154,7 +154,7 @@ def measure_parent_pickle(dataset) -> None:
 
 
 def start_loader_workers(dataset, preload: list[str], label: str):
-    """按 TorchDataLoader 的参数建 forkserver DataLoader 并起全部 worker, 返回 (迭代器, 父进程逐个 start 的耗时)。"""
+    """Build a forkserver DataLoader with TorchDataLoader's parameters, start all workers, and return (iterator, main process's per-start durations)."""
     mp_context = multiprocessing.get_context("forkserver")
     mp_context.set_forkserver_preload(preload)
     torch_loader = torch.utils.data.DataLoader(
@@ -165,11 +165,11 @@ def start_loader_workers(dataset, preload: list[str], label: str):
     start_seconds = []
     original_start = multiprocessing.process.BaseProcess.start
     loop_start = time.time()
-    # 只为计时: 包一层 start, 记录父进程每次 start() 的阻塞时长
+    # Timing only: wrap start to record how long each start() blocks the parent
     multiprocessing.process.BaseProcess.start = lambda process: start_seconds.append(
         _timed_call(original_start, process))
     try:
-        loader_iter = iter(torch_loader)  # 返回时全部 worker 已 start()
+        loader_iter = iter(torch_loader)  # When this returns, all workers have started
     finally:
         multiprocessing.process.BaseProcess.start = original_start
     logger.info(f"[{label}] {_NUM_WORKERS} 个 worker 全部 start() 返回, 共 {time.time() - loop_start:.2f}s; "
@@ -178,14 +178,14 @@ def start_loader_workers(dataset, preload: list[str], label: str):
 
 
 def _timed_call(function, *args) -> float:
-    """调用 function(*args), 返回耗时秒数。"""
+    """Call function(*args) and return the elapsed seconds."""
     start_time = time.perf_counter()
     function(*args)
     return time.perf_counter() - start_time
 
 
 def log_worker_timelines(timeline_dir: str, loop_start: float, label: str) -> None:
-    """等全部 worker 写完时间线, 逐个记录各阶段耗时。"""
+    """Wait for all workers to finish writing timelines, then record each stage's duration."""
     deadline = time.time() + 600
     while len(list(Path(timeline_dir).glob("*.json"))) < _NUM_WORKERS and time.time() < deadline:
         time.sleep(0.5)
@@ -203,7 +203,7 @@ def log_worker_timelines(timeline_dir: str, loop_start: float, label: str) -> No
     worker_seconds = [later["init_enter"] - earlier["init_enter"] for earlier, later in zip(timelines, timelines[1:])]
     logger.info(f"[{label}] 相邻 worker 就绪间隔平均 {sum(worker_seconds) / len(worker_seconds):.2f}s")
 
-    # 最后一个 worker 的 profile: 重新执行主模块这段, 累计耗时最多的调用
+    # The last worker's profile: the top cumulative-time calls in the re-execute-main-module span
     profile_path = sorted(Path(timeline_dir).glob("*.prof"), key=os.path.getmtime)[-1]
     profile_text = io.StringIO()
     pstats.Stats(str(profile_path), stream=profile_text).sort_stats("cumulative").print_stats(_PROFILE_TOP)
@@ -211,7 +211,7 @@ def log_worker_timelines(timeline_dir: str, loop_start: float, label: str) -> No
 
 
 def measure_shutdown(loader_iter, label: str) -> None:
-    """worker 正在取样时关闭: _shutdown_workers 依次 join(timeout=MP_STATUS_CHECK_INTERVAL), 记录每个 join 的耗时。"""
+    """Close while workers are sampling: _shutdown_workers joins each with timeout=MP_STATUS_CHECK_INTERVAL in turn; record each join's duration."""
     join_seconds = []
     original_join = multiprocessing.process.BaseProcess.join
     multiprocessing.process.BaseProcess.join = lambda process, timeout=None: join_seconds.append(
@@ -227,8 +227,8 @@ def measure_shutdown(loader_iter, label: str) -> None:
 
 
 def check_fixed_torch_data_loader(dataset) -> None:
-    """修复后的 TorchDataLoader: 预加载 train.py 依赖后 start() 不再逐个阻塞数秒, 关迭代器时直接 terminate worker。"""
-    multiprocessing.forkserver._forkserver._stop()  # 用 TorchDataLoader 自己设置的 preload 起新的 forkserver
+    """The fixed TorchDataLoader: after preloading train.py's dependencies start() no longer blocks for seconds one by one, and closing the iterator terminates workers directly."""
+    multiprocessing.forkserver._forkserver._stop()  # Start a fresh forkserver with TorchDataLoader's own preload settings
     data_loader = _data_loader.TorchDataLoader(
         dataset, local_batch_size=_BATCH_SIZE, shuffle=True, num_workers=_NUM_WORKERS, framework="pytorch")
     start_seconds = []
@@ -238,19 +238,19 @@ def check_fixed_torch_data_loader(dataset) -> None:
     start_time = time.perf_counter()
     try:
         batch_iter = iter(data_loader)
-        first_batch = next(batch_iter)  # 生成器里的 iter(torch loader) 起全部 worker, 再等第一个 batch
+        first_batch = next(batch_iter)  # iter(torch loader) inside the generator starts all workers, then waits for the first batch
     finally:
         multiprocessing.process.BaseProcess.start = original_start
     logger.info(f"[修复后 TorchDataLoader] 第一个 batch(含 forkserver 与 worker 启动) {time.perf_counter() - start_time:.2f}s, "
                 f"每次 start() 阻塞 {[round(seconds, 2) for seconds in start_seconds]}, "
                 f"actions {tuple(first_batch['actions'].shape)}")
     assert len(start_seconds) == _NUM_WORKERS, f"应起 {_NUM_WORKERS} 个 worker, 实际 {len(start_seconds)}"
-    # 第一个 start() 含 forkserver 自身的启动与预加载, 只看其后
+    # The first start() includes the forkserver's own startup and preload; only the rest is meaningful
     assert max(start_seconds[1:]) < 1.0, "worker 仍在逐个阻塞, train.py 的依赖没有被预加载"
 
     workers = list(data_loader.torch_loader._iterator._workers)
     start_time = time.perf_counter()
-    batch_iter.close()  # 与 train.py 结束时的 data_iter.close() 相同
+    batch_iter.close()  # Same as train.py's data_iter.close() when training ends
     close_seconds = time.perf_counter() - start_time
     logger.info(f"[修复后 TorchDataLoader] 关闭 {len(workers)} 个正在取样的 worker 共 {close_seconds:.2f}s, "
                 f"存活 {sum(worker.is_alive() for worker in workers)} 个")
@@ -259,12 +259,12 @@ def check_fixed_torch_data_loader(dataset) -> None:
 
 
 def test():
-    """核对 preload 失效原因与 pickle 开销, 再对比两种 preload 下 worker 的启动时间线与关闭耗时。"""
+    """Check the preload failure reason and pickle overhead, then compare worker startup timelines and shutdown cost under the two preload modes."""
     check_main_preload_key()
     dataset = build_train_dataset()
     measure_parent_pickle(dataset)
     for label, preload in _PRELOAD_VARIANTS.items():
-        # 每种 preload 都要一个新的 forkserver: 已在运行的 server 不会重新预加载
+        # Each preload mode needs a fresh forkserver: an already-running server does not preload again
         multiprocessing.forkserver._forkserver._stop()
         timeline_dir = tempfile.mkdtemp(prefix="forkserver_timeline_")
         os.environ[_TIMELINE_DIR_ENV] = timeline_dir

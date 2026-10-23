@@ -1,11 +1,11 @@
 """
-用 MCAP_Player 播放 mcap 的前 2000 条 message, 其中属于 state/action 的交给
-MCAP_Message_Fetcher 取出 ros2 message, 再用 ros2_message_filter 按配置提取字段,
-校验取出的 {字段名: 数组} 与 message 上该字段的值逐元素一致。
+Play the first 2000 messages of an mcap with MCAP_Player, hand the state/action ones to
+MCAP_Message_Fetcher to get ros2 messages, then extract fields per config with ros2_message_filter,
+verifying the extracted {field name: array} matches the message's own field values element-wise.
 
-关键点是同为 sensor_msgs/JointState 的 topic 取的字段并不相同:
-手臂取 position, 夹爪取 effort, 所以必须逐 topic 查配置, 不能统一取某个字段。
-配置的键已是 mcap topic 名, 故与 MCAP_Player 播出的 topic_name 直接比对, 不经映射表。
+The key point: topics that are both sensor_msgs/JointState take different fields:
+arms take position, grippers take effort, so the config must be queried per topic rather than taking one uniform field.
+The config's keys are already mcap topic names, so they compare directly against MCAP_Player's topic_name without the mapping table.
 """
 from collections import defaultdict
 import numpy as np
@@ -19,11 +19,11 @@ from openpi.training.lingyu_dataloader_v2.test.logger import get_logger
 
 logger = get_logger(__file__)
 
-_MAX_PLAYED_MESSAGES = 2000  # 只读前若干条, 够覆盖全部 state/action topic 即可
+_MAX_PLAYED_MESSAGES = 2000  # Read only the first few messages; enough to cover all state/action topics
 
 
 def test_ros2_message_filter():
-    """前 2000 条 message 中的每条 state/action message 都能按配置取出正确的字段。"""
+    """Every state/action message among the first 2000 has its fields extracted correctly per config."""
     path = next(iter(find_mcap_url_and_prompt_pairs()))
     state_and_action_fields = load_mcap_state_and_action_topics_fields()
     player = MCAP_Player(path)
@@ -31,7 +31,7 @@ def test_ros2_message_filter():
     logger.info("播放 %s 前 %d 条 message, 待测 topic 数: %d",
                 path, _MAX_PLAYED_MESSAGES, len(state_and_action_fields))
 
-    filtered_counts = defaultdict(int)  # topic -> 已校验的 message 条数
+    filtered_counts = defaultdict(int)  # topic -> messages verified
     for played_idx, message in enumerate(player.play_messages()):
         if played_idx >= _MAX_PLAYED_MESSAGES:
             break
@@ -39,11 +39,11 @@ def test_ros2_message_filter():
         if topic_name not in state_and_action_fields:
             continue
 
-        # player 定位 -> fetcher 取 message -> filter 按配置提字段
+        # player locating -> fetcher fetching the message -> filter extracting fields per config
         ros2_message = fetcher.fetch_message(msg_type, msg_def, locations)[-1]
         fields_data = ros2_message_filter(topic_name, ros2_message)
 
-        # 键必须与配置登记的字段一一对应, 值必须逐元素等于 message 上该字段的值
+        # Keys must correspond one to one to the config's registered fields, and values must equal the message's own field values element-wise
         fields = state_and_action_fields[topic_name]
         assert fields_data.keys() == set(fields), \
             f"{topic_name} 返回的字段 {sorted(fields_data)} 与配置 {fields} 不符"

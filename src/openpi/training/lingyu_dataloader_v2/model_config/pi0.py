@@ -7,8 +7,8 @@ ACTION_CHUNK_LENGTH = 100
 ######
 # State Concat and Action Concat Config
 ######
-# 拼接顺序即模型 state/action 向量的维度顺序: (mcap topic, 该 topic 取的字段)
-# 字段须已登记在 mcap_config 的 MCAP_STATE_and_ACTION_TOPICS_FIELDS 中
+# The concat order is the dimension order of the model's state/action vectors: (mcap topic, the field taken from that topic)
+# Fields must already be registered in mcap_config's MCAP_STATE_and_ACTION_TOPICS_FIELDS
 STATE_CONCAT = (
     ('/left_arm/joint_states',   'position'),
     ('/right_arm/joint_states',  'position'),

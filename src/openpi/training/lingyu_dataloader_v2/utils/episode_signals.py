@@ -1,9 +1,9 @@
-"""读取标记 episode 起止的按键信号配置。
+"""Read the key-signal config marking episode start/end.
 
-EPISODE_SIGNAL 里写的已是 mcap 中实际存在的 topic 名, 无需经映射表换算。
-配置从 mcap_config.config 读取, 本模块不关心当前是哪台机器人。
+EPISODE_SIGNAL already holds topic names that actually exist in the mcap, no mapping-table conversion needed.
+The config is read from mcap_config.config; this module does not care which robot is current.
 
-用法::
+Usage::
     from openpi.training.lingyu_dataloader_v2.utils.episode_signals import set_episode_signal
 
     signal_topic, start_button_idx, end_button_idx = set_episode_signal()
@@ -13,6 +13,6 @@ from openpi.training.lingyu_dataloader_v2.mcap_config.config import load_mcap_ep
 
 
 def set_episode_signal() -> tuple[str, int, int]:
-    """把 EPISODE_SIGNAL 拆成 (signal_topic, start_button_idx, end_button_idx)。"""
+    """Split EPISODE_SIGNAL into (signal_topic, start_button_idx, end_button_idx)."""
     episode_signal = load_mcap_episode_topic_signal()
     return episode_signal["topic_name"], episode_signal["start"], episode_signal["end"]

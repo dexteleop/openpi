@@ -1,21 +1,21 @@
 """
-用于 TeleAvatarV2 topics 对齐 Standard topics
+Map TeleAvatarV2 topics to Standard topics
 {Standard topics： TeleAvatarV2 topics}
-TeleAvatarV2 topics 只能对应一个 Standard topics
-一个 Standard topics 能够对应多个 TeleAvatarV2 topics
+A TeleAvatarV2 topic maps to exactly one Standard topic
+while one Standard topic can correspond to multiple TeleAvatarV2 topics
 """
 ######
 # Standard Topics Config
 ######
 
-MCAP_TOPICS_MAPPING = { # 标准 topic: MCAP topic
-    ## 常用Topic
-    # 三路摄像头
+MCAP_TOPICS_MAPPING = { # standard topic: MCAP topic
+    ## Commonly used topics
+    # Three cameras
     '/xr_video_topic/ffmpeg': ('/xr_video_topic/ffmpeg',),
     '/right/color/image_raw/ffmpeg': ('/right/color/image_raw/ffmpeg',),
     '/left/color/image_raw/ffmpeg': ('/left/color/image_raw/ffmpeg',),
 
-    # 双臂状态
+    # Dual-arm state
     '/left_arm/joint_states': ('/left_arm/joint_states',),
     '/left_arm/current_ee_pose': ('/left_arm/current_ee_pose',),
     '/left_gripper/joint_states': ('/left_gripper/joint_states',),
@@ -23,7 +23,7 @@ MCAP_TOPICS_MAPPING = { # 标准 topic: MCAP topic
     '/right_arm/current_ee_pose': ('/right_arm/current_ee_pose',),
     '/right_gripper/joint_states': ('/right_gripper/joint_states',),
 
-    # 双臂指令
+    # Dual-arm commands
     '/left_arm/joint_cmd': ('/left_arm/joint_cmd',),
     '/left_arm/target_ee_pose': ('/left_arm/target_ee_pose',),
     '/left_gripper/joint_cmd': ('/left_gripper/joint_cmd',),
@@ -31,8 +31,8 @@ MCAP_TOPICS_MAPPING = { # 标准 topic: MCAP topic
     '/right_arm/target_ee_pose': ('/right_arm/target_ee_pose',),
     '/right_gripper/joint_cmd': ('/right_gripper/joint_cmd',),
 
-    ## 不常用Topic
-    # 底盘指令
+    ## Rarely used topics
+    # Chassis commands
     '/chassis/joint_cmd': ('/chassis/joint_cmd',),
     '/chassis/joint_states': ('/chassis/joint_states',),
     '/chassis_target_vel': ('/chassis_target_vel',),
@@ -40,7 +40,7 @@ MCAP_TOPICS_MAPPING = { # 标准 topic: MCAP topic
     '/kinco/actual_velocity': ('/kinco/actual_velocity',),
     '/kinco/motor_state': ('/kinco/motor_state',),
 
-    # 以下Topic经常用不到
+    # The following topics are rarely used
     '/left_hand_position': ('/left_hand_position',),
     '/left_shoulder_position': ('/left_shoulder_position',),
     '/left_target_ee_pose': ('/left_target_ee_pose',),
@@ -80,7 +80,7 @@ MCAP_TOPICS_MAPPING = { # 标准 topic: MCAP topic
 }
 
 
-MODEL_SELECTED_TOPICS = { # 标准topic: 该topic在训练样本中的角色 obs/state/action
+MODEL_SELECTED_TOPICS = { # standard topic: the topic's role in training samples obs/state/action
     '/xr_video_topic/ffmpeg': 'obs',
     '/right/color/image_raw/ffmpeg': 'obs',
     '/left/color/image_raw/ffmpeg': 'obs',
@@ -108,18 +108,18 @@ MCAP_VIDEO_TOPICS_GOP = { # MCAP topics
 # Sample Extractor Config
 MCAP_EPISODE_TOPIC_SIGNAL = { # MCAP topic
     'topic_name': '/xr/left_hand_inputs',
-    'start': 2,   # 数组idx为2的数是否出现变化沿
-    'end': 3,     # 数组idx为3的数是否出现变化沿
+    'start': 2,   # whether the value at array idx 2 shows an edge transition
+    'end': 3,     # whether the value at array idx 3 shows an edge transition
 }
 
 
 # State and Action Message Filter Config
-MCAP_STATE_and_ACTION_TOPICS_FIELDS = { # MCAP topic: 所需消息字段 (嵌套字段用 flatten_msg 的点分路径表示)
-    # 双臂 state — sensor_msgs/JointState
+MCAP_STATE_and_ACTION_TOPICS_FIELDS = { # MCAP topic: required message fields (nested fields use flatten_msg's dotted paths)
+    # Dual-arm state — sensor_msgs/JointState
     '/left_arm/joint_states':        ('position',),
     '/right_arm/joint_states':       ('position',),
 
-    # 双臂 action — sensor_msgs/JointState
+    # Dual-arm action — sensor_msgs/JointState
     '/left_arm/joint_cmd':           ('position',),
     '/left_gripper/joint_cmd':       ('effort',),
     '/right_arm/joint_cmd':          ('position',),

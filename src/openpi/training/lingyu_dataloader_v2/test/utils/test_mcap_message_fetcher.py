@@ -24,7 +24,7 @@ _VALUE_PREVIEW_COUNT = 6  # array / sequence elements kept in the log preview
 
 
 def _describe_type(typestore, msg_type: str, depth: int = 0) -> list[str]:
-    """递归展开 msg_type 的字段树, 返回缩进文本行列表。深度超过上限时折叠。"""
+    """Recursively expand msg_type's field tree into a list of indented text lines; fold beyond the depth limit."""
     indent = " " * (depth * 2)
     if depth > _STRUCTURE_MAX_DEPTH:
         return [indent + "..."]
@@ -32,12 +32,12 @@ def _describe_type(typestore, msg_type: str, depth: int = 0) -> list[str]:
     lines = []
     for fname, ftype in fields:
         kind = ftype[0]
-        if kind == Nodetype.BASE:                     # 基础类型: ('float64', 0)
+        if kind == Nodetype.BASE:                     # Base type: ('float64', 0)
             lines.append(f"{indent}{fname}: {ftype[1][0]}")
-        elif kind == Nodetype.NAME:                   # 嵌套 message, 递归展开
+        elif kind == Nodetype.NAME:                   # Nested message, expand recursively
             lines.append(f"{indent}{fname}: {ftype[1]}")
             lines.extend(_describe_type(typestore, ftype[1], depth + 1))
-        else:                                         # SEQUENCE / ARRAY, 取内层类型
+        else:                                         # SEQUENCE / ARRAY, take the inner type
             inner_kind, inner_args = ftype[1][0]
             container = "sequence" if kind == Nodetype.SEQUENCE else "array"
             if inner_kind == Nodetype.BASE:
@@ -49,7 +49,7 @@ def _describe_type(typestore, msg_type: str, depth: int = 0) -> list[str]:
 
 
 def _sample_value(msg) -> list[str]:
-    """把一条 ROS2 message 对象的字段值转成可读文本, 长数组只留前几项。"""
+    """Turn one ROS2 message object's field values into readable text, keeping only the first few items of long arrays."""
     lines = []
     for fname, val in vars(msg).items():
         if fname.startswith("_"):
@@ -63,12 +63,12 @@ def _sample_value(msg) -> list[str]:
 
 
 def test():
-    """每个 msg_type 都能由 msg_def 解析出类型结构, 并反序列化出实际字段值。"""
+    """Every msg_type's structure can be parsed from msg_def, and real field values deserialized."""
     path = next(iter(find_mcap_url_and_prompt_pairs()))
     logger.info("mcap file: %s", path)
 
     fetcher = MCAP_Message_Fetcher()
-    seen_types: dict[str, tuple[str, tuple]] = {}  # msg_type -> (msg_def, 首次出现的 location)
+    seen_types: dict[str, tuple[str, tuple]] = {}  # msg_type -> (msg_def, the location of first appearance)
     seen_topics: dict[str, str] = {}               # topic_name -> msg_type
     played_count = 0
 
@@ -87,17 +87,17 @@ def test():
     assert seen_types, "mcap file must contain at least one msg_type"
 
     for msg_type, (msg_def, location) in sorted(seen_types.items()):
-        # 读取ros2原始的结构化消息
+        # Read the raw structured ros2 message
         sample_msg = fetcher.fetch_message(msg_type, msg_def, [location])[0]
 
-        # 确保所有的 ros2 msg 都可以被解析
+        # Ensure every ros2 msg can be parsed
         assert msg_type in fetcher._typestore.fielddefs, (
             f"{msg_type} must be resolvable from its msg_def"
         )
         logger.info("\n--- type structure: %s ---\n%s",
                     msg_type, "\n".join(_describe_type(fetcher._typestore, msg_type)))
 
-        # 展示 ros2 msg 反序列化后的情况
+        # Show what the ros2 msg looks like after deserialization
         assert type(sample_msg).__msgtype__ == msg_type, "反序列化结果类型必须与 msg_type 一致"
         logger.info("--- sample values: %s ---\n%s",
                     msg_type, "\n".join(_sample_value(sample_msg)))
