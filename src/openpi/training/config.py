@@ -1150,7 +1150,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 action_sequence_keys=("action",),  # Use 'action' not 'actions'
                 prompt_from_task=True,
-                iceberg_dir="/mnt/dex/a800/home/shihaoran/openpi/src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse",
+                iceberg_dir="~/openpi/src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse",
             ),
         ),
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
