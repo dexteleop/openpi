@@ -17,7 +17,6 @@ import posixpath
 import boto3
 from botocore.config import Config
 
-from openpi.training.lingyu_dataloader_v2.utils._prompt_translator import translate_prompts
 from openpi.training.lingyu_dataloader_v2.utils._read_csv_columns import read_rosbag_dirs_from_csv
 
 # Project root (openpi/); the data platform's exported csv goes here
@@ -76,8 +75,4 @@ def find_mcap_url_and_prompt_pairs() -> dict[str, str]:
         # Put the {mcap_url, prompt} pairs into mcap_urls
         mcap_urls.update(dict.fromkeys(found, prompt))
 
-    # Job names mix English and Chinese; translate all to English, deduplicating first so each job name is requested once
-    prompts = list(dict.fromkeys(mcap_urls.values()))
-    prompts_en = dict(zip(prompts, translate_prompts(prompts, max_workers=100)))
-
-    return {mcap_url: prompts_en[prompt] for mcap_url, prompt in mcap_urls.items()}
+    return mcap_urls

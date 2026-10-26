@@ -21,7 +21,7 @@ export KEY_PREFIX="<name>"
 | collect-algo-2601016/DF-33/4MI0/20260721-4MI0_20260923-100302-383890_20260923-101920-781126 | Put an apple into the bowl. |
 | ... | ... |
 - `rosbag文件夹路径`：OSS 桶内的对象前缀，与 `KEY_PREFIX` 拼接后在 `lingyu-wulan-pai-oss` 桶中查找其下的 `.mcap` 文件
-- `所属作业`：提示词（prompt），索引构建时会自动翻译为英文。翻译过程在 src/openpi/training/lingyu_dataloader_v2/utils/_prompt_translator.py。
+- `所属作业`：提示词（prompt），索引构建时按 csv 原文直接使用（默认为英文）。
 
 >.csv的文件名称可任意，但是openpi项目目录下只能有一个.csv
 

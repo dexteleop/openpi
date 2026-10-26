@@ -9,7 +9,6 @@ decoding again in reverse order verifies that the resident decoder reused across
 """
 import itertools
 import os
-from unittest.mock import patch
 
 import numpy as np
 from openpi_client import image_tools
@@ -85,9 +84,8 @@ def test_gpu():
     and the GPU result is likewise put through resize_with_pad (only black-border padding) before comparing.
     Crop/scale parameters come from the openpi config via load_video_decode_config, same as training; the control group runs openpi's original code:
     """
-    # Only one mcap path is needed; the prompt is unused, so translation is skipped (translation needs extra LINGYU_* environment variables)
-    with patch.object(search_mcap_on_s3, "translate_prompts", lambda prompts, max_workers: prompts):
-        path = next(iter(find_mcap_url_and_prompt_pairs()))
+    # Only one mcap path is needed; the prompt is unused
+    path = next(iter(find_mcap_url_and_prompt_pairs()))
     train_config = _config.get_config(_CONFIG_NAME)
     video_key_to_crop, image_resolution = load_video_decode_config(
         train_config.data.create(train_config.assets_dirs, train_config.model))
