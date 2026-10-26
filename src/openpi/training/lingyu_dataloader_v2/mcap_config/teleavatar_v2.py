@@ -83,17 +83,3 @@ MCAP_EPISODE_TOPIC_SIGNAL = { # MCAP topic
     'start': 2,   # whether the value at array idx 2 shows an edge transition
     'end': 3,     # whether the value at array idx 3 shows an edge transition
 }
-
-
-# State and Action Message Filter Config
-MCAP_STATE_and_ACTION_TOPICS_FIELDS = { # MCAP topic: required message fields (nested fields use flatten_msg's dotted paths)
-    # Dual-arm state — sensor_msgs/JointState
-    '/left_arm/joint_states':        ('position',),
-    '/right_arm/joint_states':       ('position',),
-
-    # Dual-arm action — sensor_msgs/JointState
-    '/left_arm/joint_cmd':           ('position',),
-    '/left_gripper/joint_cmd':       ('effort',),
-    '/right_arm/joint_cmd':          ('position',),
-    '/right_gripper/joint_cmd':      ('effort',),
-}

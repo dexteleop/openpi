@@ -8,12 +8,11 @@ Every robot config file must provide the same-named constants; note which topic 
     USER_SELECTED_TOPICS             {standard topic: obs/state/action}; keys must go through the mapping table before use
     TELEAVATAV2_VIDEO_TOPICS_GOP     mcap topic names, usable directly
     EPISODE_SIGNAL                   mcap topic name, usable directly; {topic_name, start, end}
-    TELEAVATAV2_STATE_and_ACTION_TOPICS_FIELDS
-                                     mcap topic names, usable directly; {mcap topic: (required fields, ...)}
 """
 from __future__ import annotations
 
 from openpi.training.lingyu_dataloader_v2.mcap_config import teleavatar_v2  # Switching robots only changes this line
+from openpi.training.lingyu_dataloader_v2.model_config.config import load_state_and_action_concat
 
 
 ROBOT = "teleavatar_v2" # TODO: pick which robot's mcap to use
@@ -68,12 +67,10 @@ def load_mcap_episode_topic_signal() -> dict:
 #####
 
 def load_mcap_state_and_action_topics_fields() -> dict[str, tuple[str, ...]]:
-    """Return the current robot's {mcap topic: (required fields, ...)}; keys are already mcap topic names, no mapping needed."""
-    if ROBOT == "teleavatar_v2":
-        return teleavatar_v2.MCAP_STATE_and_ACTION_TOPICS_FIELDS
-    # TODO: elif other robots' constant configs
-    else:
-        raise ValueError(
-            f"Cannot find the relevant robot configuration of {ROBOT!r} "
-            f"in lingyu_dataloader_v2/robots_config."
-        )
+    """Return {mcap topic: (required fields, ...)}; keys are already mcap topic names, no mapping needed."""
+    # topic 与字段的唯一来源是 model_config 的 STATE_CONCAT/ACTION_CONCAT，机器人侧不再单独登记
+    state_concat, action_concat = load_state_and_action_concat()
+    state_and_action_fields = {}  # 同一 topic 需要多个字段时在此聚合成一个 tuple
+    for mcap_topic, field_name in state_concat + action_concat:
+        state_and_action_fields[mcap_topic] = state_and_action_fields.get(mcap_topic, ()) + (field_name,)
+    return state_and_action_fields
