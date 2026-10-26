@@ -26,6 +26,7 @@ import openpi.policies.teleavatar_v2_policy_norm as teleavatar_v2_policy_norm
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -1121,7 +1122,7 @@ _CONFIGS = [
             action_horizon=30
         ),
         data=LeRobotTeleavatarV2DataConfig(
-            repo_id="MK_tower_floor2_lerobot_45fps",  # Your local dataset name
+            repo_id="path-to-dataset",  # Your local dataset name
             base_config=DataConfig(
                 prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -1363,6 +1364,10 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    #
+    # RoboArena configs.
+    #
+    *roboarena_config.get_roboarena_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
