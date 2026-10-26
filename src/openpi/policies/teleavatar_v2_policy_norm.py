@@ -9,16 +9,6 @@ from openpi.models import model as _model
 
 logger = logging.getLogger(__name__)
 
-
-def make_teleavatar_example() -> dict:
-    """Creates a random input example for the Teleavatar policy (v2 robot formats)."""
-    return {
-        "observation/state": np.random.rand(62),
-        "actions": np.random.rand(62),
-        "prompt": "pick a cube and place it on another cube",
-    }
-
-
 # v2 platform gripper force control: the controller takes a float32 trigger
 # value in [0, 1] and maps it to a gripper effort (Nm) with a piecewise-linear,
 # non-proportional curve, identical for both arms (unlike v1, which was

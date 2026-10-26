@@ -3,12 +3,12 @@ The data platform's rosbags live on S3, and the csv's "rosbag folder path" is th
 so mcap_url is simply the in-bucket key, no longer going through a local mount.
 
 Environment variables required before running:
-    export S3_ENDPOINT="http://x.x.x.x:19000"
-    export REGION_NAME="us-east-1"
     export ACCESS_KEY_ID="xxx"
     export SECRET_ACCESS_KEY="xxx"
-    export BUCKET_NAME="xxx"
-    export KEY_PREFIX="shihaoran"  # Optional: prefix between the bucket and the csv paths; empty if unset
+    export S3_ENDPOINT="https://oss-cn-wulanchabu-internal.aliyuncs.com"
+    export REGION_NAME="cn-wulanchabu"
+    export BUCKET_NAME="lingyu-wulan-pai-oss"
+    export KEY_PREFIX="xxx"  # Optional: prefix between the bucket and the csv paths; empty if unset
 """
 import glob
 import logging

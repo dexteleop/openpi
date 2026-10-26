@@ -15,7 +15,6 @@ import tarfile
 from pathlib import Path
 
 import numpy as np
-from torch.utils.data import IterableDataset as TorchIterableDataset
 import tqdm
 import tyro
 

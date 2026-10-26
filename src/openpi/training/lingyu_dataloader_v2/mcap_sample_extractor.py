@@ -46,7 +46,7 @@ from openpi.training.lingyu_dataloader_v2.utils.episode_signals import set_episo
 from openpi.training.lingyu_dataloader_v2.model_config.config import load_action_chunk_length
 
 # Constants
-MIN_EPISODE_LENGTH = 60 # An episode needs at least 2 seconds
+MIN_EPISODE_LENGTH = 180 # An episode needs at least 4 seconds
 ACTION_OFFSET_RATIO = 1.0 / 3.0
 # Episode start/end key signals: kept hardcoded here and not read from mcap_config, as this and build_sample_idx.py are two independent sources
 MCAP_SIGNAL_TOPIC, X_BUTTON, Y_BUTTON = set_episode_signal()
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 class MCAPSampleExtractor:
     """Replay one mcap and record which message each sample selects per topic."""
 
-    def __init__(self, mcap_path: str, fps: int = 30):
+    def __init__(self, mcap_path: str, fps: int = 45):
         self.mcap_path = mcap_path
         self.mcap_name = Path(mcap_path).name
         # source_id: one mcap is one source; the file name without its extension already identifies one recording uniquely
