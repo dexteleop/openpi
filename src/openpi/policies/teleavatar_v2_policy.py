@@ -32,6 +32,10 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+# 各路相机从左右拼接的双目帧里保留哪只眼(键为 openpi 图像名的末段); LingyuDatasetV2 的 GPU 解码按同一规则裁剪
+STEREO_EYES = {"head_camera": "left", "left_color": "right", "right_color": "left"}
+
+
 def _extract_stereo_view(image: np.ndarray, side: str, *, rotate: bool = False) -> np.ndarray:
     """Crop one eye from a side-by-side stereo frame, optionally rotating 180°
     first (rotation applies to the full stereo frame, before the crop).
@@ -114,6 +118,10 @@ class TeleavatarInputs(transforms.DataTransformFn):
     # generic DeltaActions transform, since state (14-dim) and actions
     # (16-dim, gripper-interleaved) don't share a layout it can index by position.
     use_delta_joint_actions: bool = False
+    # True: state/action 已由按下面格式拼接好，不再按 62 维下标选取。openpi需要的格式：
+    # (state 14 维 [左臂7, 右臂7], action 16 维 [左臂7, 左夹爪1, 右臂7, 右夹爪1])
+    # 则 state_action_selected=True。没有进行选择的使用False来进行管理
+    state_action_selected: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Parse images to uint8 (H,W,C) format
@@ -129,18 +137,22 @@ class TeleavatarInputs(transforms.DataTransformFn):
         # _extract_stereo_view makes all three no-ops when frames already
         # arrive cropped (by ros2_interface) or mono (v1 robot left/right).
         head_color = _extract_stereo_view(
-            head_color, "left", rotate=self.rotate_head_camera
+            head_color, STEREO_EYES["head_camera"], rotate=self.rotate_head_camera
         )
-        left_color = _extract_stereo_view(left_color, "right")
-        right_color = _extract_stereo_view(right_color, "left")
+        left_color = _extract_stereo_view(left_color, STEREO_EYES["left_color"])
+        right_color = _extract_stereo_view(right_color, STEREO_EYES["right_color"])
 
         # Extract 14-dim state from the observation vector (62-dim on v2,
         # 48-dim on v1 — position indices are identical in both layouts).
         # Input layout: [positions(0-15), velocities(16-31), efforts(32-47), (v2) ee_pose(48-61)]
-        state_14d = np.concatenate([
-            data["observation/state"][0:7],    # Left arm positions (indices 0-6)
-            data["observation/state"][8:15],   # Right arm positions (indices 8-14)
-        ], axis=0)
+        if self.state_action_selected:
+            state_14d = np.asarray(data["observation/state"])
+            assert state_14d.shape == (14,), f"state 应为 14 维, 实际 {state_14d.shape}"
+        else:
+            state_14d = np.concatenate([
+                data["observation/state"][0:7],    # Left arm positions (indices 0-6)
+                data["observation/state"][8:15],   # Right arm positions (indices 8-14)
+            ], axis=0)
 
         # Create inputs dict. Do not change the keys in the dict below.
         # Pi0 models support three image inputs: one third-person view and two wrist views.
@@ -169,12 +181,18 @@ class TeleavatarInputs(transforms.DataTransformFn):
 
             # Extract 16 dimensions: joint positions (14) + gripper efforts (2)
             # Note: State only uses 14 dims (joint positions), but actions include gripper efforts
-            selected_actions = np.concatenate([
-                action_data[:, 0:7],    # Left arm positions
-                action_data[:, 39:40],  # Left gripper effort (index 39 = 32+7)
-                action_data[:, 8:15],   # Right arm positions
-                action_data[:, 47:48],  # Right gripper effort (index 47 = 32+15)
-            ], axis=1)  # Concatenate along action dimension
+            if self.state_action_selected:
+                # 复制一份: 下面会就地改写夹爪列与 delta
+                selected_actions = np.array(action_data, dtype=np.float32)
+                assert selected_actions.ndim == 2 and selected_actions.shape[1] == 16, \
+                    f"action 应为 (action_horizon, 16), 实际 {selected_actions.shape}"
+            else:
+                selected_actions = np.concatenate([
+                    action_data[:, 0:7],    # Left arm positions
+                    action_data[:, 39:40],  # Left gripper effort (index 39 = 32+7)
+                    action_data[:, 8:15],   # Right arm positions
+                    action_data[:, 47:48],  # Right gripper effort (index 47 = 32+15)
+                ], axis=1)  # Concatenate along action dimension
 
             # Convert raw gripper efforts (Nm) to the normalized [0, 1]
             # trigger range (same curve for both arms on v2). This runs before

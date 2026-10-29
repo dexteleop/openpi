@@ -10,11 +10,28 @@ import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+import time
 
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import LingyuDatasetV2
+from openpi.training.lingyu_dataloader_v2.lingyu_dataset_v2 import load_video_decode_config
 import openpi.transforms as _transforms
+
+# scripts/train.py 的全部顶层 import(按包名): forkserver 预加载它们, worker 重新执行 train.py 时就都已在 sys.modules 里
+_TRAIN_SCRIPT_IMPORTS = [
+    "etils.epath", "flax.nnx", "flax.training.common_utils", "flax.traverse_util", "jax", "optax",
+    "tqdm_loggable.auto", "wandb", "openpi.models.model", "openpi.shared.array_typing", "openpi.shared.nnx_utils",
+    "openpi.training.checkpoints", "openpi.training.config", "openpi.training.data_loader", "openpi.training.optimizer",
+    "openpi.training.sharding", "openpi.training.utils", "openpi.training.weight_loaders",
+]
+
+# torch.utils.data.DataLoader picks map-style vs iterable-style with an
+# isinstance() check, so a dataset handed to it must really subclass this one.
+# The IterableDataset Protocol defined below is structural typing only and is
+# invisible to that check. Aliased to keep the two names distinguishable.
+TorchIterableDataset = torch.utils.data.IterableDataset
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -62,7 +79,7 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
-class IterableTransformedDataset(IterableDataset[T_co]):
+class IterableTransformedDataset(TorchIterableDataset, IterableDataset[T_co]):
     def __init__(
         self,
         dataset: IterableDataset,
@@ -161,22 +178,18 @@ def create_torch_dataset(
     return torch.utils.data.ConcatDataset(datasets)
 
 
-def create_rlds_dataset(
+def create_lingyu_dataset_v2(
     data_config: _config.DataConfig,
-    action_horizon: int,
-    batch_size: int,
-    *,
-    shuffle: bool = False,
+    model_config: _model.BaseModelConfig
 ) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
-    return DroidRldsDataset(
-        data_dir=data_config.rlds_data_dir,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        action_chunk_size=action_horizon,
-        action_space=data_config.action_space,
-        filter_dict_path=data_config.filter_dict_path,
-    )
+    logging.info(f"action_dim: {model_config.action_dim}")
+    logging.info(f"action_horizon: {model_config.action_horizon}")
+    logging.info(f"max_token_len: {model_config.max_token_len}")
+    # GPU 解码的裁剪与缩放参数取自本 data_config 的 openpi 图像变换, 不另行配置
+    video_key_to_crop, image_resolution = load_video_decode_config(data_config)
+    # 训练只要前 action_horizon 步动作, 数据集在读 mcap 前截掉索引里的多余 action location
+    return LingyuDatasetV2(data_config.iceberg_dir, video_key_to_crop=video_key_to_crop,
+                           image_resolution=image_resolution, action_horizon=model_config.action_horizon)
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
@@ -309,7 +322,11 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    # fake 配置(如 debug)走上游 FakeDataset; 其余统一走 lingyu v2
+    if data_config.repo_id == "fake":
+        dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    else:
+        dataset = create_lingyu_dataset_v2(data_config, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
@@ -437,7 +454,13 @@ class TorchDataLoader:
 
         mp_context = None
         if num_workers > 0:
-            mp_context = multiprocessing.get_context("spawn")
+            # forkserver: 重型模块只在 server 进程里 import 一次, worker 从 server fork 出来;
+            # spawn 下每个 worker 都要重跑主模块的 import(~5s), 且因 dataset pickle 超过管道缓冲而逐个串行启动。
+            # Python 3.11 默认的 ['__main__'] 预加载不生效, 须显式列出模块名; 且 forkserver 不设置 sys_path,
+            # 只能 import site-packages/src 下的包。worker 仍会重新执行主模块(train.py), 其顶层依赖若没预加载,
+            # 每个 worker 要现 import 约 1170 个模块(~3.5s), 又因上面的管道阻塞逐个串行, 故按包名全部预加载
+            mp_context = multiprocessing.get_context("forkserver")
+            mp_context.set_forkserver_preload([__name__, "openpi.training.config", *_TRAIN_SCRIPT_IMPORTS])
 
         generator = torch.Generator()
         generator.manual_seed(seed)
@@ -453,6 +476,8 @@ class TorchDataLoader:
             worker_init_fn=_worker_init_fn,
             drop_last=True,
             generator=generator,
+            prefetch_factor=2 if num_workers > 0 else None,
+            in_order=False if num_workers > 0 else True,
         )
 
     @property
@@ -473,9 +498,42 @@ class TorchDataLoader:
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                    device_batch = jax.tree.map(
+                        lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                    device_batch = jax.tree.map(torch.as_tensor, batch)
+                try:
+                    yield device_batch
+                except GeneratorExit:
+                    # 使用方提前关掉了迭代器(train.py 结束时 data_iter.close()), 手上的 batch 已无用
+                    _terminate_workers(data_iter)
+                    raise
+
+
+def _terminate_workers(torch_iter) -> None:
+    """直接 terminate 全部 worker 再收尾, 不走 torch 默认的逐个 join。
+
+    torch 的 _shutdown_workers 对每个 worker 依次 join(timeout=5s), 而 worker 要取完手上整个 batch
+    才响应退出, 关闭时 worker 几乎都在取样, 256 个 worker 最多要等约 21 分钟。
+    """
+    workers = getattr(torch_iter, "_workers", None)
+    if workers is None:  # num_workers=0, 没有 worker 进程
+        return
+    # 先摘掉 SIGCHLD 监视, 否则 torch 会把被 terminate 的 worker 当成异常退出, 在主进程里报错
+    if torch_iter._worker_pids_set:
+        torch.utils.data._utils.signal_handling._remove_worker_pids(id(torch_iter))
+        torch_iter._worker_pids_set = False
+    terminate_start = time.perf_counter()
+    for worker in workers:
+        worker.terminate()
+    torch_iter._shutdown_workers()  # 此时 join 的都是已退出的进程, 只剩关队列等收尾
+    logging.info(f"Terminated {len(workers)} data loader workers in {time.perf_counter() - terminate_start:.1f}s")
+
+
+def _fetch_and_put(data_iter, sharding):
+    """Fetch one batch from the worker pool and place it on the devices."""
+    batch = next(data_iter)
+    return jax.tree.map(lambda x: jax.make_array_from_process_local_data(sharding, x), batch)
 
 
 def _collate_fn(items):
@@ -491,6 +549,9 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # forkserver worker 里 CUDA 无法初始化, 而部分 transform 链(如 debug 的 resize_with_pad)会触发 jax;
+    # data worker 只产 numpy/torch 数据, sharding 全在主进程, 强制其 jax 走 CPU (backend 尚未初始化时仍可改)
+    jax.config.update("jax_platform_name", "cpu")
 
 
 class RLDSDataLoader:

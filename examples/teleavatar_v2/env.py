@@ -72,8 +72,9 @@ class TeleavatarEnvironment(_environment.Environment):
                 interpolate=self._interpolate,
             )
 
-            # Spin in background
-            executor = rclpy.executors.MultiThreadedExecutor()
+            # Callbacks are short and share the node's default mutually exclusive group.
+            # A thread pool adds GIL contention with GStreamer's Python callbacks and can starve video reception.
+            executor = rclpy.executors.SingleThreadedExecutor()
             executor.add_node(self._ros_interface)
 
             # Signal that spinning is about to start

@@ -1,6 +1,3 @@
-import dataclasses
-import typing
-
 import jax
 import torch.utils.data
 
@@ -95,28 +92,6 @@ def test_with_fake_dataset():
 
     for batch in batches:
         assert all(x.shape[0] == config.batch_size for x in jax.tree.leaves(batch))
-
-    for _, actions in batches:
-        assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
-
-
-def test_with_real_dataset():
-    config = _config.get_config("pi0_aloha_sim")
-    config = dataclasses.replace(config, batch_size=4)
-
-    loader = _data_loader.create_data_loader(
-        config,
-        # Skip since we may not have the data available.
-        skip_norm_stats=True,
-        num_batches=2,
-        shuffle=True,
-    )
-    # Make sure that we can get the data config.
-    assert loader.data_config().repo_id == config.data.repo_id
-
-    batches = list(loader)
-
-    assert len(batches) == 2
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)

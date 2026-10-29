@@ -33,10 +33,21 @@ dependencies = [
     "wandb>=0.19.1",
     "filelock>=3.16.1",
     "beartype==0.19.0",
+    "chex==0.1.88",
     "treescope>=0.1.7",
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "boto3-stubs~=1.43.98",
+    "rosbags==0.11.5",
+    "boto3==1.43.103",
+    "pyiceberg[sql-sqlite]==0.12.0",
+    # pyarrow 必须停在 21.x: numpy 锁 <2.0(pyarrow 22+ 运行时要求 numpy>=2.0), 而 datasets 5.0.1 要求 >=21.0.0
+    "pyarrow>=21,<22",
+    "duckdb==1.5.6",
+    "openai==3.17.0",
+    "zstandard==0.25.0",
+    "lz4==4.4.5",
 ]
 
 
@@ -60,7 +71,9 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# av 14.3.0/14.4.0 ship no prebuilt wheels; building from source requires ffmpeg 7 headers.
+# Pin to 14.2.0, the newest release with cp311 manylinux wheels.
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "av==14.2.0"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

@@ -94,7 +94,6 @@ Once uv is installed, run the following to set up the environment:
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
 Note: `GIT_LFS_SKIP_SMUDGE=1` is required to pull LeRobot as a dependency.

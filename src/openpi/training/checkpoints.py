@@ -4,7 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from etils import epath
 import jax
@@ -13,8 +13,10 @@ import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
-import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+if TYPE_CHECKING:
+    import openpi.training.data_loader as _data_loader
 
 
 def initialize_checkpoint_dir(
@@ -108,7 +110,31 @@ def restore_state(
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
-    norm_stats_dir = epath.Path(assets_dir) / asset_id
+    """Load checkpoint stats by asset id, falling back only to a unique file in the checkpoint assets."""
+    assets_dir = epath.Path(assets_dir)
+    norm_stats_dir = assets_dir / asset_id
+    expected_path = norm_stats_dir / "norm_stats.json"
+    if not expected_path.exists():
+        # Serving and training configs may use different asset ids. Only use stats bundled with this checkpoint.
+        candidates = sorted(
+            directory / "norm_stats.json" for directory, _, files in assets_dir.walk() if "norm_stats.json" in files
+        )
+        if not candidates:
+            raise FileNotFoundError(
+                f"Norm stats file not found at: {expected_path}. No norm_stats.json found under {assets_dir}."
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Norm stats file not found at: {expected_path}. "
+                f"Multiple norm stats files found under {assets_dir}; cannot select one safely: "
+                + ", ".join(str(path) for path in candidates)
+            )
+        norm_stats_dir = candidates[0].parent
+        logging.warning(
+            "Norm stats not found at %s; using the only norm stats file in checkpoint assets: %s",
+            expected_path,
+            candidates[0],
+        )
     norm_stats = _normalize.load(norm_stats_dir)
     logging.info(f"Loaded norm stats from {norm_stats_dir}")
     return norm_stats

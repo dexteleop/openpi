@@ -1,7 +1,9 @@
 import dataclasses
 import functools
+import gc
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -45,6 +47,10 @@ def init_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
+    # 同时写入 scripts/train.log; forkserver 起的 worker 不继承这里的配置, 其异常经 torch 传回主进程再记录
+    file_handler = logging.FileHandler(__file__.removesuffix(".py") + ".log", mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
@@ -223,7 +229,10 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
+    # 首个 batch 含 worker 启动与单个 worker 串行取满一个 batch, 单独记录, 不计入稳态吞吐
+    first_batch_start = time.perf_counter()
     batch = next(data_iter)
+    logging.info(f"First batch took {time.perf_counter() - first_batch_start:.1f}s (worker startup included)")
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -256,24 +265,42 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    interval_start = time.perf_counter()  # 本日志间隔的起点, 用于算 samples_per_s
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
+
+        # 取下一个 batch 的等待时间: 接近 0 说明 loader 跟得上训练, 很大则 loader 是瓶颈
+        # (train step 是异步派发的, 这段时间与 GPU 计算重叠)
+        data_start = time.perf_counter()
+        batch = next(data_iter)
+        infos.append({**info, "data_time": time.perf_counter() - data_start})
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            reduced_info["data_time_max"] = float(np.max(stacked_infos["data_time"]))
+            # 本间隔训练的样本数 / 墙钟耗时(含 train step 与等 batch)
+            reduced_info["samples_per_s"] = len(infos) * config.batch_size / (time.perf_counter() - interval_start)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            logging.info(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
+            interval_start = time.perf_counter()
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+
+    # Shut the data loader down here rather than leaving it to the garbage
+    # collector: otherwise DataLoader.__del__ joins its worker processes during
+    # interpreter finalization, where any error it hits can only be reported as
+    # "Exception ignored in: <function _MultiProcessingDataLoaderIter.__del__>".
+    # Closing the iterator releases the torch iterator the generators hold.
+    data_iter.close()
+    del data_iter, batch, data_loader
+    gc.collect()
 
 
 if __name__ == "__main__":
