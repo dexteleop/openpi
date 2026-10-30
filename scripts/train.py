@@ -3,6 +3,7 @@ import functools
 import gc
 import logging
 import platform
+import signal
 import time
 from typing import Any
 
@@ -30,6 +31,11 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 
+def _raise_system_exit(signum, _frame):
+    # Convert SIGTERM into SystemExit: it takes the normal exit path, so atexit can clean up the decode processes and DataLoader workers
+    raise SystemExit(128 + signum)
+
+
 def init_logging():
     """Custom logging format for better readability."""
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -47,7 +53,7 @@ def init_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
-    # 同时写入 scripts/train.log; forkserver 起的 worker 不继承这里的配置, 其异常经 torch 传回主进程再记录
+    # Also write to scripts/train.log; workers started by the forkserver do not inherit this config, their exceptions are sent back to the main process via torch and logged there
     file_handler = logging.FileHandler(__file__.removesuffix(".py") + ".log", mode="w", encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
@@ -198,6 +204,8 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
+    # A plain kill (SIGTERM) terminates the process directly without running atexit, which leaks all child processes; register a handler to turn it into a normal exit
+    signal.signal(signal.SIGTERM, _raise_system_exit)
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -229,7 +237,7 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
-    # 首个 batch 含 worker 启动与单个 worker 串行取满一个 batch, 单独记录, 不计入稳态吞吐
+    # The first batch includes worker startup plus one worker serially filling a whole batch; log it separately, excluded from steady-state throughput
     first_batch_start = time.perf_counter()
     batch = next(data_iter)
     logging.info(f"First batch took {time.perf_counter() - first_batch_start:.1f}s (worker startup included)")
@@ -265,13 +273,13 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
-    interval_start = time.perf_counter()  # 本日志间隔的起点, 用于算 samples_per_s
+    interval_start = time.perf_counter()  # Start of this logging interval, used to compute samples_per_s
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
 
-        # 取下一个 batch 的等待时间: 接近 0 说明 loader 跟得上训练, 很大则 loader 是瓶颈
-        # (train step 是异步派发的, 这段时间与 GPU 计算重叠)
+        # Wait time for the next batch: near 0 means the loader keeps up with training, large means the loader is the bottleneck
+        # (the train step is dispatched asynchronously, this period overlaps with GPU compute)
         data_start = time.perf_counter()
         batch = next(data_iter)
         infos.append({**info, "data_time": time.perf_counter() - data_start})
@@ -279,7 +287,7 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             reduced_info["data_time_max"] = float(np.max(stacked_infos["data_time"]))
-            # 本间隔训练的样本数 / 墙钟耗时(含 train step 与等 batch)
+            # Samples trained in this interval / wall time (including train step and batch waiting)
             reduced_info["samples_per_s"] = len(infos) * config.batch_size / (time.perf_counter() - interval_start)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             logging.info(f"Step {step}: {info_str}")
