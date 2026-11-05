@@ -1051,7 +1051,7 @@ _CONFIGS = [
             rtc_training_max_delay=12,
         ),
         data=LeRobotTeleavatarV2DataConfig(
-            repo_id="/cloud_disk/haonan/move/ta2/checkout_no_scan1_224",
+            repo_id="/home/haonan/disk0/openpi/data/move_test_pred",
             base_config=DataConfig(
                 prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -1063,8 +1063,8 @@ _CONFIGS = [
             # head camera was mounted upside-down.
             rotate_head_camera=False,
         ),
-        batch_size=1024,
-        num_workers=128,
+        batch_size=64,
+        num_workers=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=5_000,
             peak_lr=5e-5,
@@ -1073,7 +1073,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/data/base_model/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/DATA/disk0/model/pi05_base/params"),
         num_train_steps=7_000,
     ),
     TrainConfig(
