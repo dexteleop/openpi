@@ -122,6 +122,9 @@ class TeleavatarInputs(transforms.DataTransformFn):
     # generic DeltaActions transform, since state (14-dim) and actions
     # (16-dim, gripper-interleaved) don't share a layout it can index by position.
     use_delta_joint_actions: bool = False
+    # Append the 3 chassis target velocities [vx, vy, wz] from the raw action
+    # vector (indices 73-75) to the 16 arm/gripper actions.
+    include_chassis_actions: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Parse images to uint8 (H,W,C) format
@@ -168,9 +171,16 @@ class TeleavatarInputs(transforms.DataTransformFn):
         # (62-dim on v2, 48-dim on v1 — the indices used are identical).
         # Actions are only available during training, not during inference
         if "action" in data:
-            # data["action"] has shape [action_horizon, 62] (v2) or [action_horizon, 48] (v1)
-            # Layout: [positions(0-15), velocities(16-31), efforts(32-47), (v2) ee_pose(48-61)]
+            # data["action"] has shape [action_horizon, 76] for chassis data,
+            # [action_horizon, 62] for v2, or [action_horizon, 48] for v1.
+            # Layout: [positions(0-15), velocities(16-31), efforts(32-47),
+            # ee_pose(48-61), chassis/kinco(62-75)].
             action_data = data["action"]
+            if self.include_chassis_actions and action_data.shape[-1] < 76:
+                raise ValueError(
+                    "include_chassis_actions=True requires a 76-dimensional raw action vector, "
+                    f"got shape {action_data.shape}."
+                )
 
             # Extract 16 dimensions: joint positions (14) + gripper efforts (2)
             # Note: State only uses 14 dims (joint positions), but actions include gripper efforts
@@ -180,6 +190,9 @@ class TeleavatarInputs(transforms.DataTransformFn):
                 action_data[:, 8:15],   # Right arm positions
                 action_data[:, 47:48],  # Right gripper effort (index 47 = 32+15)
             ], axis=1)  # Concatenate along action dimension
+            if self.include_chassis_actions:
+                # Chassis target velocities [vx, vy, yaw] are absolute.
+                selected_actions = np.concatenate([selected_actions, action_data[:, 73:76]], axis=1)
 
             # Convert raw gripper efforts (Nm) to the normalized [0, 1]
             # trigger range (same curve for both arms on v2). This runs before
@@ -223,7 +236,8 @@ class TeleavatarInputs(transforms.DataTransformFn):
         if not self.use_delta_joint_actions:
             return None
         state_14d = _state_14d(data)
-        anchor = np.zeros(16, dtype=np.float32)
+        action_dim = 19 if self.include_chassis_actions else 16
+        anchor = np.zeros(action_dim, dtype=np.float32)
         anchor[0:7] = state_14d[0:7]
         anchor[8:15] = state_14d[7:14]
         return anchor
@@ -235,23 +249,26 @@ class TeleavatarOutputs(transforms.DataTransformFn):
     This class is used to convert outputs from the model back to the dataset specific format. It is
     used for inference only.
 
-    For teleavatar, we return 16 actions:
+    For teleavatar, we return 16 actions, or 19 when chassis actions are enabled:
     - Joint positions for joints 1-7 for both arms (14 values)
     - Joint efforts for left and right grippers (2 values)
+    - Chassis target velocities [vx, vy, wz] (3 values)
 
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
 
     # Must match the TeleavatarInputs setting for this config.
     use_delta_joint_actions: bool = False
+    include_chassis_actions: bool = False
 
     def __call__(self, data: dict) -> dict:
-        # Only return the first 16 actions for teleavatar.
+        action_dim = 19 if self.include_chassis_actions else 16
+        # Only return the action dimensions used by teleavatar.
         # Since the model may output more dimensions due to padding, we extract just what we need.
-        # For your own dataset, replace `16` with the action dimension of your dataset.
+        # For your own dataset, replace `action_dim` with the action dimension of your dataset.
         # Copy so the in-place gripper conversion below never mutates the
         # caller's array.
-        actions = np.array(data["actions"][:, :16])
+        actions = np.array(data["actions"][:, :action_dim])
 
         # data["state"] is the un-normalized 14-dim state: [left_arm(7), right_arm(7)].
         if self.use_delta_joint_actions:

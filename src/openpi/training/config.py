@@ -456,6 +456,10 @@ class LeRobotTeleavatarV2DataConfig(DataConfigFactory):
     robot use LeRobotTeleavatarV1DataConfig instead.
     """
     use_delta_joint_actions: bool = False
+    # Also predict the 3 chassis target velocities [vx, vy, wz] stored at
+    # action indices 73-75 of a 76-dim dataset (otherwise the output is the
+    # 16-dim arm/gripper actions only).
+    include_chassis_actions: bool = False
     # Whether the head camera should be rotated 180° before the left-eye crop.
     # Property of the source dataset orientation; forwarded to TeleavatarInputs.
     rotate_head_camera: bool = False
@@ -490,11 +494,13 @@ class LeRobotTeleavatarV2DataConfig(DataConfigFactory):
                     model_type=model_config.model_type,
                     rotate_head_camera=self.rotate_head_camera,
                     use_delta_joint_actions=self.use_delta_joint_actions,
+                    include_chassis_actions=self.include_chassis_actions,
                 )
             ],
             outputs=[
                 teleavatar_v2_policy.TeleavatarOutputs(
                     use_delta_joint_actions=self.use_delta_joint_actions,
+                    include_chassis_actions=self.include_chassis_actions,
                 )
             ],
         )
@@ -1032,6 +1038,43 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
+    ),
+    TrainConfig(
+        # pi05_teleavatar_v2 plus the 3 chassis target velocities [vx, vy, wz],
+        # learned jointly with the 16 arm/gripper actions (19-dim output).
+        name="pi05_teleavatar_v2_chassis",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            action_dim=32,  # Keep 32 to match pretrained weights; this config uses the first 19 dims
+            rtc_training_max_delay=12,
+        ),
+        data=LeRobotTeleavatarV2DataConfig(
+            repo_id="/cloud_disk/haonan/move/ta2/checkout_no_scan1_224",
+            base_config=DataConfig(
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
+                action_sequence_keys=("action",)  # Use 'action' not 'actions'
+            ),
+            use_delta_joint_actions=True,
+            include_chassis_actions=True,
+            # v2 robot: head camera is right-side-up, so no 180° rotation
+            # before the left-eye crop. Set True only for v1 datasets, whose
+            # head camera was mounted upside-down.
+            rotate_head_camera=False,
+        ),
+        batch_size=1024,
+        num_workers=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/data/base_model/pi05_base/params"),
+        num_train_steps=7_000,
     ),
     TrainConfig(
         # pi05_teleavatar_v2 plus RTC action conditioning, for `--rtc.mode=TRAINED` serving.
