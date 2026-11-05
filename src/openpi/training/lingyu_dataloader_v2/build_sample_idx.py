@@ -61,7 +61,10 @@ from openpi.training.lingyu_dataloader_v2.mcap_sample_extractor import MCAPSampl
 from openpi.training.lingyu_dataloader_v2.utils.pyiceberg_saver import (
     EPISODES_TABLE_NAME, EpisodeParquetWriter, EpisodeRecord, IcebergEpisodeSaver,
     load_episodes_catalog, load_episodes_table)
-from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import find_mcap_url_and_prompt_pairs
+from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_s3 import (
+    find_mcap_url_and_prompt_pairs as find_mcap_url_and_prompt_pairs_oss)
+from openpi.training.lingyu_dataloader_v2.utils.search_mcap_on_local import (
+    find_mcap_url_and_prompt_pairs as find_mcap_url_and_prompt_pairs_local)
 from openpi.training.lingyu_dataloader_v2.utils.mcap_topics_filter import filter_topics
 
 # Constants
@@ -293,15 +296,25 @@ def load_existing_tables(warehouse_dir: str = WAREHOUSE_DIR) -> dict:
     return tables
 
 
-def build_all(log_enabled: bool = False) -> str:
-    """Extract all mcaps into Iceberg, then build the global index."""
+def build_all(mcap_source: str = "local", log_enabled: bool = False) -> str:
+    """Extract all mcaps into Iceberg, then build the global index.
+
+    mcap_source 决定 csv 中 rosbag 地址的形式与发现方式:
+    local=本地挂载目录(search_mcap_on_local, 索引 locations 记录绝对路径),
+    oss=S3 桶内前缀(search_mcap_on_s3, 索引记录桶内 key)。
+    """
+    # 按 mcap 来源选择发现函数: 两者同签名, 返回 {mcap_url: prompt}
+    find_mcap_urls = (find_mcap_url_and_prompt_pairs_local if mcap_source == "local"
+                      else find_mcap_url_and_prompt_pairs_oss)
     # All mcaps are enqueued and picked up by MAX_MCAP_WORKERS resident workers; the process count does not grow with mcap count
-    tables = build_episodes_table(find_mcap_url_and_prompt_pairs(), WAREHOUSE_DIR, log_enabled)
+    tables = build_episodes_table(find_mcap_urls(), WAREHOUSE_DIR, log_enabled)
     return build_global_index(tables, WAREHOUSE_DIR)
 
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser(description="并行抽取 mcap 存进 Iceberg, 再生成全局索引")
+    arg_parser.add_argument("--mcap-source", choices=["local", "oss"], default="local",
+                            help="csv 中 mcap 地址的形式: local=本地挂载目录(默认), oss=S3 桶内前缀")
     arg_parser.add_argument("--index-only", action="store_true",
                             help="跳过采集, 只用 catalog 里已有的表重建 episode_index.parquet")
     arg_parser.add_argument("--log", action="store_true",
@@ -317,4 +330,4 @@ if __name__ == "__main__":
         # Do not re-collect: rerunning collection would add_files the same data again, leaving two copies of every episode in the table
         build_global_index(load_existing_tables())
     else:
-        build_all(cli_args.log)
+        build_all(cli_args.mcap_source, cli_args.log)

@@ -13,6 +13,7 @@ import logging
 import os
 import tarfile
 from pathlib import Path
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import numpy as np
 import tqdm

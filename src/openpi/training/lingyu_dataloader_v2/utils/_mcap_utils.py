@@ -1,6 +1,8 @@
 from __future__ import annotations
 from functools import lru_cache
+import errno
 import logging
+import os
 import random
 import struct
 import threading
@@ -88,11 +90,75 @@ u64 = struct.Struct("<Q").unpack_from # 8 bytes -> int
 
 
 ##########
+# 本地挂载读取: 索引里记录的 mcap_url 以 "/" 开头即为本地绝对路径, 走 os.pread 免去对象存储请求
+##########
+# fd 与文件大小缓存: 每进程每个文件只 open/fstat 一次; pread 不带位置状态, 多线程并发读同一 fd 安全
+_local_fds: dict[str, int] = {}
+_local_sizes: dict[str, int] = {}
+_local_fd_lock = threading.Lock()
+
+# 本地挂载实际是 ossfs2 (FUSE + HTTPS 到 OSS), 这些瞬态 errno 退避重试后可自愈
+# 覆盖三类来源: 内核 FUSE 层在 daemon 瞬断时直接返回 (ENOTCONN/EIO/ENOMEM/EAGAIN),
+# libcurl 透传的 TCP 网络错误 (ECONNABORTED/ECONNRESET/ECONNREFUSED/EPIPE/ESHUTDOWN/
+# ETIMEDOUT/EHOSTUNREACH/ENETUNREACH/ENETRESET/ENOBUFS), 网络 FS 经典瞬态 (ESTALE)
+_LOCAL_TRANSIENT_ERRNOS = frozenset({
+    errno.ECONNABORTED, errno.ECONNRESET, errno.ETIMEDOUT, errno.EAGAIN,
+    errno.EIO, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETRESET,
+    errno.ENOTCONN, errno.EPIPE, errno.ENOBUFS, errno.ENOMEM,
+    errno.ECONNREFUSED, errno.ESHUTDOWN, errno.ESTALE,
+})
+# 单次本地读取的最大尝试次数; 指数退避上限 10s, 全部耗尽约 1 分钟后放弃
+LOCAL_READ_ATTEMPTS = 10
+
+
+def _open_local_fd(mcap_url: str) -> int:
+    """打开本地 mcap 缓存其 fd 与大小; 双检查锁保证多线程下只 open 一次"""
+    fd = _local_fds.get(mcap_url)
+    if fd is None:
+        with _local_fd_lock:
+            fd = _local_fds.get(mcap_url)
+            if fd is None:
+                fd = os.open(mcap_url, os.O_RDONLY)
+                _local_fds[mcap_url] = fd
+                _local_sizes[mcap_url] = os.fstat(fd).st_size
+    return fd
+
+
+def _drop_local_fd(mcap_url: str) -> None:
+    """关闭并移除缓存的 fd; 底层连接坏掉后旧 fd 继续用只会一直报错, 必须重开"""
+    with _local_fd_lock:
+        fd = _local_fds.pop(mcap_url, None)
+        _local_sizes.pop(mcap_url, None)
+    if fd is not None:
+        os.close(fd)
+
+
+def _pread_local_retry(mcap_url: str, length: int, offset: int) -> bytes:
+    """带重试的本地挂载读取: 瞬态 errno 时丢弃坏 fd, 指数退避后重新 open/pread
+
+    对齐 S3 路径的兜底策略, 避免 32 worker 高并发下一次连接抖动打死整个长任务
+    """
+    for attempt_idx in range(LOCAL_READ_ATTEMPTS):
+        try:
+            return os.pread(_open_local_fd(mcap_url), length, offset)
+        except OSError as error:
+            if error.errno not in _LOCAL_TRANSIENT_ERRNOS or attempt_idx == LOCAL_READ_ATTEMPTS - 1:
+                raise
+            # open 失败时缓存本就为空, pread 失败时坏 fd 在此被关闭
+            _drop_local_fd(mcap_url)
+            backoff_seconds = min(2 ** attempt_idx, 10) * random.uniform(0.5, 1.5)
+            logger.warning(f"本地读 {mcap_url} offset={offset} length={length} 失败"
+                           f"(errno={error.errno} {os.strerror(error.errno)}), "
+                           f"{backoff_seconds:.1f}s 后第 {attempt_idx + 2} 次尝试")
+            time.sleep(backoff_seconds)
+    raise AssertionError("unreachable")
+
+
+##########
 # Object storage read functions
 ##########
 # Per-process connection pool limit: concurrent requests beyond this still create new connections, but they are closed after use and cannot be reused
-S3_MAX_POOL_CONNECTIONS = 200
-# Maximum attempts for one request when the response body read times out / the stream breaks, or throttling persists after botocore's own retries are exhausted;
+S3_MAX_POOL_CONNECTIONS = 200# Maximum attempts for one request when the response body read times out / the stream breaks, or throttling persists after botocore's own retries are exhausted;
 # in practice the OSS gateway can stall on individual object ranges for over ten minutes; together with S3_READ_TIMEOUT and backoff of up to 30s, this tolerates about 45 minutes of continuous failures
 S3_READ_ATTEMPTS = 60
 # Socket timeout (seconds) per read; botocore defaults to 60s, stuck connections rarely recover on their own, shortening it switches to a new connection and retries faster
@@ -185,13 +251,18 @@ def _bucket_key(mcap_url: str) -> str:
 
 
 def fetch_mcap_bytes(mcap_url: str, length: int, offset: int) -> bytes:
-    """Read a byte range from the bucket; when the logger has DEBUG enabled, record the timing and pool status of this read
+    """Read a byte range from the local mount or the bucket; when the logger has DEBUG enabled, record the timing and pool status of this read
 
-    ttfb spans from sending the request to receiving the response headers (including possible connection setup, signing and server-side processing); transfer is the time spent reading the response body.
+    mcap_url 以 "/" 开头是本地挂载绝对路径, pread 直接读; 文件末尾自然截断, 与 S3 range 语义一致(_play_messages 依赖此行为)。
+    其余形式是桶内 key, 走对象存储; ttfb spans from sending the request to receiving the response headers (including possible
+    connection setup, signing and server-side processing); transfer is the time spent reading the response body.
     At end of file S3 truncates the range, so the returned byte count may be smaller than length (_play_messages relies on this behavior)
     """
     # length<=0 builds an invalid Range header; S3 may return the whole object
     assert length > 0 and offset >= 0, f"非法读取范围: length={length}, offset={offset}"
+    # 本地绝对路径分派: 索引由 --mcap-source local 构建时 locations 记录的就是绝对路径
+    if mcap_url.startswith("/"):
+        return _pread_local_retry(mcap_url, length, offset)
     byte_range = f"bytes={offset}-{offset + length - 1}"
     for attempt_idx in range(S3_READ_ATTEMPTS):
         _tcp_connect_local.connect_ms = None  # Clear this thread's connection-establishment record from the previous request
@@ -241,7 +312,11 @@ def _fetch_mcap_bytes_in_pieces(mcap_url: str, length: int, offset: int) -> byte
 ##########
 # Read the MCAP byte length
 def fetch_mcap_length(mcap_url: str) -> int:
-    """Byte size of the object"""
+    """Byte size of the local file or the object"""
+    # 本地绝对路径: 取 _open_local_fd 缓存过的大小
+    if mcap_url.startswith("/"):
+        _open_local_fd(mcap_url)
+        return _local_sizes[mcap_url]
     return s3_client().head_object(
         Bucket=BUCKET_NAME,
         Key=mcap_url

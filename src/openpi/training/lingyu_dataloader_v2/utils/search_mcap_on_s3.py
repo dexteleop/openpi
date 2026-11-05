@@ -21,7 +21,8 @@ from openpi.training.lingyu_dataloader_v2.utils._read_csv_columns import read_ro
 
 # Project root (openpi/); the data platform's exported csv goes here
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
-BUCKET_NAME = os.environ["BUCKET_NAME"]
+# 本地挂载模式下不需要任何 S3 环境变量, import 本模块不应报错; 真正调用 make_client() 时才要求凭证存在
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
 # In-bucket key = KEY_PREFIX + the rosbag path from the csv; listing results already include the prefix, so downstream get_object need not re-join
 KEY_PREFIX = os.environ.get("KEY_PREFIX", "").strip("/")
 

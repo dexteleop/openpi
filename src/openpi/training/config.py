@@ -1172,6 +1172,37 @@ _CONFIGS = [
         wandb_enabled=True,
     ),
     TrainConfig(
+        name="pi05_teleavatar_v2_lingyu",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
+            discrete_state_input=True,
+            action_horizon=30,
+        ),
+        checkpoint_base_dir="./checkpoints",
+        data=LingyuTeleavatarV2DataConfig(
+            base_config=DataConfig(
+                action_sequence_keys=("action",),  # Use 'action' not 'actions'
+                prompt_from_task=True,
+                iceberg_dir="~/openpi/src/openpi/training/lingyu_dataloader_v2/iceberg_warehouse",
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/data/base_model/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=64,
+        num_workers=32,
+        num_train_steps=20_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
         name="pi0_teleavatar_v2_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(

@@ -108,7 +108,8 @@ def load_video_decode_config(data_config) -> tuple[dict[str, tuple[str, bool]], 
 
 def load_episode_index(warehouse_dir: str) -> list[dict]:
     """Read episode_index.parquet, returning the episode list sorted by sample_offset ascending."""
-    index_path = Path(warehouse_dir, GLOBAL_INDEX_NAME)
+    # warehouse_dir 允许以 ~ 开头, 在此底层统一 expanduser 展开
+    index_path = Path(warehouse_dir).expanduser() / GLOBAL_INDEX_NAME
     assert index_path.exists(), f"没有 {index_path}, 请先运行 build_sample_idx.py"
     index_columns = duckdb.sql(f"SELECT * FROM '{index_path}' LIMIT 0").columns
     assert set(INDEX_COLUMNS) <= set(index_columns), \
