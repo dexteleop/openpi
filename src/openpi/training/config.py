@@ -1051,7 +1051,7 @@ _CONFIGS = [
             rtc_training_max_delay=12,
         ),
         data=LeRobotTeleavatarV2DataConfig(
-            repo_id="/home/haonan/disk0/openpi/data/move_test_pred",
+            repo_id="path-to-dataset",  # Your local dataset name; override with --data.repo_id=/path/to/dataset
             base_config=DataConfig(
                 prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
@@ -1073,8 +1073,8 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/DATA/disk0/model/pi05_base/params"),
-        num_train_steps=7_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
     ),
     TrainConfig(
         # pi05_teleavatar_v2 plus RTC action conditioning, for `--rtc.mode=TRAINED` serving.
